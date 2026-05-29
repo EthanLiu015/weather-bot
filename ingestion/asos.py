@@ -5,14 +5,12 @@ from datetime import datetime, timezone
 import httpx
 import pandas as pd
 
+from config.stations import station_timezones
+
 logger = logging.getLogger(__name__)
 
 METAR_BASE = "https://aviationweather.gov/cgi-bin/data/metar.php"
-STATION_TZ = {
-    "KORD": "America/Chicago",
-    "KJFK": "America/New_York",
-    "KLAX": "America/Los_Angeles",
-}
+STATION_TZ = station_timezones()
 
 
 async def fetch_metar(station: str, hours: int = 24) -> list[dict]:

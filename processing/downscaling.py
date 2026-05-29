@@ -2,28 +2,17 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
+from config.stations import STATION_REGISTRY
+
 STATION_META = {
-    "KORD": {
-        "lat": 41.978611,
-        "lon": -87.904722,
-        "elevation_m": 203.0,
-        "uhi_index": 1.8,
-        "coastal_distance_km": 1500.0,
-    },
-    "KJFK": {
-        "lat": 40.639722,
-        "lon": -73.778889,
-        "elevation_m": 4.0,
-        "uhi_index": 2.5,
-        "coastal_distance_km": 2.0,
-    },
-    "KLAX": {
-        "lat": 33.942536,
-        "lon": -118.408075,
-        "elevation_m": 38.0,
-        "uhi_index": 2.1,
-        "coastal_distance_km": 5.0,
-    },
+    icao: {
+        "lat": s.lat,
+        "lon": s.lon,
+        "elevation_m": s.elevation_m,
+        "uhi_index": s.uhi_index,
+        "coastal_distance_km": s.coastal_distance_km,
+    }
+    for icao, s in STATION_REGISTRY.items()
 }
 
 LAPSE_RATE_C_PER_M = 0.0065

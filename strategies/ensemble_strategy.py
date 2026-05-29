@@ -4,16 +4,16 @@ import pandas as pd
 
 from ingestion.gefs import fetch_latest_gefs_run, detect_new_run
 from ingestion.ecmwf import fetch_latest_ecmwf_run
-from ingestion.qc import qc_metar_list
-from processing.downscaling import downscale_gefs_to_station, STATION_META
+from ingestion.nbm import fetch_latest_nbm
 from processing.bias_correction import BiasCorrectionRegistry, get_lead_bucket, get_season
 from processing.features import build_feature_matrix, get_feature_columns
+from config.stations import ALL_ICAO
 from db.models import ForecastRun
 from db.session import get_session
 
 logger = logging.getLogger(__name__)
 
-STATIONS = ["KORD", "KJFK", "KLAX"]
+STATIONS = ALL_ICAO
 RESOLUTION_WINDOW_DAYS = 7
 
 
@@ -31,47 +31,30 @@ class EnsembleStrategy:
         try:
             gefs_raw = await fetch_latest_gefs_run()
             ecmwf_raw = await fetch_latest_ecmwf_run()
+            nbm_raw = await fetch_latest_nbm()
         except Exception as exc:
             logger.error("Ingestion failed: %s", exc)
             return
 
-        gefs_by_station = {}
+        # Apply Kalman bias correction to GEFS member temperatures
         for station in STATIONS:
-            try:
-                gefs_by_station[station] = downscale_gefs_to_station(
-                    gefs_data=gefs_raw.get(station, {}),
-                    station=station,
-                )
-            except Exception as exc:
-                logger.warning("Downscaling failed for %s: %s", station, exc)
-                gefs_by_station[station] = {}
+            station_data = gefs_raw.get(station, {})
+            for lead_hour, member_list in station_data.items():
+                lead_bucket = get_lead_bucket(lead_hour)
+                season = get_season(datetime.utcnow().month)
+                corrector = self._bias_registry.get_corrector(station, lead_bucket, season)
+                for member in member_list:
+                    tf = member.get("temp_f", float("nan"))
+                    import math
+                    if not math.isnan(tf):
+                        member["temp_f"] = corrector.correct(tf)
 
-        # Bias correct each station/lead
-        gefs_corrected = {}
-        for station in STATIONS:
-            df = gefs_by_station.get(station)
-            if df is None or (hasattr(df, 'empty') and df.empty):
-                gefs_corrected[station] = {}
-                continue
-            corrected_members = {}
-            for member, mdf in gefs_raw.get(station, {}).items():
-                corrected_df = mdf.copy()
-                for idx, row in mdf.iterrows():
-                    lead = row.get("lead_hour", 24)
-                    lead_bucket = get_lead_bucket(lead)
-                    season = get_season(datetime.utcnow().month)
-                    corrector = self._bias_registry.get_corrector(station, lead_bucket, season)
-                    if "t2m" in corrected_df.columns:
-                        corrected_df.at[idx, "t2m"] = corrector.correct(row.get("t2m", float("nan")))
-                corrected_members[member] = corrected_df
-            gefs_corrected[station] = corrected_members
-
-        gefs_for_features = {s: gefs_raw.get(s, {}) for s in STATIONS}
         feature_df = build_feature_matrix(
-            gefs_data=gefs_for_features,
+            gefs_data=gefs_raw,
             ecmwf_data=ecmwf_raw,
             asos_history=pd.DataFrame(),
             regime_labels=pd.Series(dtype=float),
+            nbm_data=nbm_raw,
             station_meta=None,
         )
 
