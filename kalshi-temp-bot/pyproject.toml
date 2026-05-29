@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kalshi-temp-bot"
+version = "1.0.0"
+description = "Algorithmic trading bot for Kalshi daily temperature markets"
+requires-python = ">=3.11"
+dependencies = [
+    # Core ML
+    "ngboost>=0.4.1",
+    "scikit-learn>=1.5.0",
+    "lightgbm>=4.3.0",
+    "quantile-forest>=1.3.0",
+    "properscoring>=0.1",
+    "scipy>=1.13.0",
+    # Data
+    "numpy>=1.26.0",
+    "pandas>=2.2.0",
+    "xarray>=2024.1.0",
+    "cfgrib>=0.9.12",
+    "eccodes>=1.7.0",
+    # API/web
+    "fastapi>=0.111.0",
+    "uvicorn[standard]>=0.30.0",
+    "httpx>=0.27.0",
+    "websockets>=12.0",
+    # Database
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.13.0",
+    # Config
+    "pydantic-settings>=2.3.0",
+    # Crypto for Kalshi auth
+    "cryptography>=42.0.0",
+    # Scheduler
+    "apscheduler>=3.10.4",
+    # Logging
+    "structlog>=24.1.0",
+    # Date utils
+    "python-dateutil>=2.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.14.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["config*", "db*", "ingestion*", "processing*", "models*", "strategies*", "trading*", "risk*", "backtest*", "scheduler*", "api*", "scripts*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

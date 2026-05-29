@@ -1,0 +1,50 @@
+# Environment
+.env
+*.pem
+keys/
+
+# Data (large files)
+data/gefs/
+data/ecmwf/
+data/nbm/
+data/historical/
+data/models/
+data/regime_clusters/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Database
+*.db
+*.sqlite
+
+# Frontend build
+frontend/node_modules/
+frontend/dist/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+.pytest_cache/
+htmlcov/
+.coverage
+
+# Backtest outputs
+data/backtest_results.csv
+data/backtest_report.html
