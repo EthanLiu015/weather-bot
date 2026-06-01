@@ -10,6 +10,12 @@ export default defineConfig({
       '/ws': {
         target: 'ws://localhost:8000',
         ws: true,
+        configure: (proxy) => {
+          proxy.on('error', (err) => {
+            if ((err as NodeJS.ErrnoException).code === 'EPIPE') return
+            console.error('ws proxy error:', err)
+          })
+        },
       },
     },
   },

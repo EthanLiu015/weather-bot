@@ -5,7 +5,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import markets, positions, model, controls
+from api.routers import markets, positions, model, controls, backtest
 from api.websocket import WebSocketBroadcaster, websocket_endpoint
 from config.settings import get_settings
 from db.session import init_db
@@ -139,6 +139,7 @@ def create_app() -> FastAPI:
     app.include_router(positions.router, prefix="/api")
     app.include_router(model.router, prefix="/api")
     app.include_router(controls.router, prefix="/api")
+    app.include_router(backtest.router, prefix="/api")
 
     @app.websocket("/ws/live")
     async def ws_live(ws: WebSocket):

@@ -53,3 +53,29 @@ export type WsMessage = {
   bot_active: boolean
   model_status?: ModelStatus
 }
+
+export type BacktestFold = {
+  fold_month: string
+  crps: number | null
+  mae: number | null
+  brier_score: number | null
+  reliability_slope: number | null
+  simulated_pnl_usd: number | null
+  num_simulated_trades: number
+  edge_above_threshold_pct: number | null
+}
+
+export type BacktestSummary = {
+  num_folds: number
+  mean_crps: number
+  mean_mae: number
+  mean_brier: number
+  mean_reliability_slope: number
+  total_simulated_pnl: number
+  total_trades: number
+}
+
+export type BacktestReport = {
+  folds: BacktestFold[]
+  summary: BacktestSummary
+}

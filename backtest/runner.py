@@ -9,7 +9,6 @@ from backtest.track_a import track_a_metrics
 from backtest.track_b import simulate_pnl
 from backtest.report import BacktestReport, FoldResult
 from models.ngboost_model import NGBoostTemperatureModel
-from models.qrf_model import QRFTemperatureModel
 from models.calibration import IsotonicCalibrator
 from processing.features import get_feature_columns
 
@@ -28,6 +27,7 @@ class BacktestRunner:
         self._start = start_date
         self._end = end_date
         self._train_window_years = train_window_years
+        self._kalshi_prices = self._load_kalshi_prices()
 
     def run(self) -> BacktestReport:
         report = BacktestReport()
@@ -98,11 +98,13 @@ class BacktestRunner:
         outcomes = (y_test > threshold).astype(float).values
 
         calibrator = IsotonicCalibrator()
-        mu_tr, _ = ngb.predict_distribution(X_train)
         prob_train = ngb.predict_prob_above(X_train, threshold)
         outcomes_train = (y_train > threshold).astype(float).values
         calibrator.fit(prob_train, outcomes_train)
-        cal_probs = np.array([calibrator.calibrate(p)[0] for p in prob_forecasts])
+        if calibrator._iso is not None:
+            cal_probs = calibrator._iso.predict(prob_forecasts)
+        else:
+            cal_probs = prob_forecasts
 
         metrics = track_a_metrics(
             prob_forecasts=cal_probs,
@@ -112,11 +114,31 @@ class BacktestRunner:
             outcomes=outcomes,
         )
 
-        market_mids = np.random.uniform(0.2, 0.8, size=len(cal_probs))
+        # Simulate trades at D+1 only — one decision per (station, date) market
+        if "lead_hour" in test_df.columns:
+            d1_mask = test_df["lead_hour"] == 24
+            d1_test = test_df[d1_mask].copy()
+            trade_probs = cal_probs[d1_mask]
+            trade_outcomes = outcomes[d1_mask]
+        else:
+            d1_test = test_df.copy()
+            trade_probs = cal_probs
+            trade_outcomes = outcomes
+
+        # Market mid = climatological P(Tmax > threshold | station, month) from training data.
+        # An efficient market prices close to historical frequency; our edge comes from
+        # deviating from this when model has skill. Much more realistic than random uniform.
+        market_mids = self._climatological_mids(
+            train_df=train_df,
+            test_df=d1_test,
+            threshold=threshold,
+            target_col=target_col,
+        )
+
         sim = simulate_pnl(
-            model_probs=cal_probs,
+            model_probs=trade_probs,
             market_mids=market_mids,
-            outcomes=outcomes,
+            outcomes=trade_outcomes,
             min_edge=self._settings.MIN_EDGE_CENTS / 100.0,
         )
 
@@ -130,6 +152,93 @@ class BacktestRunner:
             num_simulated_trades=sim["num_simulated_trades"],
             edge_above_threshold_pct=sim["edge_above_threshold_pct"],
         )
+
+    @staticmethod
+    def _load_kalshi_prices() -> pd.DataFrame:
+        path = "data/historical/kalshi_prices.parquet"
+        try:
+            df = pd.read_parquet(path)
+            df["date"] = pd.to_datetime(df["date"]).dt.date
+            logger.info("Loaded %d real Kalshi market prices (%s → %s)",
+                        len(df), df["date"].min(), df["date"].max())
+            return df
+        except FileNotFoundError:
+            logger.info("No kalshi_prices.parquet found — using climatological mids")
+            return pd.DataFrame()
+
+    def _get_market_mid(self, station: str, date_: date, threshold: float) -> float | None:
+        """Return real Kalshi D+1 mid for (station, date, threshold) if available."""
+        if self._kalshi_prices.empty:
+            return None
+        mask = (
+            (self._kalshi_prices["station"] == station) &
+            (self._kalshi_prices["date"] == date_) &
+            (self._kalshi_prices["market_type"] == "above")
+        )
+        candidates = self._kalshi_prices[mask]
+        if candidates.empty:
+            return None
+        # Pick the contract whose threshold is closest to ours
+        closest = candidates.iloc[(candidates["threshold"] - threshold).abs().argmin()]
+        mid = closest["d1_mid"]
+        if pd.isna(mid) or mid <= 0 or mid >= 1:
+            return None
+        return float(mid)
+
+    def _climatological_mids(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        threshold: float,
+        target_col: str,
+        noise_std: float = 0.02,
+    ) -> np.ndarray:
+        """
+        Compute market mid for each test row as P(Tmax > threshold | station, month)
+        estimated from the training set. This is the efficient-market baseline price —
+        a rational market participant with only historical frequency data would price here.
+
+        Small Gaussian noise (std=2¢) simulates bid-ask spread and market irrationality.
+        """
+        rng = np.random.default_rng(42)
+        mids = np.full(len(test_df), 0.5)
+        real_price_count = 0
+
+        train_df = train_df.copy()
+        train_df["_month"] = pd.to_datetime(train_df["date"]).dt.month
+
+        for i, (_, row) in enumerate(test_df.iterrows()):
+            station = row.get("station")
+            row_date = row["date"] if isinstance(row["date"], date) else pd.to_datetime(row["date"]).date()
+            month = pd.to_datetime(row["date"]).month
+
+            # Prefer real Kalshi market prices when available
+            real_mid = self._get_market_mid(station, row_date, threshold)
+            if real_mid is not None:
+                mids[i] = real_mid
+                real_price_count += 1
+                continue
+
+            # Fall back to climatological probability
+            hist = train_df[
+                (train_df["station"] == station) &
+                (train_df["_month"] == month)
+            ][target_col].dropna()
+
+            if len(hist) >= 10:
+                clim_prob = float((hist > threshold).mean())
+                # Clip to tradeable range — Kalshi markets rarely go below 5¢ or above 95¢
+                clim_prob = float(np.clip(clim_prob, 0.05, 0.95))
+            else:
+                clim_prob = 0.5
+
+            noise = rng.normal(0, noise_std)
+            mids[i] = float(np.clip(clim_prob + noise, 0.02, 0.98))
+
+        if real_price_count > 0:
+            logger.debug("Market mids: %d real Kalshi prices, %d climatological",
+                         real_price_count, len(test_df) - real_price_count)
+        return mids
 
     def _load_historical_features(self, start: date, end: date) -> pd.DataFrame:
         hist_path = "data/historical/features.parquet"
