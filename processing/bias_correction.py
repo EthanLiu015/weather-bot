@@ -95,6 +95,49 @@ class BiasCorrectionRegistry:
             corrector = self.get_corrector(station, lead_bucket, season)
             corrector.update(residual)
 
+    def initialize_from_history(
+        self,
+        features_df,
+        window_days: int = 60,
+    ) -> None:
+        """
+        Seed each Kalman corrector from historical residuals (model_proxy - actual_tmax).
+        Feeds the last `window_days` of residuals in chronological order so the
+        corrector state reflects recent model bias rather than starting cold at 0.
+        """
+        import pandas as pd
+
+        if features_df.empty or "actual_tmax" not in features_df.columns:
+            logger.warning("Cannot initialize bias correctors: missing features or actual_tmax")
+            return
+
+        cutoff = features_df["date"].max() - pd.Timedelta(days=window_days)
+        recent = features_df[features_df["date"] >= cutoff].sort_values("date")
+
+        count = 0
+        for _, row in recent.iterrows():
+            station = row["station"]
+            lead_hour = int(row["lead_hour"])
+            actual = row["actual_tmax"]
+            model_proxy = row.get("gefs_tmax_mean", float("nan"))
+
+            import math
+            if math.isnan(actual) or math.isnan(model_proxy):
+                continue
+
+            residual = model_proxy - actual  # positive = model runs warm
+            month = row["date"].month if hasattr(row["date"], "month") else pd.Timestamp(row["date"]).month
+            season = get_season(month)
+            lead_bucket = get_lead_bucket(lead_hour)
+            corrector = self.get_corrector(station, lead_bucket, season)
+            corrector.update(residual)
+            count += 1
+
+        logger.info(
+            "Initialized %d bias correctors from %d recent residuals (last %d days)",
+            len(self._correctors), count, window_days,
+        )
+
     def persist(self) -> None:
         self._persist_dir.mkdir(parents=True, exist_ok=True)
         for (station, lead_bucket, season), corrector in self._correctors.items():

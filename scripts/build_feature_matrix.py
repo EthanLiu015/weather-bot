@@ -1,0 +1,399 @@
+"""
+Build historical training feature matrix from ERA5 + ASOS.
+Run after bootstrap_history.py completes.
+
+Output: data/historical/features.parquet
+One row per (station, date, lead_hour) with all model features + actual_tmax target.
+
+ERA5 is used as a reanalysis proxy for model forecasts:
+  - t2m, d2m, u10, v10, tcc → forecast analogs at lead-time initialization
+  - Spread proxies computed from ±3-day temporal window (captures synoptic variability)
+  - NBM features left NaN (no historical NBM available)
+"""
+import logging
+import os
+import sys
+import tempfile
+import zipfile
+from datetime import date, timedelta
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from config.stations import STATION_REGISTRY, ALL_ICAO
+from processing.features import get_feature_columns
+from processing.bias_correction import BiasCorrectionRegistry, get_lead_bucket, get_season
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
+
+ERA5_DIR = Path("data/era5")
+HIST_DIR = Path("data/historical")
+REGIME_DIR = Path("data/regime_clusters")
+BIAS_DIR = Path("data/bias_correctors")
+
+LEAD_HOURS = [24, 48, 72, 96, 120, 168]
+SPREAD_WINDOW_HOURS = 72   # ±3 days for spread proxy
+
+
+# ---------------------------------------------------------------------------
+# ERA5 loading
+# ---------------------------------------------------------------------------
+
+def _load_era5_zip(path: Path, tmp_dir: str) -> tuple[xr.Dataset, xr.Dataset]:
+    with zipfile.ZipFile(path) as z:
+        z.extractall(tmp_dir)
+    instant = xr.open_dataset(
+        os.path.join(tmp_dir, "data_stream-oper_stepType-instant.nc"),
+        engine="netcdf4",
+    )
+    accum = xr.open_dataset(
+        os.path.join(tmp_dir, "data_stream-oper_stepType-accum.nc"),
+        engine="netcdf4",
+    )
+    return instant, accum
+
+
+def _extract_station_series(instant: xr.Dataset, accum: xr.Dataset, station: str) -> pd.DataFrame:
+    meta = STATION_REGISTRY[station]
+    lat, lon = meta.lat, meta.lon
+    lon_360 = lon % 360
+
+    def nearest(da: xr.DataArray) -> pd.Series:
+        vals = da.sel(latitude=lat, longitude=lon_360, method="nearest")
+        return pd.Series(vals.values, index=pd.to_datetime(da.valid_time.values))
+
+    rows = pd.DataFrame({
+        "t2m":  nearest(instant["t2m"]),
+        "d2m":  nearest(instant["d2m"]),
+        "u10":  nearest(instant["u10"]),
+        "v10":  nearest(instant["v10"]),
+        "tcc":  nearest(instant["tcc"]),
+        "sp":   nearest(instant["sp"]),
+        "tp":   nearest(accum["tp"]),
+    })
+    rows.index.name = "valid_time"
+    return rows
+
+
+def build_era5_station_ts(stations: list[str]) -> dict[str, pd.DataFrame]:
+    """
+    Load all ERA5 zip files and extract a continuous time series per station.
+    Returns dict[station] -> DataFrame indexed by UTC timestamp.
+    """
+    era5_files = sorted(ERA5_DIR.glob("era5_*.nc"))
+    if not era5_files:
+        raise FileNotFoundError(f"No ERA5 files found in {ERA5_DIR}")
+
+    logger.info("Loading %d ERA5 files for %d stations...", len(era5_files), len(stations))
+    station_frames: dict[str, list[pd.DataFrame]] = {s: [] for s in stations}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for era5_path in era5_files:
+            logger.info("  %s", era5_path.name)
+            try:
+                instant, accum = _load_era5_zip(era5_path, tmp)
+                for station in stations:
+                    df = _extract_station_series(instant, accum, station)
+                    station_frames[station].append(df)
+                instant.close()
+                accum.close()
+                # Clean up extracted files for next iteration
+                for f in Path(tmp).glob("*.nc"):
+                    f.unlink()
+            except Exception as exc:
+                logger.warning("Failed to load %s: %s", era5_path.name, exc)
+
+    result = {}
+    for station, frames in station_frames.items():
+        if frames:
+            combined = pd.concat(frames).sort_index()
+            combined = combined[~combined.index.duplicated(keep="first")]
+            result[station] = combined
+            logger.info("ERA5 ts for %s: %d timesteps", station, len(combined))
+        else:
+            logger.warning("No ERA5 data for %s", station)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ASOS actual Tmax
+# ---------------------------------------------------------------------------
+
+def build_asos_daily_tmax(station: str, tz: str) -> pd.Series:
+    """Return daily Tmax (°F) in local station time, indexed by date."""
+    path = HIST_DIR / f"{station}_hourly.parquet"
+    if not path.exists():
+        logger.warning("No ASOS file for %s", station)
+        return pd.Series(dtype=float)
+
+    df = pd.read_parquet(path)
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+    df["datetime_local"] = df["datetime"].dt.tz_convert(tz)
+    df["date_local"] = df["datetime_local"].dt.date
+    df = df.dropna(subset=["tmpf"])
+
+    daily_tmax = df.groupby("date_local")["tmpf"].max()
+    daily_tmax.index = pd.to_datetime(daily_tmax.index)
+    return daily_tmax
+
+
+# ---------------------------------------------------------------------------
+# Feature computation from ERA5 time series
+# ---------------------------------------------------------------------------
+
+def _kelvin_to_f(k: float) -> float:
+    return (k - 273.15) * 9 / 5 + 32 if not np.isnan(k) else float("nan")
+
+
+def _cyclical(val: float, period: float) -> tuple[float, float]:
+    return float(np.sin(2 * np.pi * val / period)), float(np.cos(2 * np.pi * val / period))
+
+
+def _spread_proxy(ts: pd.DataFrame, center_time: pd.Timestamp, col: str, window_hours: int = 72) -> dict:
+    lo = center_time - pd.Timedelta(hours=window_hours)
+    hi = center_time + pd.Timedelta(hours=window_hours)
+    window = ts.loc[lo:hi, col].dropna()
+    if len(window) < 3:
+        return {"std": float("nan"), "p10": float("nan"), "p25": float("nan"),
+                "p75": float("nan"), "p90": float("nan"), "iqr": float("nan"),
+                "range": float("nan")}
+    vals_f = np.array([_kelvin_to_f(v) for v in window])
+    return {
+        "std":   float(np.std(vals_f)),
+        "p10":   float(np.percentile(vals_f, 10)),
+        "p25":   float(np.percentile(vals_f, 25)),
+        "p75":   float(np.percentile(vals_f, 75)),
+        "p90":   float(np.percentile(vals_f, 90)),
+        "iqr":   float(np.percentile(vals_f, 75) - np.percentile(vals_f, 25)),
+        "range": float(np.percentile(vals_f, 90) - np.percentile(vals_f, 10)),
+    }
+
+
+def build_feature_rows(
+    station: str,
+    era5_ts: pd.DataFrame,
+    daily_tmax: pd.Series,
+    regime_labels: pd.DataFrame,
+) -> list[dict]:
+    meta = STATION_REGISTRY[station]
+    tz = meta.timezone
+    rows = []
+
+    # Pre-compute lag residuals: actual_tmax - era5 mean at D+1 (lead=24h)
+    # Used for obs_minus_model_lag features
+    lag_residuals: dict[date, float] = {}
+
+    for verification_date, actual_tmax in daily_tmax.items():
+        if pd.isna(actual_tmax):
+            continue
+        vdate = verification_date.date() if hasattr(verification_date, "date") else verification_date
+
+        for lead_hour in LEAD_HOURS:
+            # ERA5 initialization time: lead_hour before midnight UTC of verification date
+            # Use tz-naive to match the ERA5 index (which comes out of netCDF4 as tz-naive UTC)
+            init_utc = pd.Timestamp(vdate) - pd.Timedelta(hours=lead_hour)
+
+            # Find closest ERA5 timestep
+            if era5_ts.empty:
+                continue
+            time_diffs = abs(era5_ts.index - init_utc)
+            if time_diffs.min() > pd.Timedelta(hours=7):
+                continue
+            closest_idx = time_diffs.argmin()
+            closest_time = era5_ts.index[closest_idx]
+            row_era5 = era5_ts.iloc[closest_idx]
+
+            t2m_k  = row_era5.get("t2m", float("nan"))
+            d2m_k  = row_era5.get("d2m", float("nan"))
+            u10    = row_era5.get("u10", float("nan"))
+            v10    = row_era5.get("v10", float("nan"))
+            tcc    = row_era5.get("tcc", float("nan"))
+            tp_m   = row_era5.get("tp", float("nan"))
+
+            t2m_f  = _kelvin_to_f(t2m_k)
+            d2m_f  = _kelvin_to_f(d2m_k)
+            wind   = float(np.sqrt(u10**2 + v10**2)) if not (np.isnan(u10) or np.isnan(v10)) else float("nan")
+            wdir_sin = float(np.sin(np.arctan2(u10, v10))) if not (np.isnan(u10) or np.isnan(v10)) else float("nan")
+            wdir_cos = float(np.cos(np.arctan2(u10, v10))) if not (np.isnan(u10) or np.isnan(v10)) else float("nan")
+            tcc_pct  = float(tcc) * 100.0 if not np.isnan(tcc) else float("nan")
+            dp_dep   = t2m_f - d2m_f if not (np.isnan(t2m_f) or np.isnan(d2m_f)) else float("nan")
+            tp_mm    = float(tp_m) * 1000.0 if not np.isnan(tp_m) else float("nan")
+            precip_p = 1.0 if (not np.isnan(tp_mm) and tp_mm > 0) else 0.0
+
+            # Cloud fractions
+            if not np.isnan(tcc):
+                cloud_total = min(max(float(tcc), 0.0), 1.0)
+                cloud_low   = cloud_total * 0.5
+                cloud_mid   = cloud_total * 0.3
+                cloud_high  = cloud_total * 0.2
+            else:
+                cloud_total = cloud_low = cloud_mid = cloud_high = float("nan")
+
+            # Spread proxies from ±SPREAD_WINDOW_HOURS of ERA5
+            sp = _spread_proxy(era5_ts, closest_time, "t2m", SPREAD_WINDOW_HOURS)
+            sp_f = {k: _kelvin_to_f(v) if k not in ("std", "iqr", "range") else v for k, v in sp.items()}
+
+            # Temporal features
+            month = vdate.month
+            doy   = vdate.timetuple().tm_yday
+            month_sin, month_cos   = _cyclical(month, 12)
+            doy_sin, doy_cos       = _cyclical(doy, 365)
+            lead_sin, lead_cos     = _cyclical(lead_hour, 168)
+
+            # Lag residuals: last 3 days of (actual - era5_proxy) at D+1 lead
+            lag1 = lag_residuals.get(vdate - timedelta(days=1), float("nan"))
+            lag2 = lag_residuals.get(vdate - timedelta(days=2), float("nan"))
+            lag3 = lag_residuals.get(vdate - timedelta(days=3), float("nan"))
+
+            # Store D+1 residual for future use
+            if lead_hour == 24:
+                lag_residuals[vdate] = actual_tmax - t2m_f
+
+            # Regime cluster
+            regime_vec = [0.0] * 12
+            if regime_labels is not None and not regime_labels.empty:
+                vdate_ts = pd.Timestamp(vdate)
+                matches = regime_labels[regime_labels["date"] == vdate_ts]
+                if not matches.empty:
+                    label = int(matches.iloc[0]["cluster"])
+                    if 0 <= label < 12:
+                        regime_vec[label] = 1.0
+
+            row: dict = {
+                "station":   station,
+                "date":      vdate,
+                "lead_hour": lead_hour,
+                "actual_tmax": actual_tmax,
+                # GEFS proxies (ERA5 as deterministic + spread from temporal window)
+                "gefs_tmax_mean":          t2m_f,
+                "gefs_tmax_median":        t2m_f,
+                "gefs_tmax_std":           sp_f["std"],
+                "gefs_tmax_range":         sp_f["range"],
+                "gefs_tmax_iqr":           sp_f["iqr"],
+                "gefs_tmax_p10":           sp_f["p10"],
+                "gefs_tmax_p25":           sp_f["p25"],
+                "gefs_tmax_p75":           sp_f["p75"],
+                "gefs_tmax_p90":           sp_f["p90"],
+                "gefs_ensemble_skewness":  0.0,
+                "gefs_ensemble_kurtosis":  0.0,
+                "gefs_tmin_mean":          t2m_f,  # same source, Tmin proxy
+                "gefs_tmin_std":           sp_f["std"],
+                # ECMWF = ERA5 (ERA5 is ECMWF's reanalysis)
+                "ecmwf_tmax":              t2m_f,
+                "ecmwf_tmin":             t2m_f,
+                "ecmwf_gefs_tmax_delta":   0.0,
+                # NBM — unavailable historically
+                "nbm_t10":   float("nan"), "nbm_t25": float("nan"),
+                "nbm_t50":   float("nan"), "nbm_t75": float("nan"),
+                "nbm_t90":   float("nan"), "nbm_tmax": float("nan"),
+                "nbm_tmin":  float("nan"), "nbm_pop12": float("nan"),
+                "nbm_spread": float("nan"), "nbm_gefs_delta": float("nan"),
+                # Atmospheric
+                "cloud_cover_total":          cloud_total,
+                "cloud_low_frac":             cloud_low,
+                "cloud_mid_frac":             cloud_mid,
+                "cloud_high_frac":            cloud_high,
+                "surface_wind_speed":         wind,
+                "wind_dir_sin":               wdir_sin,
+                "wind_dir_cos":               wdir_cos,
+                "surface_dew_point_depression": dp_dep,
+                "convective_precip_prob":     precip_p,
+                "total_precip_mm":            tp_mm,
+                # Temporal
+                "lead_time_hours": float(lead_hour),
+                "lead_sin":  lead_sin, "lead_cos": lead_cos,
+                "month_sin": month_sin, "month_cos": month_cos,
+                "day_of_year_sin": doy_sin, "day_of_year_cos": doy_cos,
+                # Station one-hots
+                **{f"station_{icao.lower()}": 1.0 if station == icao else 0.0
+                   for icao in ALL_ICAO},
+                # Physical meta
+                "elevation_delta_m":   meta.elevation_m,
+                "uhi_index":           meta.uhi_index,
+                "coastal_distance_km": meta.coastal_distance_km,
+                # Residual lags
+                "obs_minus_model_lag1": lag1,
+                "obs_minus_model_lag2": lag2,
+                "obs_minus_model_lag3": lag3,
+            }
+            for i, v in enumerate(regime_vec):
+                row[f"regime_cluster_{i}"] = v
+
+            rows.append(row)
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    out_path = HIST_DIR / "features.parquet"
+    if out_path.exists():
+        logger.info("features.parquet already exists — delete it to rebuild")
+        return
+
+    # Load regime labels
+    regime_labels = pd.DataFrame()
+    regime_path = REGIME_DIR / "historical_labels.parquet"
+    if regime_path.exists():
+        regime_labels = pd.read_parquet(regime_path)
+        regime_labels["date"] = pd.to_datetime(regime_labels["date"])
+        logger.info("Regime labels: %d rows", len(regime_labels))
+
+    # Load ERA5 time series for all stations
+    era5_ts = build_era5_station_ts(ALL_ICAO)
+
+    all_rows = []
+    for station in ALL_ICAO:
+        logger.info("=== %s (%s) ===", station, STATION_REGISTRY[station].city)
+
+        if station not in era5_ts:
+            logger.warning("No ERA5 data for %s — skipping", station)
+            continue
+
+        daily_tmax = build_asos_daily_tmax(station, STATION_REGISTRY[station].timezone)
+        if daily_tmax.empty:
+            logger.warning("No ASOS data for %s — skipping", station)
+            continue
+
+        rows = build_feature_rows(station, era5_ts[station], daily_tmax, regime_labels)
+        logger.info("%s: %d feature rows", station, len(rows))
+        all_rows.extend(rows)
+
+    if not all_rows:
+        logger.error("No rows produced — check ERA5 and ASOS data")
+        return
+
+    df = pd.DataFrame(all_rows)
+
+    # Ensure all feature columns present (fill missing with NaN)
+    for col in get_feature_columns():
+        if col not in df.columns:
+            df[col] = float("nan")
+
+    # Fill NBM NaNs with 0 for training (model learns they're absent)
+    nbm_cols = [c for c in df.columns if c.startswith("nbm_")]
+    df[nbm_cols] = df[nbm_cols].fillna(0.0)
+
+    df = df.sort_values(["station", "date", "lead_hour"]).reset_index(drop=True)
+    df.to_parquet(out_path, index=False)
+
+    logger.info(
+        "Saved features.parquet: %d rows × %d cols | stations=%d | dates %s → %s",
+        len(df), len(df.columns), df["station"].nunique(),
+        df["date"].min(), df["date"].max(),
+    )
+    logger.info("Target stats: actual_tmax mean=%.1f std=%.1f min=%.1f max=%.1f",
+                df["actual_tmax"].mean(), df["actual_tmax"].std(),
+                df["actual_tmax"].min(), df["actual_tmax"].max())
+
+
+if __name__ == "__main__":
+    main()

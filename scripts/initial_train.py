@@ -1,9 +1,15 @@
 """
-One-time script: train all models from scratch after bootstrap_history.py.
+One-time script: train all models from scratch.
 
-Usage: python scripts/initial_train.py
+Run order:
+  1. python scripts/bootstrap_history.py
+  2. python scripts/build_feature_matrix.py    ← assembles features.parquet
+  3. python scripts/initial_train.py           ← this script
+
+Usage: PYTHONPATH=. python scripts/initial_train.py
 """
 import logging
+import sys
 from datetime import date
 from dateutil.relativedelta import relativedelta
 from pathlib import Path
@@ -11,138 +17,170 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-STATIONS = ["KORD", "KJFK", "KLAX"]
 HIST_DIR = Path("data/historical")
+CALIBRATOR_DIR = Path("data/calibrators")
 
 
 def load_feature_data() -> pd.DataFrame:
     feat_path = HIST_DIR / "features.parquet"
-    if feat_path.exists():
-        return pd.read_parquet(feat_path)
-    logger.warning("features.parquet not found — using empty DataFrame")
-    return pd.DataFrame()
+    if not feat_path.exists():
+        logger.error(
+            "features.parquet not found.\n"
+            "Run: PYTHONPATH=. python scripts/build_feature_matrix.py"
+        )
+        return pd.DataFrame()
+    df = pd.read_parquet(feat_path)
+    df["date"] = pd.to_datetime(df["date"])
+    logger.info("Loaded features.parquet: %d rows, %d stations", len(df), df["station"].nunique())
+    return df
 
 
 def main() -> None:
     from config.settings import get_settings
+    from config.stations import ALL_ICAO
     from db.session import init_db
-    settings = get_settings()
-    init_db(settings.DB_URL)
-
-    logger.info("Loading historical feature data...")
-    df = load_feature_data()
-
-    if df.empty:
-        logger.error("No historical data found. Run scripts/bootstrap_history.py first.")
-        return
-
-    # Step 2: Run backtest to get validation metrics and calibration datasets
-    end_date = date.today()
-    start_date = end_date - relativedelta(years=4)
-    logger.info("Running walk-forward backtest %s → %s", start_date, end_date)
-
-    from backtest.runner import BacktestRunner
-    runner = BacktestRunner(settings=settings, start_date=start_date, end_date=end_date)
-    report = runner.run()
-    summary = report.summary()
-    logger.info("Backtest summary: %s", summary)
-
-    report.to_csv("data/backtest_results.csv")
-    report.to_html("data/backtest_report.html")
-
-    # Step 3: Train final models on ALL available data
     from processing.features import get_feature_columns
+    from processing.bias_correction import BiasCorrectionRegistry
     from models.ngboost_model import NGBoostTemperatureModel
     from models.qrf_model import QRFTemperatureModel
     from models.residual_model import ResidualModel
     from models.calibration import IsotonicCalibrator
     from models.blend import ModelBlender
     from models.registry import save_artifact
+    from backtest.runner import BacktestRunner
+
+    settings = get_settings()
+    init_db(settings.DB_URL)
+
+    df = load_feature_data()
+    if df.empty:
+        return
 
     feature_cols = get_feature_columns()
     target_col = "actual_tmax"
 
     if target_col not in df.columns:
-        logger.error("No target column '%s' in feature data", target_col)
+        logger.error("No 'actual_tmax' column in feature data")
         return
 
-    avail_cols = [c for c in feature_cols if c in df.columns]
-    X_all = df[avail_cols].fillna(0.0)
-    y_all = df[target_col]
+    # -------------------------------------------------------------------------
+    # Step 1: Seed Kalman bias correctors from history (last 60 days)
+    # -------------------------------------------------------------------------
+    logger.info("=== Seeding bias correctors from history ===")
+    bias_registry = BiasCorrectionRegistry()
+    bias_registry.initialize_from_history(df, window_days=60)
+    bias_registry.persist()
+    logger.info("Bias correctors saved to data/bias_correctors/")
+
+    # -------------------------------------------------------------------------
+    # Step 2: Walk-forward backtest (produces out-of-sample metrics + calibration data)
+    # -------------------------------------------------------------------------
+    end_date = date.today()
+    start_date = end_date - relativedelta(years=4)
+    logger.info("=== Walk-forward backtest %s → %s ===", start_date, end_date)
+
+    runner = BacktestRunner(settings=settings, start_date=start_date, end_date=end_date)
+    report = runner.run()
+    summary = report.summary()
+
+    if summary:
+        logger.info("Backtest summary:")
+        for k, v in summary.items():
+            logger.info("  %s: %s", k, f"{v:.4f}" if isinstance(v, float) else v)
+
+    report.to_csv("data/backtest_results.csv")
+    report.to_html("data/backtest_report.html")
+    logger.info("Backtest report: data/backtest_report.html")
+
+    # -------------------------------------------------------------------------
+    # Step 3: Train final models on ALL data, per station × lead bucket
+    # -------------------------------------------------------------------------
+    logger.info("=== Training final models ===")
+    CALIBRATOR_DIR.mkdir(parents=True, exist_ok=True)
 
     blender = ModelBlender()
-    station_groups = df.groupby("station") if "station" in df.columns else [("ALL", df)]
+    ngb_scores: dict[str, float] = {}
+    qrf_scores: dict[str, float] = {}
 
-    for station, station_df in station_groups:
-        logger.info("Training models for station: %s", station)
+    stations_in_data = df["station"].unique().tolist()
+    logger.info("Stations with data: %s", stations_in_data)
+
+    for station in stations_in_data:
+        station_df = df[df["station"] == station].copy()
+        avail_cols = [c for c in feature_cols if c in station_df.columns]
         X_st = station_df[avail_cols].fillna(0.0)
         y_st = station_df[target_col]
 
-        if len(X_st) < 100:
-            logger.warning("Insufficient data for %s (%d rows)", station, len(X_st))
+        if len(X_st) < 200:
+            logger.warning("Skipping %s — only %d rows", station, len(X_st))
             continue
+
+        logger.info("--- %s: %d rows ---", station, len(X_st))
 
         # NGBoost
         ngb = NGBoostTemperatureModel(n_estimators=500, learning_rate=0.01)
         ngb.fit(X_st, y_st)
         ngb_score = ngb.log_score(X_st, y_st)
+        ngb_scores[station] = ngb_score
         save_artifact(ngb, "ngboost", station, crps_val=abs(ngb_score))
-        logger.info("NGBoost fitted for %s (log_score=%.4f)", station, ngb_score)
+        logger.info("NGBoost %s log_score=%.4f", station, ngb_score)
 
         # QRF
         qrf = QRFTemperatureModel(n_estimators=500, min_samples_leaf=20)
         qrf.fit(X_st, y_st)
         qrf_score = qrf.log_score(X_st, y_st)
+        qrf_scores[station] = qrf_score
         save_artifact(qrf, "qrf", station, crps_val=abs(qrf_score))
-        logger.info("QRF fitted for %s (crps=%.4f)", station, qrf_score)
+        logger.info("QRF %s crps=%.4f", station, qrf_score)
 
-        blender.compute_weights_from_log_scores(ngb_score, qrf_score)
-
-        # Residual model
-        residual_features = [c for c in [
+        # Residual model (LightGBM)
+        residual_feature_cols = [c for c in [
             "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
             "lead_time_hours", "month_sin", "month_cos",
         ] + [f"regime_cluster_{i}" for i in range(12)] if c in X_st.columns]
 
         mu_pred, _ = ngb.predict_distribution(X_st)
-        residuals = y_st.values - mu_pred
-        if residual_features:
+        residuals = pd.Series(y_st.values - mu_pred, index=X_st.index)
+        if residual_feature_cols and residuals.abs().mean() > 0.01:
             res_model = ResidualModel(station=station)
-            res_model.fit(X_st[residual_features], pd.Series(residuals, index=X_st.index))
+            res_model.fit(X_st[residual_feature_cols], residuals)
             save_artifact(res_model, "residual", station)
+            logger.info("Residual model saved for %s (mean_residual=%.2f°F)", station, residuals.mean())
 
-        # Calibration per lead bucket
-        for lead_bucket in ["D1-2", "D3-4", "D5-7"]:
-            if "lead_time_hours" in station_df.columns:
-                if lead_bucket == "D1-2":
-                    mask = station_df["lead_time_hours"] <= 48
-                elif lead_bucket == "D3-4":
-                    mask = (station_df["lead_time_hours"] > 48) & (station_df["lead_time_hours"] <= 96)
-                else:
-                    mask = station_df["lead_time_hours"] > 96
+        # Isotonic calibration per lead bucket
+        for lead_bucket, lh_min, lh_max in [("D1-2", 0, 48), ("D3-4", 49, 96), ("D5-7", 97, 999)]:
+            mask = (station_df["lead_hour"] >= lh_min) & (station_df["lead_hour"] <= lh_max)
+            sub = station_df[mask]
+            if len(sub) < 100:
+                logger.debug("Skipping calibrator %s/%s — only %d rows", station, lead_bucket, len(sub))
+                continue
 
-                sub_df = station_df[mask]
-                if len(sub_df) < 50:
-                    continue
+            X_sub = sub[avail_cols].fillna(0.0)
+            y_sub = sub[target_col]
+            threshold = float(y_sub.median())
+            raw_probs = ngb.predict_prob_above(X_sub, threshold)
+            outcomes = (y_sub > threshold).astype(float).values
 
-                X_sub = sub_df[avail_cols].fillna(0.0)
-                y_sub = sub_df[target_col]
-                threshold = float(y_sub.mean())
-                raw_probs = ngb.predict_prob_above(X_sub, threshold)
-                outcomes = (y_sub > threshold).astype(float).values
+            cal = IsotonicCalibrator()
+            cal.fit(raw_probs, outcomes)
+            cal_path = CALIBRATOR_DIR / f"{station}_{lead_bucket}.pkl"
+            cal.save(str(cal_path))
+            logger.info("Calibrator saved: %s/%s (n=%d, slope=%.3f)",
+                        station, lead_bucket, len(sub), cal.reliability_slope())
 
-                cal = IsotonicCalibrator()
-                cal.fit(raw_probs, outcomes)
-                cal_path = f"data/calibrators/{station}_{lead_bucket}.pkl"
-                cal.save(cal_path)
-                logger.info("Calibrator saved for %s/%s", station, lead_bucket)
+    # Compute blend weights from walk-forward log-scores
+    if ngb_scores and qrf_scores:
+        mean_ngb = float(np.mean(list(ngb_scores.values())))
+        mean_qrf = float(np.mean(list(qrf_scores.values())))
+        blender.compute_weights_from_log_scores(mean_ngb, mean_qrf)
+        logger.info("Final blend weights: %s", blender.weights)
 
-    logger.info("Blend weights: %s", blender.weights)
-    logger.info("=== Initial training complete! ===")
-    logger.info("Backtest report: data/backtest_report.html")
+    logger.info("=== Training complete ===")
+    logger.info("Next step: uvicorn api.main:app --reload")
 
 
 if __name__ == "__main__":

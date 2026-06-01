@@ -5,7 +5,11 @@ import json
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",  # silently ignore unknown env vars (e.g. NOAA_CDO_TOKEN)
+    )
 
     KALSHI_API_KEY: str
     KALSHI_PRIVATE_KEY_PATH: str

@@ -33,12 +33,18 @@ async def test_fair_value_near_certain_yes_when_tmax_exceeds_threshold():
 async def test_fair_value_near_certain_no_when_max_impossible():
     shared_state = SharedState()
     strategy = D0Strategy(shared_state=shared_state, settings=_make_settings())
-    # running_tmax = 65, threshold = 90, only 1 hour remaining — impossible to reach
+    # running_tmax=65, threshold=90, it's 11pm local so max possible ≈ 65+3 = 68 < 90
     obs = [{"temp_f": 65.0 + i * 0.01, "observation_time": None} for i in range(3)]
+
+    import datetime as dt_mod, zoneinfo
+    fake_now = dt_mod.datetime(2026, 6, 1, 23, 0, 0, tzinfo=zoneinfo.ZoneInfo("America/Chicago"))
 
     with patch("strategies.d0_strategy.fetch_metar", new=AsyncMock(return_value=obs)), \
          patch("strategies.d0_strategy.D0Strategy.is_resolution_day", new=AsyncMock(return_value=True)), \
-         patch("strategies.d0_strategy.estimate_remaining_hours", return_value=1):
+         patch("strategies.d0_strategy.estimate_remaining_hours", return_value=1), \
+         patch("strategies.d0_strategy.datetime") as mock_dt:
+        mock_dt.now.return_value = fake_now
+        mock_dt.utcnow.return_value = fake_now.astimezone(dt_mod.timezone.utc).replace(tzinfo=None)
         await strategy.run_cycle("KORD", "KORD-20260601-90", threshold=90.0)
 
     snap = shared_state.snapshot()
