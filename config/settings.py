@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     STATIONS: list[str] = ["KORD", "KJFK", "KLAX"]
     DB_URL: str = "sqlite:///./kalshi_bot.db"
     BOT_ACTIVE: bool = True
+    PAPER_TRADING: bool = True  # when True: real market data, simulated fills, no real orders
     MAX_DAILY_LOSS_USD: float = 500.0
     MAX_EXPOSURE_PER_TICKER_USD: float = 200.0
     KELLY_FRACTION: float = 0.25

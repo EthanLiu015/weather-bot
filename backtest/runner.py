@@ -1,5 +1,6 @@
 import logging
 from datetime import date, timedelta
+from pathlib import Path
 from dateutil.relativedelta import relativedelta
 import numpy as np
 import pandas as pd
@@ -89,22 +90,35 @@ class BacktestRunner:
         X_test = test_df[avail_cols].fillna(0.0)
         y_test = test_df[target_col]
 
+        # Add forecast-error noise to ERA5-derived temperature features during training.
+        # ERA5 reanalysis is near-perfect; real GEFS/ECMWF forecasts have uncertainty.
+        # Noise std by lead bucket (°F): D1-2≈3°F, D3-4≈5°F, D5-7≈7°F
+        X_train = self._add_forecast_noise(X_train, train_df, avail_cols)
+
         ngb = NGBoostTemperatureModel(n_estimators=200, learning_rate=0.05)
         ngb.fit(X_train, y_train)
         mu_test, sigma_test = ngb.predict_distribution(X_test)
 
-        threshold = float(y_train.mean())
-        prob_forecasts = ngb.predict_prob_above(X_test, threshold)
-        outcomes = (y_test > threshold).astype(float).values
+        # ── Forecast skill metrics use a single global threshold ──────────────
+        global_threshold = float(y_train.mean())
+        prob_forecasts = ngb.predict_prob_above(X_test, global_threshold)
+        outcomes = (y_test > global_threshold).astype(float).values
 
         calibrator = IsotonicCalibrator()
-        prob_train = ngb.predict_prob_above(X_train, threshold)
-        outcomes_train = (y_train > threshold).astype(float).values
+        prob_train = ngb.predict_prob_above(X_train, global_threshold)
+        outcomes_train = (y_train > global_threshold).astype(float).values
         calibrator.fit(prob_train, outcomes_train)
-        if calibrator._iso is not None:
-            cal_probs = calibrator._iso.predict(prob_forecasts)
-        else:
-            cal_probs = prob_forecasts
+        cal_probs = calibrator._iso.predict(prob_forecasts) if calibrator._iso is not None else prob_forecasts
+
+        mu_nan  = int(np.isnan(mu_test).sum())
+        obs_nan = int(np.isnan(y_test.values).sum())
+        logger.info("Fold debug: len(mu)=%d len(obs)=%d mu_nan=%d obs_nan=%d mu_range=[%.1f,%.1f]",
+                    len(mu_test), len(y_test), mu_nan, obs_nan,
+                    float(np.nanmin(mu_test)), float(np.nanmax(mu_test)))
+        if mu_nan > 0 or obs_nan > 0:
+            logger.warning("Clamping NaN values before metrics")
+            mu_test = np.where(np.isfinite(mu_test), mu_test, np.nanmedian(mu_test))
+            sigma_test = np.where(np.isfinite(sigma_test) & (sigma_test > 0), sigma_test, 5.0)
 
         metrics = track_a_metrics(
             prob_forecasts=cal_probs,
@@ -114,22 +128,45 @@ class BacktestRunner:
             outcomes=outcomes,
         )
 
-        # Simulate trades at D+1 only — one decision per (station, date) market
+        # ── Trading simulation uses per-station-month thresholds ─────────────
+        # Station×month median → clim prob ≈ 0.50 by construction, so edge is
+        # real model conviction, not a systematic station-temperature artefact.
+        train_df = train_df.copy()
+        train_df["_month"] = pd.to_datetime(train_df["date"]).dt.month
+        station_month_median = (
+            train_df.groupby(["station", "_month"])[target_col].median()
+        )
+
         if "lead_hour" in test_df.columns:
             d1_mask = test_df["lead_hour"] == 24
             d1_test = test_df[d1_mask].copy()
-            trade_probs = cal_probs[d1_mask]
-            trade_outcomes = outcomes[d1_mask]
+            mu_d1    = mu_test[d1_mask]
+            sigma_d1 = sigma_test[d1_mask]
         else:
-            d1_test = test_df.copy()
-            trade_probs = cal_probs
-            trade_outcomes = outcomes
+            d1_test  = test_df.copy()
+            mu_d1    = mu_test
+            sigma_d1 = sigma_test
+
+        # Per-row threshold and probability
+        from scipy.stats import norm as _norm
+        row_thresholds = np.array([
+            float(station_month_median.get(
+                (row["station"], pd.to_datetime(row["date"]).month),
+                global_threshold,
+            ))
+            for _, row in d1_test.iterrows()
+        ])
+        # P(Tmax > threshold_i) using Normal(mu_i, sigma_i) from NGBoost
+        trade_probs_raw = 1.0 - _norm.cdf(row_thresholds, loc=mu_d1, scale=np.maximum(sigma_d1, 0.01))
+        # Calibrate using the global calibrator (approximate but consistent)
+        trade_probs = calibrator._iso.predict(trade_probs_raw) if calibrator._iso is not None else trade_probs_raw
+        trade_outcomes = (d1_test[target_col].values > row_thresholds).astype(float)
 
         # Build market mids and track which rows used real Kalshi prices
         market_mids, is_real = self._climatological_mids(
             train_df=train_df,
             test_df=d1_test,
-            threshold=threshold,
+            thresholds=row_thresholds,
             target_col=target_col,
         )
 
@@ -171,6 +208,65 @@ class BacktestRunner:
         )
 
     @staticmethod
+    def _load_error_distributions() -> pd.DataFrame:
+        err_path = Path("data/historical/forecast_error_distributions.parquet")
+        if err_path.exists():
+            df = pd.read_parquet(err_path)
+            logger.info("Loaded empirical forecast error distributions: %d buckets", len(df))
+            return df.set_index(["station", "month", "lead_hours"])
+        return pd.DataFrame()
+
+    def _add_forecast_noise(
+        self,
+        X: pd.DataFrame,
+        meta_df: pd.DataFrame,
+        avail_cols: list[str],
+    ) -> pd.DataFrame:
+        """
+        Vectorised: add empirical forecast-error noise to ERA5 temperature features.
+        Uses real ERA5-vs-ASOS error std per (station, month, lead_hours) bucket.
+        Falls back to lead-time-scaled Gaussian when distributions unavailable.
+        """
+        TEMP_COLS = [c for c in avail_cols if any(
+            k in c for k in ("gefs_tmax", "gefs_tmin", "ecmwf_tmax", "ecmwf_tmin", "nbm_t")
+        )]
+        if not TEMP_COLS or "lead_hour" not in meta_df.columns:
+            return X
+
+        err_lookup = self._load_error_distributions()
+        FALLBACK_STD = {(0, 48): 3.0, (49, 96): 5.0, (97, 999): 7.0}
+        avail_leads = sorted(err_lookup.index.get_level_values("lead_hours").unique()) if not err_lookup.empty else []
+
+        # Build per-row std array — vectorised lookup
+        meta = meta_df.reset_index(drop=True).copy()
+        meta["_month"] = pd.to_datetime(meta["date"]).dt.month
+        meta["_lead"]  = meta["lead_hour"].astype(int)
+
+        def get_std(row) -> float:
+            if not err_lookup.empty and avail_leads:
+                closest = min(avail_leads, key=lambda l: abs(l - row["_lead"]))
+                key = (row["station"], row["_month"], closest)
+                try:
+                    return float(err_lookup.loc[key, "std_error_f"])
+                except KeyError:
+                    pass
+            for (lo, hi), fb in FALLBACK_STD.items():
+                if lo <= row["_lead"] <= hi:
+                    return fb
+            return 5.0
+
+        std_arr = meta.apply(get_std, axis=1).values  # shape (n,)
+
+        rng = np.random.default_rng(0)
+        noise = rng.normal(0, 1, size=(len(X), len(TEMP_COLS))) * std_arr[:, None]
+
+        X = X.copy()
+        tc_idx = [X.columns.get_loc(c) for c in TEMP_COLS if c in X.columns]
+        if tc_idx:
+            X.iloc[:, tc_idx] = X.iloc[:, tc_idx].values + noise[:, :len(tc_idx)]
+        return X
+
+    @staticmethod
     def _load_kalshi_prices() -> pd.DataFrame:
         path = "data/historical/kalshi_prices.parquet"
         try:
@@ -206,16 +302,16 @@ class BacktestRunner:
         self,
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
-        threshold: float,
+        thresholds: np.ndarray,
         target_col: str,
         noise_std: float = 0.02,
     ) -> tuple[np.ndarray, np.ndarray]:
         """
-        Compute market mid for each test row as P(Tmax > threshold | station, month)
-        estimated from the training set. This is the efficient-market baseline price —
-        a rational market participant with only historical frequency data would price here.
+        Compute market mid for each test row using its per-row threshold.
+        Thresholds are station×month medians, so clim_prob ≈ 0.50 — edge only
+        appears when the model genuinely diverges from the historical base rate.
 
-        Small Gaussian noise (std=2¢) simulates bid-ask spread and market irrationality.
+        Prefers real Kalshi prices when available, falls back to climatology.
         """
         rng = np.random.default_rng(42)
         mids = np.full(len(test_df), 0.5)
@@ -226,27 +322,28 @@ class BacktestRunner:
         train_df["_month"] = pd.to_datetime(train_df["date"]).dt.month
 
         for i, (_, row) in enumerate(test_df.iterrows()):
+            threshold_i = float(thresholds[i])
             station = row.get("station")
             row_date = row["date"] if isinstance(row["date"], date) else pd.to_datetime(row["date"]).date()
             month = pd.to_datetime(row["date"]).month
 
-            # Prefer real Kalshi market prices when available
-            real_mid = self._get_market_mid(station, row_date, threshold)
+            # Prefer real Kalshi market price at the closest matching threshold
+            real_mid = self._get_market_mid(station, row_date, threshold_i)
             if real_mid is not None:
                 mids[i] = real_mid
                 is_real[i] = True
                 real_price_count += 1
                 continue
 
-            # Fall back to climatological probability
+            # Fall back: P(Tmax > threshold_i | station, month) from training history
+            # Using the station×month median as threshold keeps this near 0.5
             hist = train_df[
                 (train_df["station"] == station) &
                 (train_df["_month"] == month)
             ][target_col].dropna()
 
             if len(hist) >= 10:
-                clim_prob = float((hist > threshold).mean())
-                # Clip to tradeable range — Kalshi markets rarely go below 5¢ or above 95¢
+                clim_prob = float((hist > threshold_i).mean())
                 clim_prob = float(np.clip(clim_prob, 0.05, 0.95))
             else:
                 clim_prob = 0.5

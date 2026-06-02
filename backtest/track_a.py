@@ -4,18 +4,30 @@ import properscoring as ps
 
 
 def compute_crps(forecasts: np.ndarray, observations: np.ndarray) -> float:
-    if len(forecasts.shape) == 1:
-        forecasts = forecasts.reshape(-1, 1)
-    scores = ps.crps_ensemble(observations, forecasts)
-    return float(np.mean(scores))
+    # Drop any rows where either value is NaN before scoring
+    mask = np.isfinite(observations) & np.all(np.isfinite(forecasts.reshape(len(observations), -1)), axis=1)
+    if mask.sum() < 2:
+        return float("nan")
+    obs_clean = observations[mask]
+    fc_clean = forecasts[mask] if forecasts.ndim == 1 else forecasts[mask]
+    if fc_clean.ndim == 1:
+        fc_clean = fc_clean.reshape(-1, 1)
+    scores = ps.crps_ensemble(obs_clean, fc_clean)
+    return float(np.nanmean(scores))
 
 
 def compute_mae(predictions: np.ndarray, observations: np.ndarray) -> float:
-    return float(np.mean(np.abs(predictions - observations)))
+    mask = np.isfinite(predictions) & np.isfinite(observations)
+    if mask.sum() < 2:
+        return float("nan")
+    return float(np.mean(np.abs(predictions[mask] - observations[mask])))
 
 
 def compute_brier_score(prob_forecasts: np.ndarray, outcomes: np.ndarray) -> float:
-    return float(np.mean((prob_forecasts - outcomes) ** 2))
+    mask = np.isfinite(prob_forecasts) & np.isfinite(outcomes)
+    if mask.sum() < 2:
+        return float("nan")
+    return float(np.mean((prob_forecasts[mask] - outcomes[mask]) ** 2))
 
 
 def compute_reliability_slope(
@@ -23,14 +35,20 @@ def compute_reliability_slope(
     outcomes: np.ndarray,
     n_bins: int = 10,
 ) -> float:
+    mask = np.isfinite(prob_forecasts) & np.isfinite(outcomes)
+    if mask.sum() < 10:
+        return float("nan")
+    prob_forecasts = prob_forecasts[mask]
+    outcomes = outcomes[mask]
+
     bins = np.linspace(0, 1, n_bins + 1)
     bin_centers = []
     bin_freqs = []
     for lo, hi in zip(bins[:-1], bins[1:]):
-        mask = (prob_forecasts >= lo) & (prob_forecasts < hi)
-        if mask.sum() > 0:
-            bin_centers.append(prob_forecasts[mask].mean())
-            bin_freqs.append(outcomes[mask].mean())
+        m = (prob_forecasts >= lo) & (prob_forecasts < hi)
+        if m.sum() > 0:
+            bin_centers.append(prob_forecasts[m].mean())
+            bin_freqs.append(outcomes[m].mean())
     if len(bin_centers) < 2:
         return float("nan")
     x = np.array(bin_centers).reshape(-1, 1)
@@ -52,5 +70,5 @@ def track_a_metrics(
         "mae": compute_mae(mu_forecasts, observations),
         "brier_score": compute_brier_score(prob_forecasts, outcomes),
         "reliability_slope": compute_reliability_slope(prob_forecasts, outcomes),
-        "sharpness": float(np.mean(sigma_forecasts)),
+        "sharpness": float(np.nanmean(sigma_forecasts)),
     }

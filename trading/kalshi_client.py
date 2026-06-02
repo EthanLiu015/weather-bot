@@ -37,12 +37,24 @@ class _TokenBucket:
 
 
 class KalshiClient:
-    def __init__(self, api_key: str, private_key_path: str, base_url: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        private_key_path: str,
+        base_url: str,
+        paper_trading: bool = True,
+    ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._bucket = _TokenBucket()
+        self._paper_trading = paper_trading
         pem = Path(private_key_path).read_bytes()
         self._private_key = serialization.load_pem_private_key(pem, password=None)
+        if paper_trading:
+            logger.info(
+                "PAPER TRADING MODE — live market data from %s, NO real orders will be submitted",
+                base_url,
+            )
 
     def _sign_request(self, method: str, path: str, body: str = "") -> dict[str, str]:
         ts_ms = str(int(time.time() * 1000))

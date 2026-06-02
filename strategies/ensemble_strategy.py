@@ -65,13 +65,14 @@ class EnsembleStrategy:
         feature_cols = get_feature_columns()
         available_cols = [c for c in feature_cols if c in feature_df.columns]
 
-        try:
-            ngboost_model = self._registry.get("ngboost")
-            qrf_model = self._registry.get("qrf")
-            blender = self._registry.get("blender")
-            calibrators = self._registry.get("calibrators", {})
-        except Exception as exc:
-            logger.warning("Model registry lookup failed: %s", exc)
+        # Registry stores dicts keyed by station for per-station models
+        ngboost_by_station = self._registry.get("ngboost") or {}
+        qrf_by_station     = self._registry.get("qrf") or {}
+        blender            = self._registry.get("blender")
+        calibrators        = self._registry.get("calibrators") or {}
+
+        if not ngboost_by_station:
+            logger.warning("No trained NGBoost models in registry — skipping cycle")
             return
 
         active_tickers = await self.fetch_active_temperature_tickers()
@@ -91,16 +92,26 @@ class EnsembleStrategy:
                 closest_row = station_rows.iloc[[0]]
                 X = closest_row[available_cols].fillna(0.0)
 
+                ngboost_model = ngboost_by_station.get(station)
+                qrf_model     = qrf_by_station.get(station)
+                if ngboost_model is None:
+                    logger.debug("No model for station %s", station)
+                    continue
+
                 try:
                     ng_prob = ngboost_model.predict_prob_above(X, threshold)
-                    qrf_prob = qrf_model.predict_prob_above(X, threshold)
-                    blended_prob = blender.blend_probs(ng_prob, qrf_prob)
+                    if qrf_model is not None and blender is not None:
+                        qrf_prob = qrf_model.predict_prob_above(X, threshold)
+                        blended_prob = blender.blend_probs(ng_prob, qrf_prob)
+                    else:
+                        blended_prob = ng_prob
                 except Exception as exc:
                     logger.warning("Model inference failed for %s: %s", ticker, exc)
                     continue
 
                 raw_prob = float(blended_prob[0])
-                cal_key = f"{station}_D{min(horizon, 5)}"
+                lead_bucket = "D1-2" if horizon <= 2 else "D3-4" if horizon <= 4 else "D5-7"
+                cal_key = f"{station}_{lead_bucket}"
                 calibrator = calibrators.get(cal_key)
                 if calibrator is not None:
                     cal_prob, ci_lo, ci_hi = calibrator.calibrate(raw_prob)
@@ -135,14 +146,16 @@ class EnsembleStrategy:
 
     async def fetch_active_temperature_tickers(self) -> list[str]:
         try:
-            markets = await self._client.get_markets(status="open", category="temperature")
+            # Kalshi temperature markets are under the "weather" category
+            markets = await self._client.get_markets(status="open", category="weather")
             tickers = []
             for market in markets:
                 ticker = market.get("ticker", "")
-                station_match = any(s.replace("K", "") in ticker for s in STATIONS)
-                if station_match:
+                # Only keep tickers we can map to a station
+                if self._ticker_to_station(ticker) is not None:
                     tickers.append(ticker)
-            return tickers[:50]
+            logger.info("Found %d active temperature tickers", len(tickers))
+            return tickers[:200]
         except Exception as exc:
             logger.error("Failed to fetch active tickers: %s", exc)
             return []
@@ -161,31 +174,55 @@ class EnsembleStrategy:
             logger.warning("Run detection check failed: %s", exc)
             return False
 
-    @staticmethod
-    def _ticker_to_station(ticker: str) -> str | None:
-        for station in STATIONS:
-            shortname = station[1:]
-            if shortname in ticker:
-                return station
-        return None
+    # Series prefix → ASOS station. Matches what Kalshi actually uses.
+    _SERIES_TO_STATION: dict[str, str] = {
+        "KXHIGHCHI": "KORD", "KXLOWTCHI": "KORD",
+        "KXHIGHNY":  "KLGA", "KXHIGHNY0": "KLGA", "KXLOWNYC":  "KLGA",
+        "KXHIGHLAX": "KLAX", "KXLOWTLAX": "KLAX",
+        "KXHIGHMIA": "KMIA", "KXLOWMIA":  "KMIA",
+        "KXHIGHOU":  "KIAH", "KXHIGHHOU": "KIAH", "KXLOWTHOU": "KIAH",
+        "KXHIGHPHIL":"KPHL", "KXLOWPHIL": "KPHL",
+        "KXHIGHATL": "KATL", "KXLOWTATL": "KATL",
+        "KXHIGHAUS": "KAUS", "KXLOWTAUS": "KAUS",
+        "KXDENHIGH": "KDEN", "KXHIGHDEN": "KDEN", "KXLOWDEN":  "KDEN",
+        "KXHIGHTPHX":"KPHX", "KXLOWTPHX": "KPHX",
+        "KXHIGHTSFO":"KSFO", "KXLOWTSFO": "KSFO",
+        "KXHIGHTSEA":"KSEA", "KXLOWTSEA": "KSEA",
+        "KXHIGHTBOS":"KBOS", "KXLOWTBOS": "KBOS",
+        "KXHIGHTDAL":"KDFW", "KXLOWTDAL": "KDFW",
+        "KXHIGHTDC": "KDCA", "KXLOWTDC":  "KDCA",
+        "KXHIGHTLV": "KLAS", "KXLOWTLV":  "KLAS",
+        "KXHIGHTMIN":"KMSP", "KXLOWTMIN": "KMSP",
+        "KXHIGHTOKC":"KOKC", "KXLOWTOKC": "KOKC",
+        "KXHIGHTSATX":"KSAT","KXLOWTSATX":"KSAT",
+        "KXHIGHTNOLA":"KMSY","KXLOWTNOLA":"KMSY",
+    }
+
+    @classmethod
+    def _ticker_to_station(cls, ticker: str) -> str | None:
+        # Ticker format: KXHIGHCHI-26MAY31-T81 → series=KXHIGHCHI
+        series = ticker.split("-")[0]
+        return cls._SERIES_TO_STATION.get(series)
 
     @staticmethod
     def _ticker_to_threshold(ticker: str) -> float | None:
         import re
-        m = re.search(r"(\d+)", ticker)
+        # Format: ...-T81 or ...-B80.5 (T=above, B=below)
+        m = re.search(r"-[TB]([\d.]+)$", ticker)
         if m:
             return float(m.group(1))
         return None
 
     @staticmethod
     def _ticker_to_horizon(ticker: str) -> int:
-        from datetime import date
         import re
-        m = re.search(r"(\d{8})", ticker)
-        if m:
+        from datetime import date as date_type
+        # Format: KXHIGHCHI-26MAY31-T81 → date part = 26MAY31 = May 31 2026
+        parts = ticker.split("-")
+        if len(parts) >= 2:
             try:
-                tdate = datetime.strptime(m.group(1), "%Y%m%d").date()
-                delta = (tdate - date.today()).days
+                tdate = datetime.strptime(parts[1], "%y%b%d").date()
+                delta = (tdate - date_type.today()).days
                 return max(1, delta)
             except ValueError:
                 pass

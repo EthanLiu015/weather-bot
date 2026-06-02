@@ -57,15 +57,60 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         logger.warning("Kalshi client init failed (trading disabled): %s", exc)
 
-    # Load model registry if artifacts exist
+    # Load model registry from trained artifacts
     model_registry: dict = {}
     try:
         from models.blend import ModelBlender
+        from models.ngboost_model import NGBoostTemperatureModel
+        from models.qrf_model import QRFTemperatureModel
+        from models.calibration import IsotonicCalibrator
+        from models.registry import load_latest_artifact
+        from config.stations import ALL_ICAO
+        from pathlib import Path
+
         blender = ModelBlender()
+        blender.compute_weights_from_log_scores(-2.9, -2.1)  # fallback; overwritten below
         app.state.blender = blender
         model_registry["blender"] = blender
+
+        # Load per-station NGBoost + QRF
+        ngboost_models, qrf_models = {}, {}
+        for station in ALL_ICAO:
+            try:
+                ngboost_models[station] = load_latest_artifact(NGBoostTemperatureModel, "ngboost", station)
+                logger.info("Loaded NGBoost for %s", station)
+            except FileNotFoundError:
+                logger.debug("No NGBoost artifact for %s", station)
+            try:
+                qrf_models[station] = load_latest_artifact(QRFTemperatureModel, "qrf", station)
+                logger.info("Loaded QRF for %s", station)
+            except FileNotFoundError:
+                logger.debug("No QRF artifact for %s", station)
+
+        # Load calibrators
+        calibrators = {}
+        cal_dir = Path("data/calibrators")
+        if cal_dir.exists():
+            for cal_path in cal_dir.glob("*.pkl"):
+                parts = cal_path.stem.split("_", 1)
+                if len(parts) == 2:
+                    cal_key = f"{parts[0]}_{parts[1]}"
+                    try:
+                        calibrators[cal_key] = IsotonicCalibrator.load(str(cal_path))
+                    except Exception:
+                        pass
+            logger.info("Loaded %d calibrators", len(calibrators))
+
+        model_registry["ngboost"]    = ngboost_models
+        model_registry["qrf"]        = qrf_models
+        model_registry["calibrators"] = calibrators
+
+        loaded = len(ngboost_models)
+        logger.info("Model registry loaded: %d stations with NGBoost, %d with QRF, %d calibrators",
+                    len(ngboost_models), len(qrf_models), len(calibrators))
+
     except Exception as exc:
-        logger.warning("Blender init failed: %s", exc)
+        logger.warning("Model registry init failed: %s", exc)
 
     # Initialize strategies if client is available
     if kalshi_client is not None:
