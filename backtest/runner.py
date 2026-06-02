@@ -125,10 +125,8 @@ class BacktestRunner:
             trade_probs = cal_probs
             trade_outcomes = outcomes
 
-        # Market mid = climatological P(Tmax > threshold | station, month) from training data.
-        # An efficient market prices close to historical frequency; our edge comes from
-        # deviating from this when model has skill. Much more realistic than random uniform.
-        market_mids = self._climatological_mids(
+        # Build market mids and track which rows used real Kalshi prices
+        market_mids, is_real = self._climatological_mids(
             train_df=train_df,
             test_df=d1_test,
             threshold=threshold,
@@ -142,6 +140,21 @@ class BacktestRunner:
             min_edge=self._settings.MIN_EDGE_CENTS / 100.0,
         )
 
+        # Split PnL by price source: real Kalshi vs climatological
+        real_sim = simulate_pnl(
+            model_probs=trade_probs[is_real],
+            market_mids=market_mids[is_real],
+            outcomes=trade_outcomes[is_real],
+            min_edge=self._settings.MIN_EDGE_CENTS / 100.0,
+        ) if is_real.any() else {"simulated_pnl_usd": 0.0, "num_simulated_trades": 0}
+
+        clim_sim = simulate_pnl(
+            model_probs=trade_probs[~is_real],
+            market_mids=market_mids[~is_real],
+            outcomes=trade_outcomes[~is_real],
+            min_edge=self._settings.MIN_EDGE_CENTS / 100.0,
+        ) if (~is_real).any() else {"simulated_pnl_usd": 0.0, "num_simulated_trades": 0}
+
         return FoldResult(
             fold_month=test_month,
             crps=metrics["crps"],
@@ -151,6 +164,10 @@ class BacktestRunner:
             simulated_pnl_usd=sim["simulated_pnl_usd"],
             num_simulated_trades=sim["num_simulated_trades"],
             edge_above_threshold_pct=sim["edge_above_threshold_pct"],
+            real_price_pnl=real_sim["simulated_pnl_usd"],
+            real_price_trades=real_sim["num_simulated_trades"],
+            clim_price_pnl=clim_sim["simulated_pnl_usd"],
+            clim_price_trades=clim_sim["num_simulated_trades"],
         )
 
     @staticmethod
@@ -192,7 +209,7 @@ class BacktestRunner:
         threshold: float,
         target_col: str,
         noise_std: float = 0.02,
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
         """
         Compute market mid for each test row as P(Tmax > threshold | station, month)
         estimated from the training set. This is the efficient-market baseline price —
@@ -202,6 +219,7 @@ class BacktestRunner:
         """
         rng = np.random.default_rng(42)
         mids = np.full(len(test_df), 0.5)
+        is_real = np.zeros(len(test_df), dtype=bool)
         real_price_count = 0
 
         train_df = train_df.copy()
@@ -216,6 +234,7 @@ class BacktestRunner:
             real_mid = self._get_market_mid(station, row_date, threshold)
             if real_mid is not None:
                 mids[i] = real_mid
+                is_real[i] = True
                 real_price_count += 1
                 continue
 
@@ -236,9 +255,9 @@ class BacktestRunner:
             mids[i] = float(np.clip(clim_prob + noise, 0.02, 0.98))
 
         if real_price_count > 0:
-            logger.debug("Market mids: %d real Kalshi prices, %d climatological",
-                         real_price_count, len(test_df) - real_price_count)
-        return mids
+            logger.info("Market mids: %d real Kalshi prices, %d climatological",
+                        real_price_count, len(test_df) - real_price_count)
+        return mids, is_real
 
     def _load_historical_features(self, start: date, end: date) -> pd.DataFrame:
         hist_path = "data/historical/features.parquet"

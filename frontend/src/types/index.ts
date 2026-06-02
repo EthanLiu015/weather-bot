@@ -63,6 +63,10 @@ export type BacktestFold = {
   simulated_pnl_usd: number | null
   num_simulated_trades: number
   edge_above_threshold_pct: number | null
+  real_price_pnl: number
+  real_price_trades: number
+  clim_price_pnl: number
+  clim_price_trades: number
 }
 
 export type BacktestSummary = {
@@ -73,6 +77,10 @@ export type BacktestSummary = {
   mean_reliability_slope: number
   total_simulated_pnl: number
   total_trades: number
+  total_real_price_pnl: number
+  total_real_price_trades: number
+  total_clim_price_pnl: number
+  total_clim_price_trades: number
 }
 
 export type BacktestReport = {

@@ -17,6 +17,11 @@ class FoldResult:
     simulated_pnl_usd: float
     num_simulated_trades: int
     edge_above_threshold_pct: float
+    # Real Kalshi price trades vs climatological baseline
+    real_price_pnl: float = 0.0
+    real_price_trades: int = 0
+    clim_price_pnl: float = 0.0
+    clim_price_trades: int = 0
 
 
 @dataclass
@@ -36,6 +41,10 @@ class BacktestReport:
             "total_simulated_pnl": float(sum(f.simulated_pnl_usd for f in self.folds)),
             "total_trades": sum(f.num_simulated_trades for f in self.folds),
             "mean_edge_pct": float(np.mean([f.edge_above_threshold_pct for f in self.folds])),
+            "total_real_price_pnl": float(sum(f.real_price_pnl for f in self.folds)),
+            "total_real_price_trades": sum(f.real_price_trades for f in self.folds),
+            "total_clim_price_pnl": float(sum(f.clim_price_pnl for f in self.folds)),
+            "total_clim_price_trades": sum(f.clim_price_trades for f in self.folds),
         }
 
     def to_csv(self, path: str) -> None:
@@ -45,6 +54,8 @@ class BacktestReport:
                 "fold_month", "crps", "mae", "brier_score",
                 "reliability_slope", "simulated_pnl_usd",
                 "num_simulated_trades", "edge_above_threshold_pct",
+                "real_price_pnl", "real_price_trades",
+                "clim_price_pnl", "clim_price_trades",
             ])
             writer.writeheader()
             for fold in self.folds:
@@ -57,6 +68,10 @@ class BacktestReport:
                     "simulated_pnl_usd": fold.simulated_pnl_usd,
                     "num_simulated_trades": fold.num_simulated_trades,
                     "edge_above_threshold_pct": fold.edge_above_threshold_pct,
+                    "real_price_pnl": fold.real_price_pnl,
+                    "real_price_trades": fold.real_price_trades,
+                    "clim_price_pnl": fold.clim_price_pnl,
+                    "clim_price_trades": fold.clim_price_trades,
                 })
         logger.info("Backtest CSV saved to %s", path)
 

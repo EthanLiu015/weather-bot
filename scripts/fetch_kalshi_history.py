@@ -238,7 +238,9 @@ async def enrich_with_candlesticks(
     df["d1_candle_mid"] = float("nan")
 
     # Sample markets where we have volume (actively traded)
-    active = df[df["volume"].notna() & (df["volume"] > 0)].head(sample_size)
+    # volume_fp comes back as a string from Kalshi — convert first
+    df["_vol_num"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+    active = df[df["_vol_num"] > 0].head(sample_size)
     logger.info("Fetching candlestick D+1 prices for %d markets...", len(active))
 
     for _, row in active.iterrows():
@@ -263,7 +265,7 @@ async def enrich_with_candlesticks(
     # Use candlestick price where available, fall back to prev_bid/ask proxy
     has_candle = df["d1_candle_mid"].notna()
     df.loc[has_candle, "d1_mid"] = df.loc[has_candle, "d1_candle_mid"]
-    df = df.drop(columns=["d1_candle_mid"])
+    df = df.drop(columns=["d1_candle_mid", "_vol_num"], errors="ignore")
     logger.info("Candlestick enrichment: %d markets updated", has_candle.sum())
     return df
 
