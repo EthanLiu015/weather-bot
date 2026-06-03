@@ -89,12 +89,14 @@ class OrderManager:
                 order_type="limit",
             )
             kalshi_order_id = order.get("order_id") or order.get("id", "unknown")
+            is_paper = order.get("paper", False)
             self._resting_orders[ticker] = {
                 "order_id": kalshi_order_id,
                 "price": limit_price_cents,
                 "side": side,
                 "count": contracts,
             }
+            fill_price = limit_price_cents / 100.0
             with get_session() as db:
                 db.add(Order(
                     ticker=ticker,
@@ -102,11 +104,43 @@ class OrderManager:
                     side=side,
                     price=limit_price_cents,
                     size=contracts,
-                    status="pending",
+                    status="filled" if is_paper else "pending",
                     strategy="A" if state_snap.get("fair_b") is None else "B",
                     submitted_at=datetime.utcnow(),
+                    filled_at=datetime.utcnow() if is_paper else None,
+                    fill_price=fill_price if is_paper else None,
                 ))
-            logger.info("Limit order posted: %s %s @ %d¢ × %d", ticker, side, limit_price_cents, contracts)
+
+            if is_paper:
+                # Simulate immediate fill at limit price (market mid approximation)
+                contracts_delta = contracts if side == "yes" else -contracts
+                self._state.update_fill(ticker, contracts_delta, fill_price)
+                del self._resting_orders[ticker]
+                # Update Position table so risk controls see correct exposure
+                with get_session() as db:
+                    pos = db.query(Position).filter(Position.ticker == ticker).first()
+                    if pos is None:
+                        pos = Position(
+                            ticker=ticker,
+                            net_contracts=0,
+                            avg_entry_price=fill_price,
+                            unrealized_pnl=0.0,
+                            realized_pnl=0.0,
+                        )
+                        db.add(pos)
+                    old_n = pos.net_contracts
+                    pos.net_contracts += contracts_delta
+                    if pos.net_contracts != 0 and contracts_delta != 0:
+                        pos.avg_entry_price = (
+                            (abs(old_n) * pos.avg_entry_price + abs(contracts_delta) * fill_price)
+                            / abs(pos.net_contracts)
+                        )
+                    pos.last_updated = datetime.utcnow()
+                logger.info("[PAPER] Simulated fill: %s %s @ %.2f¢ × %d",
+                            ticker, side, limit_price_cents, contracts)
+            else:
+                logger.info("Limit order posted: %s %s @ %d¢ × %d",
+                            ticker, side, limit_price_cents, contracts)
         except Exception as exc:
             logger.error("Order submission failed for %s: %s", ticker, exc)
             self._risk.record_rejected_order(ticker)

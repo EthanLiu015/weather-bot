@@ -125,11 +125,20 @@ class D0Strategy:
 
     async def is_resolution_day(self, ticker: str) -> bool:
         import re
+        # Real Kalshi format: KXHIGHCHI-26JUN02-T81  (YYMMMDD)
+        parts = ticker.split("-")
+        if len(parts) >= 2:
+            try:
+                ticker_date = datetime.strptime(parts[1], "%y%b%d").date()
+                return ticker_date == date.today()
+            except ValueError:
+                pass
+        # Legacy fallback: 8-digit YYYYMMDD
         m = re.search(r"(\d{8})", ticker)
-        if not m:
-            return True
-        try:
-            ticker_date = datetime.strptime(m.group(1), "%Y%m%d").date()
-            return ticker_date == date.today()
-        except ValueError:
-            return False
+        if m:
+            try:
+                ticker_date = datetime.strptime(m.group(1), "%Y%m%d").date()
+                return ticker_date == date.today()
+            except ValueError:
+                pass
+        return False  # safe default: don't assume resolution

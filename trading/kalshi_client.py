@@ -128,7 +128,8 @@ class KalshiClient:
         return data
 
     async def get_candlesticks(self, ticker: str, period_interval: int = 1440) -> list[dict]:
-        data = await self._request("GET", f"/series/{ticker}/markets/{ticker}/candlesticks",
+        # Correct endpoint: /markets/{ticker}/candlesticks
+        data = await self._request("GET", f"/markets/{ticker}/candlesticks",
                                    params={"period_interval": period_interval})
         return data.get("candlesticks", [])
 
@@ -144,6 +145,24 @@ class KalshiClient:
         count: int,
         order_type: str = "limit",
     ) -> dict:
+        if self._paper_trading:
+            # ── PAPER MODE ── No HTTP request is made. Zero financial risk. ──
+            import uuid
+            paper_id = f"PAPER-{uuid.uuid4().hex[:12].upper()}"
+            logger.info(
+                "[PAPER] Simulated %s order: %s %s @ %d¢ × %d  id=%s",
+                order_type, ticker, side, price, count, paper_id,
+            )
+            return {
+                "order_id": paper_id,
+                "ticker": ticker,
+                "side": side,
+                "yes_price": price if side == "yes" else 100 - price,
+                "count": count,
+                "status": "resting",
+                "paper": True,
+            }
+        # ── LIVE MODE ── Only reached when PAPER_TRADING=false ──
         body = {
             "ticker": ticker,
             "action": "buy",
@@ -158,11 +177,17 @@ class KalshiClient:
         return data.get("order", data)
 
     async def cancel_order(self, order_id: str) -> dict:
+        if self._paper_trading:
+            logger.info("[PAPER] Simulated cancel: %s", order_id)
+            return {"order_id": order_id, "status": "cancelled", "paper": True}
         data = await self._request("DELETE", f"/portfolio/orders/{order_id}")
         logger.info("Order cancelled: %s", order_id)
         return data
 
     async def get_fills(self, ticker: str | None = None) -> list[dict]:
+        if self._paper_trading:
+            # Paper fills are tracked locally by order_manager — return empty here
+            return []
         params = {}
         if ticker:
             params["ticker"] = ticker
@@ -170,9 +195,13 @@ class KalshiClient:
         return data.get("fills", [])
 
     async def get_positions(self) -> list[dict]:
+        if self._paper_trading:
+            return []  # positions tracked locally in DB
         data = await self._request("GET", "/portfolio/positions")
         return data.get("market_positions", [])
 
     async def get_balance(self) -> dict:
+        if self._paper_trading:
+            return {"balance": 0, "paper_trading": True}
         data = await self._request("GET", "/portfolio/balance")
         return data

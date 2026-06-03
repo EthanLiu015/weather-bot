@@ -27,6 +27,29 @@ class SharedState:
         self._state: dict[str, TickerState] = {}
         self._min_edge = min_edge
         self._max_ci_width = max_ci_width
+        self._alerts: list[dict] = []  # [{type, message, timestamp}]
+
+    def post_alert(self, alert_type: str, message: str) -> None:
+        with self._lock:
+            self._alerts.append({
+                "type": alert_type,
+                "message": message,
+                "timestamp": datetime.utcnow().isoformat(),
+            })
+            # Keep only the last 20 alerts
+            self._alerts = self._alerts[-20:]
+        logger.warning("ALERT [%s]: %s", alert_type, message)
+
+    def clear_alerts(self, alert_type: str | None = None) -> None:
+        with self._lock:
+            if alert_type:
+                self._alerts = [a for a in self._alerts if a["type"] != alert_type]
+            else:
+                self._alerts = []
+
+    def get_alerts(self) -> list[dict]:
+        with self._lock:
+            return list(self._alerts)
 
     def _get_or_create(self, ticker: str) -> TickerState:
         if ticker not in self._state:
@@ -120,3 +143,11 @@ class SharedState:
                     "blended_fair": self._compute_blended(ts),
                 }
             return result
+
+    def full_snapshot(self) -> dict:
+        """Full snapshot including alerts — used for WebSocket broadcasts.
+        Markets is a dict keyed by ticker; broadcaster normalises to array."""
+        return {
+            "markets": self.snapshot(),  # dict — broadcaster converts to array
+            "alerts": self.get_alerts(),
+        }

@@ -50,9 +50,11 @@ def load_latest_artifact(model_cls, model_type: str, station: str):
             .order_by(ModelArtifact.trained_at.desc())
             .first()
         )
-    if artifact is None:
-        raise FileNotFoundError(f"No artifact found for {model_type}/{station}")
-    return model_cls.load(artifact.path)
+        if artifact is None:
+            raise FileNotFoundError(f"No artifact found for {model_type}/{station}")
+        # Read path inside session to avoid DetachedInstanceError
+        artifact_path = artifact.path
+    return model_cls.load(artifact_path)
 
 
 def list_artifacts(model_type: str | None = None, station: str | None = None) -> list[dict]:

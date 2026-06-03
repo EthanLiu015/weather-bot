@@ -34,7 +34,25 @@ class EnsembleStrategy:
             nbm_raw = await fetch_latest_nbm()
         except Exception as exc:
             logger.error("Ingestion failed: %s", exc)
+            self._state.post_alert("ingestion_error", f"Data ingestion failed: {exc}")
             return
+
+        # Check GEFS member coverage and alert on significant gaps
+        from ingestion.gefs import FORECAST_HOURS
+        total_expected = len(STATIONS) * len(FORECAST_HOURS) * 31
+        total_received = sum(
+            len(gefs_raw.get(s, {}).get(lh, []))
+            for s in STATIONS for lh in FORECAST_HOURS
+        )
+        coverage_pct = total_received / total_expected if total_expected > 0 else 0
+        if coverage_pct < 0.5:
+            self._state.post_alert(
+                "gefs_coverage",
+                f"GEFS member coverage low: {total_received}/{total_expected} "
+                f"({coverage_pct:.0%}) — forecasts may be unreliable",
+            )
+        elif coverage_pct >= 0.9:
+            self._state.clear_alerts("gefs_coverage")
 
         # Apply Kalman bias correction to GEFS member temperatures
         for station in STATIONS:
@@ -89,7 +107,13 @@ class EnsembleStrategy:
                 if station_rows.empty:
                     continue
 
-                closest_row = station_rows.iloc[[0]]
+                # Pick the row whose lead_hour is closest to the ticker's horizon
+                target_lead = horizon * 24
+                if "lead_hour" in station_rows.columns:
+                    idx = (station_rows["lead_hour"] - target_lead).abs().argmin()
+                    closest_row = station_rows.iloc[[idx]]
+                else:
+                    closest_row = station_rows.iloc[[0]]
                 X = closest_row[available_cols].fillna(0.0)
 
                 ngboost_model = ngboost_by_station.get(station)
@@ -145,20 +169,30 @@ class EnsembleStrategy:
         logger.info("EnsembleStrategy cycle complete; updated %d tickers", len(active_tickers))
 
     async def fetch_active_temperature_tickers(self) -> list[str]:
+        """
+        Fetch open temperature markets by querying each known series directly.
+        The live Kalshi API does not reliably tag temperature markets with a
+        category, so category-based filtering returns 0 results.
+        """
+        tickers: list[str] = []
         try:
-            # Kalshi temperature markets are under the "weather" category
-            markets = await self._client.get_markets(status="open", category="weather")
-            tickers = []
-            for market in markets:
-                ticker = market.get("ticker", "")
-                # Only keep tickers we can map to a station
-                if self._ticker_to_station(ticker) is not None:
-                    tickers.append(ticker)
-            logger.info("Found %d active temperature tickers", len(tickers))
-            return tickers[:200]
+            for series in self._SERIES_TO_STATION:
+                try:
+                    data = await self._client._request(
+                        "GET", "/markets",
+                        params={"series_ticker": series, "status": "open", "limit": 50},
+                    )
+                    for market in data.get("markets", []):
+                        ticker = market.get("ticker", "")
+                        if self._ticker_to_station(ticker) is not None:
+                            tickers.append(ticker)
+                except Exception:
+                    pass  # series may not exist on this environment
+            logger.info("Found %d active temperature tickers across %d series",
+                        len(tickers), len(self._SERIES_TO_STATION))
         except Exception as exc:
             logger.error("Failed to fetch active tickers: %s", exc)
-            return []
+        return tickers
 
     def detect_new_model_run(self, last_run_ts: datetime) -> bool:
         import asyncio

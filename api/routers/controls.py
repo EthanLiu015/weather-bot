@@ -41,6 +41,7 @@ async def get_status(request: Request) -> dict:
     risk = request.app.state.risk_controls
     return {
         "bot_active": settings.BOT_ACTIVE,
+        "paper_trading": settings.PAPER_TRADING,
         "daily_pnl": risk.daily_pnl(),
         "max_daily_loss": settings.MAX_DAILY_LOSS_USD,
         "max_exposure_per_ticker": settings.MAX_EXPOSURE_PER_TICKER_USD,

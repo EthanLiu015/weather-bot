@@ -44,14 +44,21 @@ export type ModelStatus = {
   num_active_tickers: number
 }
 
+export type Alert = {
+  type: string
+  message: string
+  timestamp: string
+}
+
 export type WsMessage = {
   type: string
   timestamp: string
-  markets: MarketState[]
+  markets: MarketState[] | Record<string, MarketState>
   positions: Position[]
   pnl: { series: DailyPnL[] } | DailyPnL[]
   bot_active: boolean
   model_status?: ModelStatus
+  alerts?: Alert[]
 }
 
 export type BacktestFold = {

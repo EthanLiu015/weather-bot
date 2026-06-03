@@ -52,6 +52,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 api_key=settings.KALSHI_API_KEY,
                 private_key_path=settings.KALSHI_PRIVATE_KEY_PATH,
                 base_url=settings.KALSHI_BASE_URL,
+                paper_trading=settings.PAPER_TRADING,
             )
             app.state.kalshi_client = kalshi_client
     except Exception as exc:
@@ -150,6 +151,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             scheduler.start()
             app.state.scheduler = scheduler
             logger.info("Scheduler started")
+            # Fix 4: trigger first ensemble cycle 30s after startup so shared_state
+            # is populated quickly (seed_active_markets runs immediately via scheduler,
+            # full model cycle fires after GEFS is available)
+            import asyncio as _asyncio
+            async def _delayed_first_cycle():
+                await _asyncio.sleep(30)
+                try:
+                    await ensemble_strategy.run_cycle()
+                    logger.info("First ensemble cycle complete")
+                except Exception as exc:
+                    logger.warning("First ensemble cycle failed: %s", exc)
+            _asyncio.create_task(_delayed_first_cycle())
         except Exception as exc:
             logger.warning("Scheduler failed to start: %s", exc)
     else:

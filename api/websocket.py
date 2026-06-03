@@ -26,10 +26,18 @@ class WebSocketBroadcaster:
     async def broadcast(self, payload: dict) -> None:
         if not self._connections:
             return
+        # Normalise markets to always be an array with ticker included
+        markets_raw = payload.get("markets", {})
+        if isinstance(markets_raw, dict):
+            markets = [{"ticker": k, **v} for k, v in markets_raw.items()]
+        else:
+            markets = markets_raw
+
         message = json.dumps({
             "type": "state_update",
             "timestamp": datetime.utcnow().isoformat(),
-            **payload,
+            "markets": markets,
+            "alerts": payload.get("alerts", []),
         })
         dead = set()
         async with self._lock:
@@ -44,6 +52,22 @@ class WebSocketBroadcaster:
                 self._connections -= dead
 
 
+def _build_message(shared_state, position_tracker, settings) -> str:
+    """Build a consistent WebSocket message with markets as an array."""
+    snap = shared_state.snapshot()
+    markets = [{"ticker": k, **v} for k, v in snap.items()]
+    return json.dumps({
+        "type": "state_update",
+        "timestamp": datetime.utcnow().isoformat(),
+        "markets": markets,
+        "positions": position_tracker.get_all_positions(),
+        "pnl": {"series": position_tracker.total_pnl_series()},
+        "bot_active": settings.BOT_ACTIVE,
+        "paper_trading": settings.PAPER_TRADING,
+        "alerts": shared_state.get_alerts(),
+    })
+
+
 async def websocket_endpoint(ws: WebSocket, app_state) -> None:
     broadcaster: WebSocketBroadcaster = app_state.ws_broadcaster
     shared_state = app_state.shared_state
@@ -52,29 +76,13 @@ async def websocket_endpoint(ws: WebSocket, app_state) -> None:
 
     await broadcaster.connect(ws)
     try:
-        # Send initial snapshot on connect
-        snap = shared_state.snapshot()
-        await ws.send_text(json.dumps({
-            "type": "state_update",
-            "timestamp": datetime.utcnow().isoformat(),
-            "markets": list(snap.values()),
-            "positions": position_tracker.get_all_positions(),
-            "pnl": position_tracker.total_pnl_series(),
-            "bot_active": settings.BOT_ACTIVE,
-        }))
+        # Send full snapshot immediately on connect
+        await ws.send_text(_build_message(shared_state, position_tracker, settings))
 
         # Push updates every 10 seconds
         while True:
             await asyncio.sleep(10)
-            snap = shared_state.snapshot()
-            await ws.send_text(json.dumps({
-                "type": "state_update",
-                "timestamp": datetime.utcnow().isoformat(),
-                "markets": [{"ticker": k, **v} for k, v in snap.items()],
-                "positions": position_tracker.get_all_positions(),
-                "pnl": {"series": position_tracker.total_pnl_series()},
-                "bot_active": settings.BOT_ACTIVE,
-            }))
+            await ws.send_text(_build_message(shared_state, position_tracker, settings))
     except WebSocketDisconnect:
         pass
     except Exception as exc:

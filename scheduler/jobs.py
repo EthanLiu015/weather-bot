@@ -1,17 +1,51 @@
 import logging
+import re
 from datetime import datetime
 import zoneinfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.executors.asyncio import AsyncIOExecutor
+from config.stations import station_timezones
+from strategies.ensemble_strategy import EnsembleStrategy
 
 logger = logging.getLogger(__name__)
 
-STATION_TZ = {
-    "KORD": "America/Chicago",
-    "KJFK": "America/New_York",
-    "KLAX": "America/Los_Angeles",
+# Use registry from stations config — covers all 20 stations
+STATION_TZ = station_timezones()
+
+# Series-prefix → ICAO mapping (mirrors ensemble_strategy._SERIES_TO_STATION)
+_SERIES_TO_STATION: dict[str, str] = {
+    "KXHIGHCHI": "KORD", "KXLOWTCHI": "KORD",
+    "KXHIGHNY":  "KLGA", "KXHIGHNY0": "KLGA", "KXLOWNYC":  "KLGA",
+    "KXHIGHLAX": "KLAX", "KXLOWTLAX": "KLAX",
+    "KXHIGHMIA": "KMIA", "KXLOWMIA":  "KMIA",
+    "KXHIGHOU":  "KIAH", "KXHIGHHOU": "KIAH", "KXLOWTHOU": "KIAH",
+    "KXHIGHPHIL":"KPHL", "KXLOWPHIL": "KPHL",
+    "KXHIGHATL": "KATL", "KXLOWTATL": "KATL",
+    "KXHIGHAUS": "KAUS", "KXLOWTAUS": "KAUS",
+    "KXDENHIGH": "KDEN", "KXHIGHDEN": "KDEN", "KXLOWDEN":  "KDEN",
+    "KXHIGHTPHX":"KPHX", "KXLOWTPHX": "KPHX",
+    "KXHIGHTSFO":"KSFO", "KXLOWTSFO": "KSFO",
+    "KXHIGHTSEA":"KSEA", "KXLOWTSEA": "KSEA",
+    "KXHIGHTBOS":"KBOS", "KXLOWTBOS": "KBOS",
+    "KXHIGHTDAL":"KDFW", "KXLOWTDAL": "KDFW",
+    "KXHIGHTDC": "KDCA", "KXLOWTDC":  "KDCA",
+    "KXHIGHTLV": "KLAS", "KXLOWTLV":  "KLAS",
+    "KXHIGHTMIN":"KMSP", "KXLOWTMIN": "KMSP",
+    "KXHIGHTOKC":"KOKC", "KXLOWTOKC": "KOKC",
+    "KXHIGHTSATX":"KSAT","KXLOWTSATX":"KSAT",
+    "KXHIGHTNOLA":"KMSY","KXLOWTNOLA":"KMSY",
 }
+
+
+def _ticker_station(ticker: str) -> str | None:
+    series = ticker.split("-")[0]
+    return _SERIES_TO_STATION.get(series)
+
+
+def _ticker_threshold(ticker: str) -> float | None:
+    m = re.search(r"-[TB]([\d.]+)$", ticker)
+    return float(m.group(1)) if m else None
 
 
 def build_scheduler(
@@ -28,6 +62,39 @@ def build_scheduler(
     scheduler = AsyncIOScheduler(executors=executors)
     last_run_holder = {"ts": datetime.min}
 
+    # ── Fix 4: seed shared_state with live markets on startup ────────────────
+    async def seed_active_markets():
+        """Populate shared_state by querying each temperature series directly.
+        Category-based filtering is unreliable on the live Kalshi API."""
+        try:
+            seeded = 0
+            for series in _SERIES_TO_STATION:
+                try:
+                    data = await kalshi_client._request(
+                        "GET", "/markets",
+                        params={"series_ticker": series, "status": "open", "limit": 50},
+                    )
+                    for m in data.get("markets", []):
+                        ticker = m.get("ticker", "")
+                        if _ticker_station(ticker) is None:
+                            continue
+                        yes_bid_raw = m.get("yes_bid") or m.get("yes_bid_dollars") or 50
+                        yes_ask_raw = m.get("yes_ask") or m.get("yes_ask_dollars") or 50
+                        scale = 100.0 if isinstance(yes_bid_raw, int) and yes_bid_raw > 1 else 1.0
+                        shared_state.update_market(
+                            ticker,
+                            float(yes_bid_raw) / scale,
+                            float(yes_ask_raw) / scale,
+                        )
+                        seeded += 1
+                except Exception:
+                    pass
+            logger.info("Seeded shared_state with %d live temperature markets", seeded)
+        except Exception as exc:
+            logger.warning("Market seed failed: %s", exc)
+
+    # ── Job definitions ───────────────────────────────────────────────────────
+
     async def detect_model_run_job():
         is_new = ensemble_strategy.detect_new_model_run(last_run_holder["ts"])
         if is_new:
@@ -41,23 +108,35 @@ def build_scheduler(
             await order_manager.process_tick()
         except Exception as exc:
             logger.error("Ensemble cycle failed: %s", exc)
+            shared_state.post_alert("ensemble_error", f"Ensemble cycle failed: {exc}")
 
     async def d0_loop_job():
-        for station in settings.STATIONS:
+        # Fix 1: match tickers using the series→station map, not station shortname
+        # Fix 1b: extract threshold from -T81 suffix, not first digit in string
+        active_tickers = shared_state.get_all_tickers()
+        if not active_tickers:
+            logger.debug("D0 loop: shared_state empty, skipping (ensemble hasn't run yet)")
+            return
+
+        for ticker in active_tickers:
+            station = _ticker_station(ticker)
+            if station is None or station not in settings.STATIONS:
+                continue
+
             tz = STATION_TZ.get(station, "UTC")
             local_hour = datetime.now(zoneinfo.ZoneInfo(tz)).hour
             if not (6 <= local_hour <= 23):
                 continue
-            tickers = [t for t in shared_state.get_all_tickers() if station[1:] in t]
-            for ticker in tickers:
-                try:
-                    import re
-                    m = re.search(r"(\d+)", ticker)
-                    threshold = float(m.group(1)) if m else 70.0
-                    await d0_strategy.run_cycle(station, ticker, threshold)
-                    await order_manager.process_tick()
-                except Exception as exc:
-                    logger.error("D0 cycle failed for %s/%s: %s", station, ticker, exc)
+
+            threshold = _ticker_threshold(ticker)
+            if threshold is None:
+                continue
+
+            try:
+                await d0_strategy.run_cycle(station, ticker, threshold)
+                await order_manager.process_tick()
+            except Exception as exc:
+                logger.error("D0 cycle failed for %s/%s: %s", station, ticker, exc)
 
     async def sync_fills_job():
         try:
@@ -67,11 +146,20 @@ def build_scheduler(
 
     async def market_snapshot_job():
         tickers = shared_state.get_all_tickers()
+
+        # Fix 3: use correct market endpoint (not broken candlestick path)
         for ticker in tickers:
             try:
                 market = await kalshi_client.get_market(ticker)
-                yes_bid = market.get("yes_bid", 50) / 100.0
-                yes_ask = market.get("yes_ask", 50) / 100.0
+                # Kalshi returns prices in cents (0-100); normalize to 0-1
+                yes_bid_raw = market.get("yes_bid") or market.get("yes_bid_dollars")
+                yes_ask_raw = market.get("yes_ask") or market.get("yes_ask_dollars")
+                if yes_bid_raw is None:
+                    continue
+                # Handle both cents (int) and dollar (float) formats
+                scale = 100.0 if isinstance(yes_bid_raw, int) and yes_bid_raw > 1 else 1.0
+                yes_bid = float(yes_bid_raw) / scale
+                yes_ask = float(yes_ask_raw) / scale
                 shared_state.update_market(ticker, yes_bid, yes_ask)
 
                 from db.models import MarketSnapshot
@@ -94,15 +182,18 @@ def build_scheduler(
 
         if ws_broadcaster is not None:
             try:
-                await ws_broadcaster.broadcast(shared_state.snapshot())
+                await ws_broadcaster.broadcast(shared_state.full_snapshot())
             except Exception as exc:
                 logger.warning("WS broadcast failed: %s", exc)
+
+        # If state is still empty, try seeding from live temperature series
+        if not tickers:
+            await seed_active_markets()
 
     async def daily_close_job():
         try:
             summary = position_tracker.close_daily()
             logger.info("Daily close: %s", summary)
-
             from db.session import get_session
             from db.models import CalibrationSnapshot
             with get_session() as db:
@@ -118,7 +209,12 @@ def build_scheduler(
         except Exception as exc:
             logger.error("Daily close failed: %s", exc)
 
-    # 1. Detect new model run every 5 minutes
+    # ── Register jobs ─────────────────────────────────────────────────────────
+
+    # Seed markets immediately on startup
+    scheduler.add_job(seed_active_markets, "date", id="seed_markets")
+
+    # 1. Detect new GEFS run every 5 minutes
     scheduler.add_job(detect_model_run_job, "interval", minutes=5, id="detect_model_run")
 
     # 2. Fallback ensemble cycle 4× daily

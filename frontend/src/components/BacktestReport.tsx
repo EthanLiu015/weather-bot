@@ -72,7 +72,9 @@ export function BacktestReport() {
     }
   })
 
-  const validFolds = folds.filter(f => f.crps !== null)
+  // validFolds used for CRPS/MAE chart filtering
+  const _validFolds = folds.filter(f => f.crps !== null)
+  void _validFolds
 
   return (
     <div className="p-6 space-y-6">

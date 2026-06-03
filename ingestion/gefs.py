@@ -132,40 +132,53 @@ async def fetch_latest_gefs_run(data_dir: str = "data/gefs") -> dict:
             s: {lh: [] for lh in FORECAST_HOURS} for s in STATION_COORDS
         }
 
-        async with httpx.AsyncClient() as client:
-            for member in members:
-                for fhour in FORECAST_HOURS:
-                    url = _build_member_url(date_str, cycle_str, member, fhour)
-                    dest = Path(data_dir) / date_str / cycle_str / f"ge{member}_f{fhour:03d}.grib2"
+        # Download all (member, fhour) combinations in parallel — 8 concurrent streams
+        sem = asyncio.Semaphore(8)
 
-                    if not dest.exists():
+        async def fetch_and_parse(member: str, fhour: int, client: httpx.AsyncClient) -> None:
+            async with sem:
+                url  = _build_member_url(date_str, cycle_str, member, fhour)
+                dest = Path(data_dir) / date_str / cycle_str / f"ge{member}_f{fhour:03d}.grib2"
+
+                if not dest.exists():
+                    # Fix 6: retry up to 3 times with backoff before giving up
+                    for attempt in range(3):
                         ok = await _download_file(url, dest, client)
-                        if not ok:
-                            logger.debug("Member %s fhour %d unavailable", member, fhour)
-                            continue
+                        if ok:
+                            break
+                        if attempt < 2:
+                            await asyncio.sleep(5 * (attempt + 1))
+                    if not ok:
+                        logger.info("Member %s fhour %dh not yet available — skipping", member, fhour)
+                        return
 
-                    for station in STATION_COORDS:
-                        raw = _parse_member_file(str(dest), station)
-                        if not raw:
-                            continue
+                for station in STATION_COORDS:
+                    raw = _parse_member_file(str(dest), station)
+                    if not raw:
+                        continue
+                    t2m = raw.get("t2m", float("nan"))
+                    d2m = raw.get("d2m", float("nan"))
+                    u10 = raw.get("u10", float("nan"))
+                    v10 = raw.get("v10", float("nan"))
+                    result[station][fhour].append({
+                        "member":      member,
+                        "temp_f":      _kelvin_to_f(t2m),
+                        "dewpoint_f":  _kelvin_to_f(d2m),
+                        "wind_speed":  _wind_speed(u10, v10),
+                        "wind_dir_sin":_wind_dir_sin(u10, v10),
+                        "wind_dir_cos":_wind_dir_cos(u10, v10),
+                        "tcc": raw.get("tcc", float("nan")),
+                        "tp":  raw.get("tp",  float("nan")),
+                        "sp":  raw.get("sp",  float("nan")),
+                    })
 
-                        t2m = raw.get("t2m", float("nan"))
-                        d2m = raw.get("d2m", float("nan"))
-                        u10 = raw.get("u10", float("nan"))
-                        v10 = raw.get("v10", float("nan"))
-
-                        member_data = {
-                            "member": member,
-                            "temp_f": _kelvin_to_f(t2m),
-                            "dewpoint_f": _kelvin_to_f(d2m),
-                            "wind_speed": _wind_speed(u10, v10),
-                            "wind_dir_sin": _wind_dir_sin(u10, v10),
-                            "wind_dir_cos": _wind_dir_cos(u10, v10),
-                            "tcc": raw.get("tcc", float("nan")),
-                            "tp": raw.get("tp", float("nan")),
-                            "sp": raw.get("sp", float("nan")),
-                        }
-                        result[station][fhour].append(member_data)
+        async with httpx.AsyncClient() as client:
+            tasks = [
+                fetch_and_parse(member, fhour, client)
+                for member in members
+                for fhour in FORECAST_HOURS
+            ]
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         members_found = sum(
             len(result[s][lh]) for s in STATION_COORDS for lh in FORECAST_HOURS
