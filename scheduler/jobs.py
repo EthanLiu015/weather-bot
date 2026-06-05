@@ -15,26 +15,47 @@ STATION_TZ = station_timezones()
 
 # Series-prefix → ICAO mapping (mirrors ensemble_strategy._SERIES_TO_STATION)
 _SERIES_TO_STATION: dict[str, str] = {
-    "KXHIGHCHI": "KORD", "KXLOWTCHI": "KORD",
-    "KXHIGHNY":  "KLGA", "KXHIGHNY0": "KLGA", "KXLOWNYC":  "KLGA",
-    "KXHIGHLAX": "KLAX", "KXLOWTLAX": "KLAX",
-    "KXHIGHMIA": "KMIA", "KXLOWMIA":  "KMIA",
-    "KXHIGHOU":  "KIAH", "KXHIGHHOU": "KIAH", "KXLOWTHOU": "KIAH",
-    "KXHIGHPHIL":"KPHL", "KXLOWPHIL": "KPHL",
-    "KXHIGHATL": "KATL", "KXLOWTATL": "KATL",
-    "KXHIGHAUS": "KAUS", "KXLOWTAUS": "KAUS",
-    "KXDENHIGH": "KDEN", "KXHIGHDEN": "KDEN", "KXLOWDEN":  "KDEN",
-    "KXHIGHTPHX":"KPHX", "KXLOWTPHX": "KPHX",
-    "KXHIGHTSFO":"KSFO", "KXLOWTSFO": "KSFO",
-    "KXHIGHTSEA":"KSEA", "KXLOWTSEA": "KSEA",
-    "KXHIGHTBOS":"KBOS", "KXLOWTBOS": "KBOS",
-    "KXHIGHTDAL":"KDFW", "KXLOWTDAL": "KDFW",
-    "KXHIGHTDC": "KDCA", "KXLOWTDC":  "KDCA",
-    "KXHIGHTLV": "KLAS", "KXLOWTLV":  "KLAS",
-    "KXHIGHTMIN":"KMSP", "KXLOWTMIN": "KMSP",
-    "KXHIGHTOKC":"KOKC", "KXLOWTOKC": "KOKC",
-    "KXHIGHTSATX":"KSAT","KXLOWTSATX":"KSAT",
-    "KXHIGHTNOLA":"KMSY","KXLOWTNOLA":"KMSY",
+    # Chicago
+    "KXHIGHCHI":  "KORD", "KXLOWTCHI":  "KORD",
+    # New York
+    "KXHIGHNY":   "KLGA", "KXHIGHNY0":  "KLGA", "KXLOWTNYC":  "KLGA",
+    # Los Angeles
+    "KXHIGHLAX":  "KLAX", "KXLOWTLAX":  "KLAX",
+    # Miami
+    "KXHIGHMIA":  "KMIA", "KXLOWTMIA":  "KMIA",
+    # Houston
+    "KXHIGHOU":   "KIAH", "KXHIGHHOU":  "KIAH", "KXHOUHIGH":  "KIAH",
+    "KXLOWTHOU":  "KIAH", "KXHIGHTHOU": "KIAH",
+    # Philadelphia
+    "KXHIGHPHIL": "KPHL", "KXLOWTPHIL": "KPHL",
+    # Atlanta
+    "KXHIGHATL":  "KATL", "KXHIGHTATL": "KATL", "KXLOWTATL":  "KATL",
+    # Austin
+    "KXHIGHAUS":  "KAUS", "KXLOWTAUS":  "KAUS",
+    # Denver
+    "KXDENHIGH":  "KDEN", "KXHIGHDEN":  "KDEN", "KXLOWTDEN":  "KDEN",
+    # New Orleans
+    "KXHIGHTNOLA":"KMSY", "KXLOWTNOLA": "KMSY",
+    # Phoenix
+    "KXHIGHTPHX": "KPHX", "KXLOWTPHX":  "KPHX",
+    # San Francisco
+    "KXHIGHTSFO": "KSFO", "KXLOWTSFO":  "KSFO",
+    # Seattle
+    "KXHIGHTSEA": "KSEA", "KXLOWTSEA":  "KSEA",
+    # Boston
+    "KXHIGHTBOS": "KBOS", "KXLOWTBOS":  "KBOS",
+    # Dallas
+    "KXHIGHTDAL": "KDFW", "KXLOWTDAL":  "KDFW",
+    # Washington DC
+    "KXHIGHTDC":  "KDCA", "KXLOWTDC":   "KDCA",
+    # Las Vegas
+    "KXHIGHTLV":  "KLAS", "KXLOWTLV":   "KLAS",
+    # Minneapolis
+    "KXHIGHTMIN": "KMSP", "KXLOWTMIN":  "KMSP",
+    # Oklahoma City
+    "KXHIGHTOKC": "KOKC", "KXLOWTOKC":  "KOKC",
+    # San Antonio
+    "KXHIGHTSATX":"KSAT", "KXLOWTSATX": "KSAT",
 }
 
 
@@ -64,32 +85,52 @@ def build_scheduler(
 
     # ── Fix 4: seed shared_state with live markets on startup ────────────────
     async def seed_active_markets():
-        """Populate shared_state by querying each temperature series directly.
-        Category-based filtering is unreliable on the live Kalshi API."""
+        """Fetch all open temperature markets sequentially to stay within rate limits."""
         try:
-            seeded = 0
+            import asyncio as _aio
+            import httpx as _httpx
+
+            all_markets: list[dict] = []
             for series in _SERIES_TO_STATION:
-                try:
-                    data = await kalshi_client._request(
-                        "GET", "/markets",
-                        params={"series_ticker": series, "status": "open", "limit": 50},
-                    )
-                    for m in data.get("markets", []):
-                        ticker = m.get("ticker", "")
-                        if _ticker_station(ticker) is None:
-                            continue
-                        yes_bid_raw = m.get("yes_bid") or m.get("yes_bid_dollars") or 50
-                        yes_ask_raw = m.get("yes_ask") or m.get("yes_ask_dollars") or 50
-                        scale = 100.0 if isinstance(yes_bid_raw, int) and yes_bid_raw > 1 else 1.0
-                        shared_state.update_market(
-                            ticker,
-                            float(yes_bid_raw) / scale,
-                            float(yes_ask_raw) / scale,
+                for attempt in range(4):
+                    try:
+                        data = await kalshi_client._request(
+                            "GET", "/markets",
+                            params={"series_ticker": series, "status": "open", "limit": 50},
+                            retries=1,  # don't let _request retry — we handle it here
                         )
-                        seeded += 1
-                except Exception:
-                    pass
-            logger.info("Seeded shared_state with %d live temperature markets", seeded)
+                        all_markets.extend(data.get("markets", []))
+                        await _aio.sleep(0.15)  # 150ms between requests ≈ 6 req/sec
+                        break
+                    except Exception as exc:
+                        if "429" in str(exc) and attempt < 3:
+                            wait = 2 ** attempt
+                            logger.debug("Rate limited on %s, waiting %ds", series, wait)
+                            await _aio.sleep(wait)
+                        else:
+                            break
+
+            fresh_tickers: set[str] = set()
+            for m in all_markets:
+                ticker = m.get("ticker", "")
+                if _ticker_station(ticker) is None:
+                    continue
+                yes_bid_raw = m.get("yes_bid") or m.get("yes_bid_dollars") or 50
+                yes_ask_raw = m.get("yes_ask") or m.get("yes_ask_dollars") or 50
+                scale = 100.0 if isinstance(yes_bid_raw, int) and yes_bid_raw > 1 else 1.0
+                shared_state.update_market(
+                    ticker,
+                    float(yes_bid_raw) / scale,
+                    float(yes_ask_raw) / scale,
+                )
+                fresh_tickers.add(ticker)
+
+            # Remove any tickers that are no longer open on Kalshi
+            if fresh_tickers:
+                shared_state.replace_active_tickers(fresh_tickers)
+
+            logger.info("Seeded shared_state with %d live temperature markets (%d series)",
+                        len(fresh_tickers), len(_SERIES_TO_STATION))
         except Exception as exc:
             logger.warning("Market seed failed: %s", exc)
 
@@ -186,9 +227,8 @@ def build_scheduler(
             except Exception as exc:
                 logger.warning("WS broadcast failed: %s", exc)
 
-        # If state is still empty, try seeding from live temperature series
-        if not tickers:
-            await seed_active_markets()
+        # Evict tickers not seen in a price update for 5 minutes
+        shared_state.evict_stale_tickers(max_age_seconds=300)
 
     async def daily_close_job():
         try:
@@ -211,8 +251,9 @@ def build_scheduler(
 
     # ── Register jobs ─────────────────────────────────────────────────────────
 
-    # Seed markets immediately on startup
-    scheduler.add_job(seed_active_markets, "date", id="seed_markets")
+    # Seed markets on startup and then every 5 minutes
+    scheduler.add_job(seed_active_markets, "date", id="seed_markets_startup")
+    scheduler.add_job(seed_active_markets, "interval", minutes=5, id="seed_markets")
 
     # 1. Detect new GEFS run every 5 minutes
     scheduler.add_job(detect_model_run_job, "interval", minutes=5, id="detect_model_run")

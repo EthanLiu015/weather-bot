@@ -2,32 +2,57 @@ import type { MarketState } from '../types'
 
 // Series prefix → {badge, city, station}
 const SERIES_META: Record<string, { badge: string; city: string; station: string }> = {
-  KXHIGHCHI:  { badge: 'CHI', city: 'Chicago',       station: 'KORD' },
-  KXLOWTCHI:  { badge: 'CHI', city: 'Chicago',       station: 'KORD' },
-  KXHIGHNY:   { badge: 'NYC', city: 'New York City', station: 'KLGA' },
-  KXHIGHNY0:  { badge: 'NYC', city: 'New York City', station: 'KLGA' },
-  KXHIGHLAX:  { badge: 'LA',  city: 'Los Angeles',   station: 'KLAX' },
-  KXLOWTLAX:  { badge: 'LA',  city: 'Los Angeles',   station: 'KLAX' },
-  KXHIGHMIA:  { badge: 'MIA', city: 'Miami',         station: 'KMIA' },
-  KXLOWMIA:   { badge: 'MIA', city: 'Miami',         station: 'KMIA' },
-  KXHIGHOU:   { badge: 'HOU', city: 'Houston',       station: 'KIAH' },
-  KXHIGHHOU:  { badge: 'HOU', city: 'Houston',       station: 'KIAH' },
-  KXHIGHPHIL: { badge: 'PHI', city: 'Philadelphia',  station: 'KPHL' },
-  KXHIGHATL:  { badge: 'ATL', city: 'Atlanta',       station: 'KATL' },
-  KXHIGHAUS:  { badge: 'AUS', city: 'Austin',        station: 'KAUS' },
-  KXDENHIGH:  { badge: 'DEN', city: 'Denver',        station: 'KDEN' },
-  KXHIGHDEN:  { badge: 'DEN', city: 'Denver',        station: 'KDEN' },
-  KXHIGHTPHX: { badge: 'PHX', city: 'Phoenix',       station: 'KPHX' },
-  KXHIGHTSFO: { badge: 'SF',  city: 'San Francisco', station: 'KSFO' },
-  KXHIGHTSEA: { badge: 'SEA', city: 'Seattle',       station: 'KSEA' },
-  KXHIGHTBOS: { badge: 'BOS', city: 'Boston',        station: 'KBOS' },
-  KXHIGHTDAL: { badge: 'DAL', city: 'Dallas',        station: 'KDFW' },
-  KXHIGHTDC:  { badge: 'DC',  city: 'Washington DC', station: 'KDCA' },
-  KXHIGHTLV:  { badge: 'LV',  city: 'Las Vegas',     station: 'KLAS' },
-  KXHIGHTMIN: { badge: 'MIN', city: 'Minneapolis',   station: 'KMSP' },
-  KXHIGHTOKC: { badge: 'OKC', city: 'Oklahoma City', station: 'KOKC' },
-  KXHIGHTSATX:{ badge: 'SA',  city: 'San Antonio',   station: 'KSAT' },
-  KXHIGHTNOLA:{ badge: 'NOL', city: 'New Orleans',   station: 'KMSY' },
+  KXHIGHCHI:   { badge: 'CHI', city: 'Chicago',       station: 'KORD' },
+  KXLOWTCHI:   { badge: 'CHI', city: 'Chicago',       station: 'KORD' },
+  KXLOWCHI:    { badge: 'CHI', city: 'Chicago',       station: 'KORD' },
+  KXHIGHNY:    { badge: 'NYC', city: 'New York City', station: 'KLGA' },
+  KXHIGHNY0:   { badge: 'NYC', city: 'New York City', station: 'KLGA' },
+  KXLOWTNYC:   { badge: 'NYC', city: 'New York City', station: 'KLGA' },
+  KXLOWNYC:    { badge: 'NYC', city: 'New York City', station: 'KLGA' },
+  KXHIGHLAX:   { badge: 'LA',  city: 'Los Angeles',   station: 'KLAX' },
+  KXLOWTLAX:   { badge: 'LA',  city: 'Los Angeles',   station: 'KLAX' },
+  KXHIGHMIA:   { badge: 'MIA', city: 'Miami',         station: 'KMIA' },
+  KXLOWTMIA:   { badge: 'MIA', city: 'Miami',         station: 'KMIA' },
+  KXLOWMIA:    { badge: 'MIA', city: 'Miami',         station: 'KMIA' },
+  KXHIGHOU:    { badge: 'HOU', city: 'Houston',       station: 'KIAH' },
+  KXHIGHHOU:   { badge: 'HOU', city: 'Houston',       station: 'KIAH' },
+  KXHOUHIGH:   { badge: 'HOU', city: 'Houston',       station: 'KIAH' },
+  KXHIGHTHOU:  { badge: 'HOU', city: 'Houston',       station: 'KIAH' },
+  KXLOWTHOU:   { badge: 'HOU', city: 'Houston',       station: 'KIAH' },
+  KXHIGHPHIL:  { badge: 'PHI', city: 'Philadelphia',  station: 'KPHL' },
+  KXLOWTPHIL:  { badge: 'PHI', city: 'Philadelphia',  station: 'KPHL' },
+  KXLOWPHIL:   { badge: 'PHI', city: 'Philadelphia',  station: 'KPHL' },
+  KXHIGHATL:   { badge: 'ATL', city: 'Atlanta',       station: 'KATL' },
+  KXHIGHTATL:  { badge: 'ATL', city: 'Atlanta',       station: 'KATL' },
+  KXLOWTATL:   { badge: 'ATL', city: 'Atlanta',       station: 'KATL' },
+  KXHIGHAUS:   { badge: 'AUS', city: 'Austin',        station: 'KAUS' },
+  KXLOWTAUS:   { badge: 'AUS', city: 'Austin',        station: 'KAUS' },
+  KXLOWAUS:    { badge: 'AUS', city: 'Austin',        station: 'KAUS' },
+  KXDENHIGH:   { badge: 'DEN', city: 'Denver',        station: 'KDEN' },
+  KXHIGHDEN:   { badge: 'DEN', city: 'Denver',        station: 'KDEN' },
+  KXLOWTDEN:   { badge: 'DEN', city: 'Denver',        station: 'KDEN' },
+  KXHIGHTPHX:  { badge: 'PHX', city: 'Phoenix',       station: 'KPHX' },
+  KXLOWTPHX:   { badge: 'PHX', city: 'Phoenix',       station: 'KPHX' },
+  KXHIGHTSFO:  { badge: 'SF',  city: 'San Francisco', station: 'KSFO' },
+  KXLOWTSFO:   { badge: 'SF',  city: 'San Francisco', station: 'KSFO' },
+  KXHIGHTSEA:  { badge: 'SEA', city: 'Seattle',       station: 'KSEA' },
+  KXLOWTSEA:   { badge: 'SEA', city: 'Seattle',       station: 'KSEA' },
+  KXHIGHTBOS:  { badge: 'BOS', city: 'Boston',        station: 'KBOS' },
+  KXLOWTBOS:   { badge: 'BOS', city: 'Boston',        station: 'KBOS' },
+  KXHIGHTDAL:  { badge: 'DAL', city: 'Dallas',        station: 'KDFW' },
+  KXLOWTDAL:   { badge: 'DAL', city: 'Dallas',        station: 'KDFW' },
+  KXHIGHTDC:   { badge: 'DC',  city: 'Washington DC', station: 'KDCA' },
+  KXLOWTDC:    { badge: 'DC',  city: 'Washington DC', station: 'KDCA' },
+  KXHIGHTLV:   { badge: 'LV',  city: 'Las Vegas',     station: 'KLAS' },
+  KXLOWTLV:    { badge: 'LV',  city: 'Las Vegas',     station: 'KLAS' },
+  KXHIGHTMIN:  { badge: 'MIN', city: 'Minneapolis',   station: 'KMSP' },
+  KXLOWTMIN:   { badge: 'MIN', city: 'Minneapolis',   station: 'KMSP' },
+  KXHIGHTOKC:  { badge: 'OKC', city: 'Oklahoma City', station: 'KOKC' },
+  KXLOWTOKC:   { badge: 'OKC', city: 'Oklahoma City', station: 'KOKC' },
+  KXHIGHTSATX: { badge: 'SA',  city: 'San Antonio',   station: 'KSAT' },
+  KXLOWTSATX:  { badge: 'SA',  city: 'San Antonio',   station: 'KSAT' },
+  KXHIGHTNOLA: { badge: 'NOL', city: 'New Orleans',   station: 'KMSY' },
+  KXLOWTNOLA:  { badge: 'NOL', city: 'New Orleans',   station: 'KMSY' },
 }
 
 export function parseTicker(ticker: string): {
@@ -50,14 +75,16 @@ export function parseTicker(ticker: string): {
   const isHigh = series.toLowerCase().includes('high')
 
   // Parse date from YYMMMDD e.g. "26JUN03" → "2026-06-03"
+  const MONTHS: Record<string, string> = {
+    JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',
+    JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12',
+  }
   let resolveDate = 'unknown'
   if (parts.length >= 2) {
-    try {
-      const d = new Date(parts[1].replace(/(\d{2})([A-Z]{3})(\d{2})/, '20$1-$2-$3'))
-      if (!isNaN(d.getTime())) {
-        resolveDate = d.toISOString().slice(0, 10)
-      }
-    } catch { /* leave as unknown */ }
+    const dm = parts[1].match(/^(\d{2})([A-Z]{3})(\d{2})$/)
+    if (dm && MONTHS[dm[2]]) {
+      resolveDate = `20${dm[1]}-${MONTHS[dm[2]]}-${dm[3].padStart(2,'0')}`
+    }
   }
 
   return { series, ...meta, threshold, isHigh, resolveDate }
@@ -92,8 +119,6 @@ export function CityCard({ city, badge, isHigh, resolveDate, markets, totalVolum
   const sorted = [...markets].sort((a, b) =>
     isHigh ? b.threshold - a.threshold : a.threshold - b.threshold
   )
-  const featured = sorted.slice(0, 2)
-  const rest = sorted.slice(2)
 
   // Visual identity: orange sun = high temp, blue snowflake = low temp
   const badgeBg   = isHigh ? 'bg-orange-500'  : 'bg-blue-600'
@@ -102,11 +127,17 @@ export function CityCard({ city, badge, isHigh, resolveDate, markets, totalVolum
   const borderAccent = isHigh ? 'border-[#222]' : 'border-blue-900/40'
   const typeLabel = isHigh ? 'HIGH TEMPERATURE' : 'LOW TEMPERATURE'
   const typeIcon  = isHigh ? '☀' : '❄'
-  const today = new Date().toISOString().slice(0, 10)
-  const dateLabel = resolveDate === today ? 'today'
-    : resolveDate === new Date(Date.now() + 86400000).toISOString().slice(0, 10) ? 'tomorrow'
-    : resolveDate !== 'unknown' ? new Date(resolveDate + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
-    : ''
+  // Compute a human date label relative to local time
+  const now = new Date()
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`
+  const tomorrowDate = new Date(now); tomorrowDate.setDate(now.getDate() + 1)
+  const tomorrowStr = `${tomorrowDate.getFullYear()}-${String(tomorrowDate.getMonth()+1).padStart(2,'0')}-${String(tomorrowDate.getDate()).padStart(2,'0')}`
+  const dateLabel = resolveDate === todayStr ? 'today'
+    : resolveDate === tomorrowStr ? 'tomorrow'
+    : resolveDate !== 'unknown'
+      ? new Date(resolveDate + 'T12:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+      : 'today'
+
   const question  = isHigh
     ? `Highest temperature in ${city} ${dateLabel}?`
     : `Lowest temperature in ${city} ${dateLabel}?`
@@ -152,30 +183,26 @@ export function CityCard({ city, badge, isHigh, resolveDate, markets, totalVolum
         </div>
       </div>
 
-      {/* Featured market rows */}
-      <div className="space-y-3">
-        {featured.map((m, featuredIdx) => {
+      {/* All market rows — each shown as a bar */}
+      <div className="space-y-2.5">
+        {sorted.map((m, i) => {
           const mid = m.market_mid ?? 0.5
           const fair = m.blended_fair
           const pct = Math.round(mid * 100)
           const hasEdge = fair !== null && Math.abs(fair - mid) > 0.04
           const edgeColor = fair !== null && fair > mid ? 'text-green-400' : 'text-orange-400'
-          // High markets: green for likely-yes (high prob), blue for unlikely
-          // Low markets: cyan for likely-yes, purple for unlikely
           const barColor = pct >= 50 ? accentBar : accentLow
           const circleColor = pct >= 50
             ? (isHigh ? 'border-green-500 text-green-400' : 'border-cyan-500 text-cyan-400')
             : (isHigh ? 'border-blue-500 text-blue-400'  : 'border-purple-500 text-purple-400')
-          const label = rangeLabel(featuredIdx)
+          const label = rangeLabel(i)
 
           return (
             <div key={m.ticker}>
-              <div className="flex items-center justify-between mb-1.5">
+              <div className="flex items-center justify-between mb-1">
                 <div className="flex items-center gap-2">
-                  <span className="text-white text-sm font-medium">
-                    {label}
-                  </span>
-                  {fair !== null && hasEdge && (
+                  <span className="text-white text-sm">{label}</span>
+                  {hasEdge && fair !== null && (
                     <span className={`text-[10px] font-bold ${edgeColor}`}>
                       {fair > mid ? '↑' : '↓'} {Math.round(fair * 100)}¢
                     </span>
@@ -183,12 +210,11 @@ export function CityCard({ city, badge, isHigh, resolveDate, markets, totalVolum
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="text-gray-500 text-xs">{multiplier(mid)}</span>
-                  <div className={`w-12 h-7 rounded-full border text-xs font-bold flex items-center justify-center ${circleColor}`}>
+                  <div className={`w-11 h-6 rounded-full border text-xs font-bold flex items-center justify-center ${circleColor}`}>
                     {pct}%
                   </div>
                 </div>
               </div>
-              {/* Probability bar */}
               <div className="h-0.5 bg-[#2a2a2a] rounded-full overflow-hidden">
                 <div
                   className={`h-full rounded-full transition-all duration-500 ${barColor}`}
@@ -199,27 +225,6 @@ export function CityCard({ city, badge, isHigh, resolveDate, markets, totalVolum
           )
         })}
       </div>
-
-      {/* Collapsed remaining rows */}
-      {rest.length > 0 && (
-        <div className="space-y-1 pt-1 border-t border-[#1e1e1e]">
-          {rest.map((m, restIdx) => {
-            const mid = m.market_mid ?? 0.5
-            const pct = Math.round(mid * 100)
-            // rest starts at index featured.length in sorted array
-            const label = rangeLabel(featured.length + restIdx)
-            return (
-              <div key={m.ticker} className="flex items-center justify-between text-xs text-gray-500 py-0.5">
-                <span>{label}</span>
-                <div className="flex items-center gap-2">
-                  <span>{multiplier(mid)}</span>
-                  <span className="w-8 text-right">{pct}%</span>
-                </div>
-              </div>
-            )
-          })}
-        </div>
-      )}
 
       {/* Footer */}
       <div className="flex items-center justify-between text-[11px] text-gray-600 pt-1 border-t border-[#1a1a1a]">
@@ -239,16 +244,29 @@ type CityGroup = {
   rows: MarketRow[]
 }
 
-/** Group markets by (station, isHigh, resolveDate) — one card per city per day */
+/** Group markets by (station, isHigh), keeping only the nearest resolution date
+ *  per city+direction so there are no duplicates when Kalshi rolls to a new day. */
 export function groupMarketsByCity(markets: MarketState[]): Map<string, CityGroup> {
-  const groups = new Map<string, CityGroup>()
+  // First pass: find the nearest (earliest) resolve date per city+direction key
+  const nearestDate = new Map<string, string>()
+  for (const m of markets) {
+    const parsed = parseTicker(m.ticker)
+    if (!parsed || parsed.threshold === null || parsed.resolveDate === 'unknown') continue
+    const key = `${parsed.station}-${parsed.isHigh ? 'high' : 'low'}`
+    const existing = nearestDate.get(key)
+    if (!existing || parsed.resolveDate < existing) {
+      nearestDate.set(key, parsed.resolveDate)
+    }
+  }
 
+  // Second pass: only include contracts from the nearest date for each key
+  const groups = new Map<string, CityGroup>()
   for (const m of markets) {
     const parsed = parseTicker(m.ticker)
     if (!parsed || parsed.threshold === null) continue
+    const key = `${parsed.station}-${parsed.isHigh ? 'high' : 'low'}`
+    if (parsed.resolveDate !== nearestDate.get(key)) continue
 
-    // Key includes date so today's and tomorrow's cards are separate
-    const key = `${parsed.station}-${parsed.isHigh ? 'high' : 'low'}-${parsed.resolveDate}`
     if (!groups.has(key)) {
       groups.set(key, {
         city: parsed.city,
@@ -268,9 +286,7 @@ export function groupMarketsByCity(markets: MarketState[]): Map<string, CityGrou
     })
   }
 
-  // Sort: today's markets first, then by city name
-  return new Map([...groups.entries()].sort(([, a], [, b]) => {
-    if (a.resolveDate !== b.resolveDate) return a.resolveDate.localeCompare(b.resolveDate)
-    return a.city.localeCompare(b.city)
-  }))
+  return new Map([...groups.entries()].sort(([, a], [, b]) =>
+    a.city.localeCompare(b.city)
+  ))
 }

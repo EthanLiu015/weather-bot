@@ -102,6 +102,36 @@ class SharedState:
             return (ts.fair_a + ts.fair_b) / 2.0
         return ts.fair_a if ts.fair_a is not None else ts.fair_b
 
+    def replace_active_tickers(self, new_tickers: set[str]) -> None:
+        """Replace the active ticker set with a fresh list from Kalshi.
+        Only called when we have high confidence in the result (enough tickers returned).
+        Removes any tickers not in new_tickers (settled/expired markets)."""
+        if not new_tickers:
+            return
+        with self._lock:
+            to_remove = [t for t in self._state if t not in new_tickers]
+            for t in to_remove:
+                del self._state[t]
+            if to_remove:
+                logger.info("Removed %d stale tickers from shared_state", len(to_remove))
+
+    def evict_stale_tickers(self, max_age_seconds: int = 300) -> None:
+        """Remove tickers whose market price hasn't been updated in max_age_seconds.
+        Handles the case where Kalshi closes/settles markets without us explicitly
+        knowing — if we stop receiving prices for a ticker, it's gone."""
+        cutoff = datetime.utcnow()
+        from datetime import timedelta
+        threshold = cutoff - timedelta(seconds=max_age_seconds)
+        with self._lock:
+            to_remove = [
+                t for t, ts in self._state.items()
+                if ts.last_updated < threshold
+            ]
+            for t in to_remove:
+                del self._state[t]
+        if to_remove:
+            logger.info("Evicted %d stale tickers (not updated in %ds)", len(to_remove), max_age_seconds)
+
     def blended_fair(self, ticker: str) -> float | None:
         with self._lock:
             ts = self._state.get(ticker)
