@@ -70,8 +70,15 @@ class KalmanBiasCorrector:
 
 
 class BiasCorrectionRegistry:
-    def __init__(self, persist_dir: str = "data/bias_correctors") -> None:
+    def __init__(
+        self,
+        persist_dir: str = "data/bias_correctors",
+        process_noise: float = 0.1,
+        obs_noise: float = 1.5,
+    ) -> None:
         self._persist_dir = Path(persist_dir)
+        self._process_noise = process_noise
+        self._obs_noise = obs_noise
         self._correctors: dict[tuple[str, str, str], KalmanBiasCorrector] = {}
 
     def _key(self, station: str, lead_bucket: str, season: str) -> tuple[str, str, str]:
@@ -87,7 +94,10 @@ class BiasCorrectionRegistry:
                     return self._correctors[key]
                 except Exception as exc:
                     logger.warning("Failed to load corrector %s: %s; creating fresh", path, exc)
-            self._correctors[key] = KalmanBiasCorrector()
+            self._correctors[key] = KalmanBiasCorrector(
+                process_noise=self._process_noise,
+                obs_noise=self._obs_noise,
+            )
         return self._correctors[key]
 
     def update_all(self, new_obs: dict) -> None:

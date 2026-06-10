@@ -2,11 +2,15 @@ import logging
 from datetime import datetime
 import pandas as pd
 
+import numpy as np
+from scipy.stats import norm as _scipy_norm
+
 from ingestion.gefs import fetch_latest_gefs_run, detect_new_run
 from ingestion.ecmwf import fetch_latest_ecmwf_run
 from ingestion.nbm import fetch_latest_nbm
 from processing.bias_correction import BiasCorrectionRegistry, get_lead_bucket, get_season
 from processing.features import build_feature_matrix, get_feature_columns
+from models.spread_inflation import apply_spread_inflation_from_stats
 from config.stations import ALL_ICAO
 from db.models import ForecastRun
 from db.session import get_session
@@ -25,6 +29,50 @@ class EnsembleStrategy:
         self._settings = settings
         self._bias_registry = BiasCorrectionRegistry()
         self._last_run_time: datetime = datetime.min
+
+    @staticmethod
+    def _compute_fair_value(
+        X: "pd.DataFrame",
+        ngboost_model,
+        qrf_model,
+        residual_model,
+        blender,
+        calibrator,
+        threshold: float,
+    ) -> dict:
+        mu, sigma = ngboost_model.predict_distribution(X)
+
+        if residual_model is not None:
+            try:
+                mu = mu + residual_model.predict(X)
+            except Exception:
+                pass
+
+        if "gefs_tmax_std" in X.columns and "gefs_tmax_range" in X.columns:
+            std_arr = X["gefs_tmax_std"].fillna(0).values
+            range_arr = X["gefs_tmax_range"].fillna(0).values
+            _, sigma = apply_spread_inflation_from_stats(mu, sigma, std_arr, range_arr)
+
+        raw_prob = float(1.0 - _scipy_norm.cdf(threshold, loc=mu[0], scale=max(sigma[0], 0.01)))
+
+        if qrf_model is not None and blender is not None:
+            try:
+                qrf_prob = float(qrf_model.predict_prob_above(X, threshold)[0])
+                raw_prob = float(
+                    blender.weights["ngboost"] * raw_prob
+                    + blender.weights["qrf"] * qrf_prob
+                )
+            except Exception:
+                pass
+
+        if calibrator is not None:
+            cal_prob, ci_lo, ci_hi = calibrator.calibrate(raw_prob)
+            ci_width = ci_hi - ci_lo
+        else:
+            cal_prob = raw_prob
+            ci_width = 0.1
+
+        return {"raw_prob": raw_prob, "cal_prob": float(cal_prob), "ci_width": float(ci_width)}
 
     async def run_cycle(self) -> None:
         logger.info("EnsembleStrategy: starting cycle")
@@ -84,10 +132,11 @@ class EnsembleStrategy:
         available_cols = [c for c in feature_cols if c in feature_df.columns]
 
         # Registry stores dicts keyed by station for per-station models
-        ngboost_by_station = self._registry.get("ngboost") or {}
-        qrf_by_station     = self._registry.get("qrf") or {}
-        blender            = self._registry.get("blender")
-        calibrators        = self._registry.get("calibrators") or {}
+        ngboost_by_station  = self._registry.get("ngboost") or {}
+        qrf_by_station      = self._registry.get("qrf") or {}
+        residual_by_station = self._registry.get("residual") or {}
+        blender             = self._registry.get("blender")
+        calibrators         = self._registry.get("calibrators") or {}
 
         if not ngboost_by_station:
             logger.warning("No trained NGBoost models in registry — skipping cycle")
@@ -116,33 +165,33 @@ class EnsembleStrategy:
                     closest_row = station_rows.iloc[[0]]
                 X = closest_row[available_cols].fillna(0.0)
 
-                ngboost_model = ngboost_by_station.get(station)
-                qrf_model     = qrf_by_station.get(station)
+                ngboost_model  = ngboost_by_station.get(station)
+                qrf_model      = qrf_by_station.get(station)
+                residual_model = residual_by_station.get(station)
                 if ngboost_model is None:
                     logger.debug("No model for station %s", station)
                     continue
 
+                lead_bucket = "D1-2" if horizon <= 2 else "D3-4" if horizon <= 4 else "D5-7"
+                cal_key = f"{station}_{lead_bucket}"
+                calibrator = calibrators.get(cal_key)
+
                 try:
-                    ng_prob = ngboost_model.predict_prob_above(X, threshold)
-                    if qrf_model is not None and blender is not None:
-                        qrf_prob = qrf_model.predict_prob_above(X, threshold)
-                        blended_prob = blender.blend_probs(ng_prob, qrf_prob)
-                    else:
-                        blended_prob = ng_prob
+                    fv = self._compute_fair_value(
+                        X=X,
+                        ngboost_model=ngboost_model,
+                        qrf_model=qrf_model,
+                        residual_model=residual_model,
+                        blender=blender,
+                        calibrator=calibrator,
+                        threshold=threshold,
+                    )
                 except Exception as exc:
                     logger.warning("Model inference failed for %s: %s", ticker, exc)
                     continue
 
-                raw_prob = float(blended_prob[0])
-                lead_bucket = "D1-2" if horizon <= 2 else "D3-4" if horizon <= 4 else "D5-7"
-                cal_key = f"{station}_{lead_bucket}"
-                calibrator = calibrators.get(cal_key)
-                if calibrator is not None:
-                    cal_prob, ci_lo, ci_hi = calibrator.calibrate(raw_prob)
-                    ci_width = ci_hi - ci_lo
-                else:
-                    cal_prob = raw_prob
-                    ci_width = 0.1
+                cal_prob = fv["cal_prob"]
+                ci_width = fv["ci_width"]
 
                 self._state.update_fair_a(ticker, cal_prob, ci_width, horizon)
 
@@ -152,7 +201,7 @@ class EnsembleStrategy:
                         model_source="blend",
                         run_time=datetime.utcnow(),
                         lead_time_hours=horizon * 24,
-                        mu=cal_prob,
+                        mu=fv["raw_prob"],
                         sigma=ci_width,
                         calibrated_prob=cal_prob,
                         ci_lower=cal_prob - ci_width / 2,

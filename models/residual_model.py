@@ -12,8 +12,10 @@ class ResidualModel:
     def __init__(self, station: str) -> None:
         self.station = station
         self._model: lgb.LGBMRegressor | None = None
+        self.feature_names_: list[str] | None = None
 
     def fit(self, X_residual: pd.DataFrame, residuals: pd.Series) -> None:
+        self.feature_names_ = list(X_residual.columns)
         split = int(len(X_residual) * 0.8)
         X_tr, X_val = X_residual.iloc[:split], X_residual.iloc[split:]
         y_tr, y_val = residuals.iloc[:split], residuals.iloc[split:]
@@ -38,6 +40,8 @@ class ResidualModel:
     def predict(self, X_residual: pd.DataFrame) -> np.ndarray:
         if self._model is None:
             raise RuntimeError("Model not fitted")
+        if self.feature_names_ is not None:
+            X_residual = X_residual[self.feature_names_]
         return self._model.predict(X_residual)
 
     def feature_importance(self) -> pd.Series:
@@ -51,7 +55,10 @@ class ResidualModel:
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
-            pickle.dump({"station": self.station, "model": self._model}, f)
+            pickle.dump(
+                {"station": self.station, "model": self._model, "feature_names": self.feature_names_},
+                f,
+            )
         logger.info("ResidualModel saved to %s", path)
 
     @classmethod
@@ -60,4 +67,5 @@ class ResidualModel:
             data = pickle.load(f)
         instance = cls(station=data["station"])
         instance._model = data["model"]
+        instance.feature_names_ = data.get("feature_names")
         return instance

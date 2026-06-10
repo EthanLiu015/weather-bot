@@ -11,6 +11,10 @@ from backtest.track_b import simulate_pnl
 from backtest.report import BacktestReport, FoldResult
 from models.ngboost_model import NGBoostTemperatureModel
 from models.calibration import IsotonicCalibrator
+from models.residual_model import ResidualModel
+from models.qrf_model import QRFTemperatureModel
+from models.blend import ModelBlender
+from models.spread_inflation import apply_spread_inflation_from_stats
 from processing.features import get_feature_columns
 
 logger = logging.getLogger(__name__)
@@ -56,18 +60,10 @@ class BacktestRunner:
         train_df = self._load_historical_features(train_start, train_end)
         test_df = self._load_historical_features(test_month, test_month + relativedelta(months=1) - timedelta(days=1))
 
-        if train_df.empty or test_df.empty:
-            logger.warning("Empty data for fold %s — returning dummy metrics", test_month)
-            return FoldResult(
-                fold_month=test_month,
-                crps=float("nan"),
-                mae=float("nan"),
-                brier_score=float("nan"),
-                reliability_slope=float("nan"),
-                simulated_pnl_usd=0.0,
-                num_simulated_trades=0,
-                edge_above_threshold_pct=0.0,
-            )
+        if train_df.empty:
+            raise ValueError(f"Fold {test_month}: train data is empty for {train_start} → {train_end}")
+        if test_df.empty:
+            raise ValueError(f"Fold {test_month}: test data is empty for {test_month}")
 
         ok, issues = audit_no_leakage(train_df, test_df, date_col="date", train_end=train_end)
         if not ok:
@@ -99,6 +95,39 @@ class BacktestRunner:
         ngb.fit(X_train, y_train)
         mu_test, sigma_test = ngb.predict_distribution(X_test)
 
+        # Apply residual correction: train ResidualModel on NGBoost residuals
+        mu_train, _ = ngb.predict_distribution(X_train)
+        residuals_train = y_train.values - mu_train
+        res_model = ResidualModel(station="all")
+        res_model.fit(X_train, pd.Series(residuals_train, index=y_train.index))
+        mu_test = mu_test + res_model.predict(X_test)
+
+        # Blend with QRF using out-of-fold log-score weighting
+        val_n = max(30, int(len(X_train) * 0.15))
+        X_val_ngb = X_train.iloc[-val_n:]
+        y_val_ngb = y_train.iloc[-val_n:]
+        import properscoring as ps
+        from scipy.stats import norm as _norm_val
+        mu_val, sigma_val = ngb.predict_distribution(X_val_ngb)
+        ngb_log_score = float(np.mean(ps.crps_gaussian(y_val_ngb.values, mu_val, sigma_val)))
+        mu_test, sigma_test = self._fit_qrf_and_blend(
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            ngb_mu=mu_test,
+            ngb_sigma=sigma_test,
+            ngb_log_score=ngb_log_score,
+        )
+
+        # Widen sigma when ensemble members cluster tightly (overconfidence signal)
+        if "gefs_tmax_std" in X_test.columns and "gefs_tmax_range" in X_test.columns:
+            _, sigma_test = apply_spread_inflation_from_stats(
+                mu=mu_test,
+                sigma=sigma_test,
+                std_arr=X_test["gefs_tmax_std"].fillna(0).values,
+                range_arr=X_test["gefs_tmax_range"].fillna(0).values,
+            )
+
         # ── Forecast skill metrics use a single global threshold ──────────────
         global_threshold = float(y_train.mean())
         prob_forecasts = ngb.predict_prob_above(X_test, global_threshold)
@@ -110,15 +139,10 @@ class BacktestRunner:
         calibrator.fit(prob_train, outcomes_train)
         cal_probs = calibrator._iso.predict(prob_forecasts) if calibrator._iso is not None else prob_forecasts
 
-        mu_nan  = int(np.isnan(mu_test).sum())
-        obs_nan = int(np.isnan(y_test.values).sum())
-        logger.info("Fold debug: len(mu)=%d len(obs)=%d mu_nan=%d obs_nan=%d mu_range=[%.1f,%.1f]",
-                    len(mu_test), len(y_test), mu_nan, obs_nan,
+        logger.info("Fold debug: len(mu)=%d len(obs)=%d mu_range=[%.1f,%.1f]",
+                    len(mu_test), len(y_test),
                     float(np.nanmin(mu_test)), float(np.nanmax(mu_test)))
-        if mu_nan > 0 or obs_nan > 0:
-            logger.warning("Clamping NaN values before metrics")
-            mu_test = np.where(np.isfinite(mu_test), mu_test, np.nanmedian(mu_test))
-            sigma_test = np.where(np.isfinite(sigma_test) & (sigma_test > 0), sigma_test, 5.0)
+        self._validate_predictions(mu_test, sigma_test, y_test.values, test_month)
 
         metrics = track_a_metrics(
             prob_forecasts=cal_probs,
@@ -137,18 +161,15 @@ class BacktestRunner:
             train_df.groupby(["station", "_month"])[target_col].median()
         )
 
-        if "lead_hour" in test_df.columns:
-            d1_mask = test_df["lead_hour"] == 24
-            d1_test = test_df[d1_mask].copy()
-            mu_d1    = mu_test[d1_mask]
-            sigma_d1 = sigma_test[d1_mask]
-        else:
-            d1_test  = test_df.copy()
-            mu_d1    = mu_test
-            sigma_d1 = sigma_test
+        # Evaluate all lead hours (D1-D7); filter to [24] for backward compat
+        eval_lead_hours = getattr(self._settings, "EVAL_LEAD_HOURS", [24])
+        d1_test, mu_d1, sigma_d1 = self._filter_by_lead_hours(
+            test_df=test_df, mu=mu_test, sigma=sigma_test, lead_hours=eval_lead_hours
+        )
+
+        market_type = getattr(self._settings, "MARKET_TYPE", "above")
 
         # Per-row threshold and probability
-        from scipy.stats import norm as _norm
         row_thresholds = np.array([
             float(station_month_median.get(
                 (row["station"], pd.to_datetime(row["date"]).month),
@@ -156,11 +177,35 @@ class BacktestRunner:
             ))
             for _, row in d1_test.iterrows()
         ])
-        # P(Tmax > threshold_i) using Normal(mu_i, sigma_i) from NGBoost
-        trade_probs_raw = 1.0 - _norm.cdf(row_thresholds, loc=mu_d1, scale=np.maximum(sigma_d1, 0.01))
-        # Calibrate using the global calibrator (approximate but consistent)
-        trade_probs = calibrator._iso.predict(trade_probs_raw) if calibrator._iso is not None else trade_probs_raw
-        trade_outcomes = (d1_test[target_col].values > row_thresholds).astype(float)
+        trade_probs_raw = self._compute_trade_prob(mu_d1, sigma_d1, row_thresholds, market_type)
+
+        # Calibrate with a trade-specific calibrator trained on per-row training probs
+        train_thresholds = np.array([
+            float(station_month_median.get(
+                (row["station"], pd.to_datetime(row["date"]).month),
+                global_threshold,
+            ))
+            for _, row in d1_test.iterrows()  # only D1 rows in test; use training analogue
+        ])
+        mu_train_pred, sigma_train_pred = ngb.predict_distribution(X_train[avail_cols])
+        train_row_thresholds = np.array([
+            float(station_month_median.get(
+                (row["station"], pd.to_datetime(row["date"]).month),
+                global_threshold,
+            ))
+            for _, row in train_df.iterrows()
+        ])
+        trade_calibrator = self._build_trade_calibrator(
+            mu_train=mu_train_pred,
+            sigma_train=sigma_train_pred,
+            y_train=y_train.values,
+            row_thresholds_train=train_row_thresholds,
+        )
+        trade_probs = trade_calibrator._iso.predict(trade_probs_raw) if trade_calibrator._iso is not None else trade_probs_raw
+        if market_type == "below":
+            trade_outcomes = (d1_test[target_col].values < row_thresholds).astype(float)
+        else:
+            trade_outcomes = (d1_test[target_col].values > row_thresholds).astype(float)
 
         # Build market mids and track which rows used real Kalshi prices
         market_mids, is_real = self._climatological_mids(
@@ -168,6 +213,7 @@ class BacktestRunner:
             test_df=d1_test,
             thresholds=row_thresholds,
             target_col=target_col,
+            market_type=market_type,
         )
 
         sim = simulate_pnl(
@@ -206,6 +252,113 @@ class BacktestRunner:
             clim_price_pnl=clim_sim["simulated_pnl_usd"],
             clim_price_trades=clim_sim["num_simulated_trades"],
         )
+
+    @staticmethod
+    def _compute_trade_prob(
+        mu: np.ndarray,
+        sigma: np.ndarray,
+        threshold: np.ndarray,
+        market_type: str = "above",
+    ) -> np.ndarray:
+        from scipy.stats import norm as _norm
+        cdf = _norm.cdf(threshold, loc=mu, scale=np.maximum(sigma, 0.01))
+        if market_type == "below":
+            return cdf
+        return 1.0 - cdf
+
+    @staticmethod
+    def _filter_by_lead_hours(
+        test_df: pd.DataFrame,
+        mu: np.ndarray,
+        sigma: np.ndarray,
+        lead_hours: list[int] | None,
+    ) -> tuple[pd.DataFrame, np.ndarray, np.ndarray]:
+        if "lead_hour" not in test_df.columns or lead_hours is None:
+            return test_df, mu, sigma
+        mask = test_df["lead_hour"].isin(lead_hours)
+        return test_df[mask].copy(), mu[mask], sigma[mask]
+
+    @staticmethod
+    def _fit_qrf_and_blend(
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_test: pd.DataFrame,
+        ngb_mu: np.ndarray,
+        ngb_sigma: np.ndarray,
+        ngb_log_score: float,
+        n_estimators: int = 100,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        val_n = max(30, int(len(X_train) * 0.15))
+        X_val, y_val = X_train.iloc[-val_n:], y_train.iloc[-val_n:]
+        X_tr, y_tr = X_train.iloc[:-val_n], y_train.iloc[:-val_n]
+
+        qrf = QRFTemperatureModel(n_estimators=n_estimators, min_samples_leaf=10)
+        qrf.fit(X_tr, y_tr)
+
+        qrf_log_score = qrf.log_score(X_val, y_val)
+        blender = ModelBlender()
+        blender.compute_weights_from_log_scores(ngb_log_score, qrf_log_score)
+
+        q_df = qrf.predict_quantiles(X_test)
+        qrf_mu = q_df["q50"].values
+        qrf_sigma = np.maximum((q_df["q75"].values - q_df["q25"].values) / 1.35, 0.01)
+
+        return blender.blend_mu_sigma(ngb_mu, ngb_sigma, qrf_mu, qrf_sigma)
+
+    @staticmethod
+    def _compute_error_distributions(features_df: pd.DataFrame) -> pd.DataFrame:
+        from processing.bias_correction import get_lead_bucket
+        required = {"station", "lead_hour", "gefs_tmax_mean", "actual_tmax"}
+        if not required.issubset(features_df.columns):
+            return pd.DataFrame()
+        df = features_df.dropna(subset=["gefs_tmax_mean", "actual_tmax"]).copy()
+        df["residual"] = df["gefs_tmax_mean"] - df["actual_tmax"]
+        df["lead_hours"] = df["lead_hour"].astype(int)
+        df["month"] = pd.to_datetime(df["date"]).dt.month
+
+        rows = []
+        for (station, month, lead), grp in df.groupby(["station", "month", "lead_hours"]):
+            if len(grp) >= 10:
+                rows.append({
+                    "station": station,
+                    "month": month,
+                    "lead_hours": lead,
+                    "std_error_f": float(grp["residual"].std()),
+                })
+        return pd.DataFrame(rows)
+
+    @staticmethod
+    def _build_trade_calibrator(
+        mu_train: np.ndarray,
+        sigma_train: np.ndarray,
+        y_train: np.ndarray,
+        row_thresholds_train: np.ndarray,
+    ) -> IsotonicCalibrator:
+        from scipy.stats import norm as _norm
+        probs = 1.0 - _norm.cdf(
+            row_thresholds_train,
+            loc=mu_train,
+            scale=np.maximum(sigma_train, 0.01),
+        )
+        outcomes = (y_train > row_thresholds_train).astype(float)
+        cal = IsotonicCalibrator()
+        cal.fit(probs, outcomes)
+        return cal
+
+    @staticmethod
+    def _validate_predictions(
+        mu: np.ndarray,
+        sigma: np.ndarray,
+        observations: np.ndarray,
+        fold_month,
+    ) -> None:
+        mu_nan = int(np.isnan(mu).sum())
+        obs_nan = int(np.isnan(observations).sum())
+        if mu_nan > 0 or obs_nan > 0:
+            raise ValueError(
+                f"Fold {fold_month}: {mu_nan} NaN mu predictions, {obs_nan} NaN observations — "
+                "fix the upstream feature pipeline rather than imputing"
+            )
 
     @staticmethod
     def _load_error_distributions() -> pd.DataFrame:
@@ -279,20 +432,28 @@ class BacktestRunner:
             logger.info("No kalshi_prices.parquet found — using climatological mids")
             return pd.DataFrame()
 
-    def _get_market_mid(self, station: str, date_: date, threshold: float) -> float | None:
-        """Return real Kalshi D+1 mid for (station, date, threshold) if available."""
+    def _get_market_mid(
+        self,
+        station: str,
+        date_: date,
+        threshold: float,
+        market_type: str = "above",
+    ) -> float | None:
+        """Return real Kalshi D+1 mid for (station, date, threshold, market_type) if available."""
         if self._kalshi_prices.empty:
             return None
         mask = (
             (self._kalshi_prices["station"] == station) &
             (self._kalshi_prices["date"] == date_) &
-            (self._kalshi_prices["market_type"] == "above")
+            (self._kalshi_prices["market_type"] == market_type)
         )
         candidates = self._kalshi_prices[mask]
         if candidates.empty:
             return None
         # Pick the contract whose threshold is closest to ours
         closest = candidates.iloc[(candidates["threshold"] - threshold).abs().argmin()]
+        if abs(closest["threshold"] - threshold) > 5.0:
+            return None
         mid = closest["d1_mid"]
         if pd.isna(mid) or mid <= 0 or mid >= 1:
             return None
@@ -304,7 +465,7 @@ class BacktestRunner:
         test_df: pd.DataFrame,
         thresholds: np.ndarray,
         target_col: str,
-        noise_std: float = 0.02,
+        market_type: str = "above",
     ) -> tuple[np.ndarray, np.ndarray]:
         """
         Compute market mid for each test row using its per-row threshold.
@@ -313,7 +474,6 @@ class BacktestRunner:
 
         Prefers real Kalshi prices when available, falls back to climatology.
         """
-        rng = np.random.default_rng(42)
         mids = np.full(len(test_df), 0.5)
         is_real = np.zeros(len(test_df), dtype=bool)
         real_price_count = 0
@@ -328,7 +488,7 @@ class BacktestRunner:
             month = pd.to_datetime(row["date"]).month
 
             # Prefer real Kalshi market price at the closest matching threshold
-            real_mid = self._get_market_mid(station, row_date, threshold_i)
+            real_mid = self._get_market_mid(station, row_date, threshold_i, market_type)
             if real_mid is not None:
                 mids[i] = real_mid
                 is_real[i] = True
@@ -348,8 +508,7 @@ class BacktestRunner:
             else:
                 clim_prob = 0.5
 
-            noise = rng.normal(0, noise_std)
-            mids[i] = float(np.clip(clim_prob + noise, 0.02, 0.98))
+            mids[i] = float(np.clip(clim_prob, 0.02, 0.98))
 
         if real_price_count > 0:
             logger.info("Market mids: %d real Kalshi prices, %d climatological",

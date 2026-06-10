@@ -88,6 +88,33 @@ def _aggregate_members(member_list: list[dict]) -> dict[str, float]:
     }
 
 
+_MAX_LAG_STALENESS_DAYS = 3
+
+
+def _filter_and_sort_asos(hist: pd.Series, ref_ts: pd.Timestamp) -> pd.Series:
+    if isinstance(hist.index, pd.DatetimeIndex):
+        hist = hist[hist.index <= ref_ts]
+    return hist.sort_index()
+
+
+def _extract_lags(
+    vals: np.ndarray,
+    index: pd.Index,
+    ref_ts: pd.Timestamp,
+) -> tuple[float, float, float]:
+    if len(vals) == 0:
+        return float("nan"), float("nan"), float("nan")
+    if isinstance(index, pd.DatetimeIndex) and len(index) > 0:
+        most_recent = index[-1]
+        staleness = (ref_ts - most_recent).days
+        if staleness > _MAX_LAG_STALENESS_DAYS:
+            return float("nan"), float("nan"), float("nan")
+    lag1 = float(vals[-1]) if len(vals) >= 1 else float("nan")
+    lag2 = float(vals[-2]) if len(vals) >= 2 else float("nan")
+    lag3 = float(vals[-3]) if len(vals) >= 3 else float("nan")
+    return lag1, lag2, lag3
+
+
 def build_feature_matrix(
     gefs_data: dict,
     ecmwf_data: dict,
@@ -95,23 +122,32 @@ def build_feature_matrix(
     regime_labels: pd.Series,
     nbm_data: dict | None = None,
     station_meta: dict | None = None,
+    reference_date: dt_mod.date | None = None,
 ) -> pd.DataFrame:
     rows = []
     if station_meta is None:
         station_meta = STATION_META
 
-    today = dt_mod.date.today()
-    month = today.month
-    doy = today.timetuple().tm_yday
+    ref_date = reference_date or dt_mod.date.today()
+    month = ref_date.month
+    doy = ref_date.timetuple().tm_yday
     month_sin, month_cos = _cyclical(month, 12)
     doy_sin, doy_cos = _cyclical(doy, 365)
 
     regime_vec = [0.0] * N_REGIME_CLUSTERS
     if regime_labels is not None and len(regime_labels) > 0:
         try:
-            latest_label = int(regime_labels.iloc[-1])
-            if 0 <= latest_label < N_REGIME_CLUSTERS:
-                regime_vec[latest_label] = 1.0
+            if isinstance(regime_labels.index, pd.DatetimeIndex):
+                ref_ts = pd.Timestamp(ref_date)
+                label_val = regime_labels.asof(ref_ts)
+                if pd.notna(label_val):
+                    label = int(label_val)
+                else:
+                    label = int(regime_labels.iloc[-1])
+            else:
+                label = int(regime_labels.iloc[-1])
+            if 0 <= label < N_REGIME_CLUSTERS:
+                regime_vec[label] = 1.0
         except Exception:
             pass
 
@@ -189,19 +225,18 @@ def build_feature_matrix(
             lag1 = lag2 = lag3 = float("nan")
             if asos_history is not None and not asos_history.empty:
                 try:
+                    ref_ts = pd.Timestamp(ref_date)
                     if isinstance(asos_history.index, pd.MultiIndex):
                         if station in asos_history.index.get_level_values(0):
                             hist = asos_history.loc[station]
+                            hist = _filter_and_sort_asos(hist, ref_ts)
                             vals = hist.dropna().values[-3:]
-                            if len(vals) >= 1: lag1 = float(vals[-1])
-                            if len(vals) >= 2: lag2 = float(vals[-2])
-                            if len(vals) >= 3: lag3 = float(vals[-3])
+                            lag1, lag2, lag3 = _extract_lags(vals, hist.dropna().index, ref_ts)
                     elif station in asos_history.columns:
                         hist = asos_history[station]
+                        hist = _filter_and_sort_asos(hist, ref_ts)
                         vals = hist.dropna().values[-3:]
-                        if len(vals) >= 1: lag1 = float(vals[-1])
-                        if len(vals) >= 2: lag2 = float(vals[-2])
-                        if len(vals) >= 3: lag3 = float(vals[-3])
+                        lag1, lag2, lag3 = _extract_lags(vals, hist.dropna().index, ref_ts)
                 except Exception:
                     pass
 

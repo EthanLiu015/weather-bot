@@ -64,6 +64,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         from models.blend import ModelBlender
         from models.ngboost_model import NGBoostTemperatureModel
         from models.qrf_model import QRFTemperatureModel
+        from models.residual_model import ResidualModel
         from models.calibration import IsotonicCalibrator
         from models.registry import load_latest_artifact
         from config.stations import ALL_ICAO
@@ -74,8 +75,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.blender = blender
         model_registry["blender"] = blender
 
-        # Load per-station NGBoost + QRF
-        ngboost_models, qrf_models = {}, {}
+        # Load per-station NGBoost + QRF + ResidualModel
+        ngboost_models, qrf_models, residual_models = {}, {}, {}
         for station in ALL_ICAO:
             try:
                 ngboost_models[station] = load_latest_artifact(NGBoostTemperatureModel, "ngboost", station)
@@ -87,6 +88,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 logger.info("Loaded QRF for %s", station)
             except FileNotFoundError:
                 logger.debug("No QRF artifact for %s", station)
+            try:
+                residual_models[station] = load_latest_artifact(ResidualModel, "residual", station)
+                logger.info("Loaded ResidualModel for %s", station)
+            except FileNotFoundError:
+                logger.debug("No ResidualModel artifact for %s", station)
 
         # Load calibrators
         calibrators = {}
@@ -104,11 +110,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         model_registry["ngboost"]    = ngboost_models
         model_registry["qrf"]        = qrf_models
+        model_registry["residual"]   = residual_models
         model_registry["calibrators"] = calibrators
 
         loaded = len(ngboost_models)
-        logger.info("Model registry loaded: %d stations with NGBoost, %d with QRF, %d calibrators",
-                    len(ngboost_models), len(qrf_models), len(calibrators))
+        logger.info("Model registry loaded: %d stations with NGBoost, %d with QRF, %d with ResidualModel, %d calibrators",
+                    len(ngboost_models), len(qrf_models), len(residual_models), len(calibrators))
 
     except Exception as exc:
         logger.warning("Model registry init failed: %s", exc)

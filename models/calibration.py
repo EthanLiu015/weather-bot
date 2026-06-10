@@ -8,7 +8,7 @@ from sklearn.linear_model import LinearRegression
 
 logger = logging.getLogger(__name__)
 
-MIN_SAMPLES = 100
+MIN_SAMPLES = 30
 
 
 class IsotonicCalibrator:
