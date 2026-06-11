@@ -297,7 +297,9 @@ class BacktestRunner:
 
         qrf_log_score = qrf.log_score(X_val, y_val)
         blender = ModelBlender()
-        blender.compute_weights_from_log_scores(ngb_log_score, qrf_log_score)
+        # ngb_log_score / qrf_log_score are CRPS values (lower = better), but
+        # compute_weights_from_log_scores treats higher = better, so negate.
+        blender.compute_weights_from_log_scores(-ngb_log_score, -qrf_log_score)
 
         q_df = qrf.predict_quantiles(X_test)
         qrf_mu = q_df["q50"].values

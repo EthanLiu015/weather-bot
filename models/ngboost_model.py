@@ -73,6 +73,13 @@ class NGBoostTemperatureModel:
         scores = self._model.score(X.values, y.values)
         return float(np.mean(scores))
 
+    def crps(self, X: pd.DataFrame, y: pd.Series) -> float:
+        """CRPS of the predicted distribution, in the same units (and lower-is-better
+        sense) as QRFTemperatureModel.log_score, so the two can be compared directly."""
+        import properscoring as ps
+        mu, sigma = self.predict_distribution(X)
+        return float(np.mean(ps.crps_gaussian(y.values, mu, sigma)))
+
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:

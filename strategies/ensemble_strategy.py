@@ -1,17 +1,20 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 
 import numpy as np
 from scipy.stats import norm as _scipy_norm
 
-from ingestion.gefs import fetch_latest_gefs_run, detect_new_run
+from ingestion.asos import fetch_daily_tmax_history
+from ingestion.gefs import fetch_latest_gefs_run, detect_new_run, FORECAST_HOURS
 from ingestion.ecmwf import fetch_latest_ecmwf_run
 from ingestion.nbm import fetch_latest_nbm
+from processing.asos_history import compute_daily_residuals, build_asos_history_df
 from processing.bias_correction import BiasCorrectionRegistry, get_lead_bucket, get_season
 from processing.features import build_feature_matrix, get_feature_columns
 from models.spread_inflation import apply_spread_inflation_from_stats
 from config.stations import ALL_ICAO
+from db.forecast_log import record_forecast_tmax, get_forecast_tmax
 from db.models import ForecastRun
 from db.session import get_session
 
@@ -19,6 +22,15 @@ logger = logging.getLogger(__name__)
 
 STATIONS = ALL_ICAO
 RESOLUTION_WINDOW_DAYS = 7
+
+# Below this overall GEFS coverage, the scheduler should keep retrying
+# ingestion (cheap — fetch_latest_gefs_run only re-downloads missing files)
+# rather than waiting for the next 6-hourly GEFS cycle.
+RETRY_COVERAGE_THRESHOLD = 0.9
+
+# Below this per-lead-bucket GEFS coverage, skip updating fair values for
+# tickers in that bucket rather than quoting off empty/zero-filled features.
+GATE_COVERAGE_THRESHOLD = 0.5
 
 
 class EnsembleStrategy:
@@ -29,6 +41,53 @@ class EnsembleStrategy:
         self._settings = settings
         self._bias_registry = BiasCorrectionRegistry()
         self._last_run_time: datetime = datetime.min
+        self.last_gefs_coverage_pct: float = 1.0
+
+    def needs_retry(self) -> bool:
+        """True if the last cycle's GEFS coverage was low enough that the
+        scheduler should retry ingestion before the next 6-hourly cycle."""
+        return self.last_gefs_coverage_pct < RETRY_COVERAGE_THRESHOLD
+
+    @staticmethod
+    def _compute_coverage_by_bucket(gefs_raw: dict, stations: list[str]) -> dict[str, float]:
+        """Fraction of expected (member × station × lead-hour) GEFS records
+        received, broken down by lead bucket (D1-2, D3-4, D5-7)."""
+        expected = {"D1-2": 0, "D3-4": 0, "D5-7": 0}
+        received = {"D1-2": 0, "D3-4": 0, "D5-7": 0}
+        for station in stations:
+            for lead_hour in FORECAST_HOURS:
+                bucket = get_lead_bucket(lead_hour)
+                expected[bucket] += 31
+                received[bucket] += len(gefs_raw.get(station, {}).get(lead_hour, []))
+        return {
+            bucket: (received[bucket] / expected[bucket] if expected[bucket] else 0.0)
+            for bucket in expected
+        }
+
+    @staticmethod
+    def _record_tomorrows_forecast(feature_df: "pd.DataFrame", today=None) -> None:
+        """Persist each station's GEFS D+1 (lead_hour=24) Tmax forecast as the
+        prediction for tomorrow, so a future cycle can diff it against the
+        observed Tmax to populate obs_minus_model_lag1/2/3."""
+        target_date = (today or datetime.utcnow().date()) + timedelta(days=1)
+        d1_rows = feature_df[feature_df["lead_hour"] == 24]
+        for _, row in d1_rows.iterrows():
+            record_forecast_tmax(row["station"], target_date, float(row["gefs_tmax_mean"]))
+
+    @staticmethod
+    async def _build_live_asos_history(stations: list[str], lookback_days: int = 4) -> "pd.DataFrame":
+        """Build asos_history (obs_minus_model residuals) from recent observed
+        Tmax and previously-persisted GEFS D+1 forecasts."""
+        residuals_by_station: dict[str, dict] = {}
+        for station in stations:
+            actual_tmax = await fetch_daily_tmax_history(station, days=lookback_days)
+            if not actual_tmax:
+                continue
+            forecast_tmax = get_forecast_tmax(station, list(actual_tmax.keys()))
+            residuals = compute_daily_residuals(actual_tmax, forecast_tmax)
+            if residuals:
+                residuals_by_station[station] = residuals
+        return build_asos_history_df(residuals_by_station)
 
     @staticmethod
     def _compute_fair_value(
@@ -86,13 +145,13 @@ class EnsembleStrategy:
             return
 
         # Check GEFS member coverage and alert on significant gaps
-        from ingestion.gefs import FORECAST_HOURS
         total_expected = len(STATIONS) * len(FORECAST_HOURS) * 31
         total_received = sum(
             len(gefs_raw.get(s, {}).get(lh, []))
             for s in STATIONS for lh in FORECAST_HOURS
         )
         coverage_pct = total_received / total_expected if total_expected > 0 else 0
+        self.last_gefs_coverage_pct = coverage_pct
         if coverage_pct < 0.5:
             self._state.post_alert(
                 "gefs_coverage",
@@ -101,6 +160,8 @@ class EnsembleStrategy:
             )
         elif coverage_pct >= 0.9:
             self._state.clear_alerts("gefs_coverage")
+
+        bucket_coverage = self._compute_coverage_by_bucket(gefs_raw, STATIONS)
 
         # Apply Kalman bias correction to GEFS member temperatures
         for station in STATIONS:
@@ -115,10 +176,16 @@ class EnsembleStrategy:
                     if not math.isnan(tf):
                         member["temp_f"] = corrector.correct(tf)
 
+        try:
+            asos_history = await self._build_live_asos_history(STATIONS)
+        except Exception as exc:
+            logger.warning("Failed to build live ASOS history: %s", exc)
+            asos_history = pd.DataFrame()
+
         feature_df = build_feature_matrix(
             gefs_data=gefs_raw,
             ecmwf_data=ecmwf_raw,
-            asos_history=pd.DataFrame(),
+            asos_history=asos_history,
             regime_labels=pd.Series(dtype=float),
             nbm_data=nbm_raw,
             station_meta=None,
@@ -127,6 +194,11 @@ class EnsembleStrategy:
         if feature_df.empty:
             logger.warning("Empty feature matrix — skipping order updates")
             return
+
+        try:
+            self._record_tomorrows_forecast(feature_df)
+        except Exception as exc:
+            logger.warning("Failed to record forecast log: %s", exc)
 
         feature_cols = get_feature_columns()
         available_cols = [c for c in feature_cols if c in feature_df.columns]
@@ -173,6 +245,14 @@ class EnsembleStrategy:
                     continue
 
                 lead_bucket = "D1-2" if horizon <= 2 else "D3-4" if horizon <= 4 else "D5-7"
+
+                if bucket_coverage.get(lead_bucket, 1.0) < GATE_COVERAGE_THRESHOLD:
+                    logger.info(
+                        "Skipping %s — %s GEFS coverage too low (%.0f%%)",
+                        ticker, lead_bucket, bucket_coverage.get(lead_bucket, 0.0) * 100,
+                    )
+                    continue
+
                 cal_key = f"{station}_{lead_bucket}"
                 calibrator = calibrators.get(cal_key)
 

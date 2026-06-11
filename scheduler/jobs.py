@@ -141,6 +141,16 @@ def build_scheduler(
         if is_new:
             logger.info("New GEFS run detected — triggering ensemble cycle")
             await run_ensemble_cycle_job()
+        elif ensemble_strategy.needs_retry():
+            # Last cycle had low GEFS coverage (NOAA hadn't finished publishing
+            # the longer-lead forecast hours yet). Retry now — fetch_latest_gefs_run
+            # only re-downloads files that were missing, so this is cheap and lets
+            # D3-D7 quotes recover without waiting for the next 6-hourly cycle.
+            logger.info(
+                "GEFS coverage still low (%.0f%%) — retrying ingestion",
+                ensemble_strategy.last_gefs_coverage_pct * 100,
+            )
+            await run_ensemble_cycle_job()
 
     async def run_ensemble_cycle_job():
         try:

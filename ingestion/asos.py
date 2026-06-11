@@ -1,6 +1,7 @@
 import re
 import asyncio
 import logging
+import zoneinfo
 from datetime import datetime, timezone
 import httpx
 import pandas as pd
@@ -143,9 +144,41 @@ def compute_running_tmax(obs_list: list[dict]) -> float:
 
 
 def estimate_remaining_hours(current_hour_utc: int, station_tz: str) -> int:
-    import zoneinfo
     tz = zoneinfo.ZoneInfo(station_tz)
     now_local = datetime.now(tz)
     local_hour = now_local.hour
     remaining = max(0, 23 - local_hour)
     return remaining
+
+
+def compute_daily_tmax_history(
+    obs_list: list[dict],
+    station_tz: str,
+    days: int = 4,
+    reference_time: datetime | None = None,
+) -> dict:
+    """Group METAR observations into daily Tmax (local date), excluding
+    today (incomplete) and dates older than `days`."""
+    tz = zoneinfo.ZoneInfo(station_tz)
+    now_local = (reference_time or datetime.now(timezone.utc)).astimezone(tz)
+    today_local = now_local.date()
+
+    by_date: dict = {}
+    for obs in obs_list:
+        ts = obs.get("observation_time")
+        temp = obs.get("temp_f")
+        if ts is None or temp is None:
+            continue
+        local_date = ts.astimezone(tz).date()
+        if local_date >= today_local:
+            continue
+        if (today_local - local_date).days > days:
+            continue
+        by_date.setdefault(local_date, []).append(temp)
+
+    return {date: max(temps) for date, temps in by_date.items()}
+
+
+async def fetch_daily_tmax_history(station: str, days: int = 4) -> dict:
+    obs_list = await fetch_metar(station, hours=24 * (days + 1))
+    return compute_daily_tmax_history(obs_list, STATION_TZ.get(station, "UTC"), days=days)

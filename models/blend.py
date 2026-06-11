@@ -1,4 +1,6 @@
 import logging
+import pickle
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
@@ -54,3 +56,20 @@ class ModelBlender:
     @property
     def weights(self) -> dict[str, float]:
         return {"ngboost": self._ngboost_weight, "qrf": self._qrf_weight}
+
+    def save(self, path: str) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "wb") as f:
+            pickle.dump(
+                {"ngboost_weight": self._ngboost_weight, "qrf_weight": self._qrf_weight}, f
+            )
+        logger.info("ModelBlender saved to %s", path)
+
+    @classmethod
+    def load(cls, path: str) -> "ModelBlender":
+        with open(path, "rb") as f:
+            data = pickle.load(f)
+        instance = cls()
+        instance._ngboost_weight = data["ngboost_weight"]
+        instance._qrf_weight = data["qrf_weight"]
+        return instance

@@ -70,8 +70,13 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         from config.stations import ALL_ICAO
         from pathlib import Path
 
-        blender = ModelBlender()
-        blender.compute_weights_from_log_scores(-2.9, -2.1)  # fallback; overwritten below
+        try:
+            blender = load_latest_artifact(ModelBlender, "blender", "global")
+            logger.info("Loaded blend weights: %s", blender.weights)
+        except FileNotFoundError:
+            blender = ModelBlender()
+            blender.compute_weights_from_log_scores(-2.9, -2.1)  # fallback default
+            logger.warning("No blend weight artifact found — using fallback weights: %s", blender.weights)
         app.state.blender = blender
         model_registry["blender"] = blender
 

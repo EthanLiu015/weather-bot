@@ -92,6 +92,16 @@ class CalibrationSnapshot(Base):
     recorded_at = Column(DateTime, default=datetime.utcnow)
 
 
+class DailyForecastLog(Base):
+    __tablename__ = "daily_forecast_log"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    station = Column(String(10), nullable=False, index=True)
+    target_date = Column(Date, nullable=False, index=True)
+    forecast_tmax_f = Column(Float, nullable=False)
+    recorded_at = Column(DateTime, default=datetime.utcnow)
+
+
 class ModelArtifact(Base):
     __tablename__ = "model_artifacts"
 
