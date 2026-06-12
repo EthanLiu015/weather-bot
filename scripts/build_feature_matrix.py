@@ -10,6 +10,7 @@ ERA5 is used as a reanalysis proxy for model forecasts:
   - Spread proxies computed from ±3-day temporal window (captures synoptic variability)
   - NBM features left NaN (no historical NBM available)
 """
+import json
 import logging
 import os
 import sys
@@ -25,7 +26,14 @@ import xarray as xr
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from config.stations import STATION_REGISTRY, ALL_ICAO
-from processing.features import get_feature_columns
+from processing.climatology import CLIMATOLOGY_PATH, climo_tmax_normal
+from processing.features import (
+    get_feature_columns,
+    _quantile_skewness,
+    _quantile_kurtosis,
+    _onshore_wind_component,
+    _ROLLING_WINDOW_DAYS,
+)
 from processing.bias_correction import BiasCorrectionRegistry, get_lead_bucket, get_season
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -158,14 +166,17 @@ def _spread_proxy(ts: pd.DataFrame, center_time: pd.Timestamp, col: str, window_
     hi = center_time + pd.Timedelta(hours=window_hours)
     window = ts.loc[lo:hi, col].dropna()
     if len(window) < 3:
-        return {"std": float("nan"), "p10": float("nan"), "p25": float("nan"),
+        return {"std": float("nan"), "p10": float("nan"), "p25": float("nan"), "p50": float("nan"),
                 "p75": float("nan"), "p90": float("nan"), "iqr": float("nan"),
                 "range": float("nan")}
+    # vals_f is already converted Kelvin -> Fahrenheit, so every stat below is
+    # already in the right units — do not re-apply _kelvin_to_f to these.
     vals_f = np.array([_kelvin_to_f(v) for v in window])
     return {
         "std":   float(np.std(vals_f)),
         "p10":   float(np.percentile(vals_f, 10)),
         "p25":   float(np.percentile(vals_f, 25)),
+        "p50":   float(np.percentile(vals_f, 50)),
         "p75":   float(np.percentile(vals_f, 75)),
         "p90":   float(np.percentile(vals_f, 90)),
         "iqr":   float(np.percentile(vals_f, 75) - np.percentile(vals_f, 25)),
@@ -211,7 +222,6 @@ def build_feature_rows(
             u10    = row_era5.get("u10", float("nan"))
             v10    = row_era5.get("v10", float("nan"))
             tcc    = row_era5.get("tcc", float("nan"))
-            tp_m   = row_era5.get("tp", float("nan"))
 
             t2m_f  = _kelvin_to_f(t2m_k)
             d2m_f  = _kelvin_to_f(d2m_k)
@@ -220,8 +230,6 @@ def build_feature_rows(
             wdir_cos = float(np.cos(np.arctan2(u10, v10))) if not (np.isnan(u10) or np.isnan(v10)) else float("nan")
             tcc_pct  = float(tcc) * 100.0 if not np.isnan(tcc) else float("nan")
             dp_dep   = t2m_f - d2m_f if not (np.isnan(t2m_f) or np.isnan(d2m_f)) else float("nan")
-            tp_mm    = float(tp_m) * 1000.0 if not np.isnan(tp_m) else float("nan")
-            precip_p = 1.0 if (not np.isnan(tp_mm) and tp_mm > 0) else 0.0
 
             # Cloud fractions
             if not np.isnan(tcc):
@@ -232,21 +240,46 @@ def build_feature_rows(
             else:
                 cloud_total = cloud_low = cloud_mid = cloud_high = float("nan")
 
-            # Spread proxies from ±SPREAD_WINDOW_HOURS of ERA5
-            sp = _spread_proxy(era5_ts, closest_time, "t2m", SPREAD_WINDOW_HOURS)
-            sp_f = {k: _kelvin_to_f(v) if k not in ("std", "iqr", "range") else v for k, v in sp.items()}
+            # Spread proxies from ±SPREAD_WINDOW_HOURS of ERA5 (already in °F)
+            sp_f = _spread_proxy(era5_ts, closest_time, "t2m", SPREAD_WINDOW_HOURS)
+            skewness = _quantile_skewness(sp_f["p10"], sp_f["p50"], sp_f["p90"])
+            kurtosis = _quantile_kurtosis(sp_f["p10"], sp_f["p25"], sp_f["p75"], sp_f["p90"])
 
             # Temporal features
             month = vdate.month
             doy   = vdate.timetuple().tm_yday
-            month_sin, month_cos   = _cyclical(month, 12)
-            doy_sin, doy_cos       = _cyclical(doy, 365)
-            lead_sin, lead_cos     = _cyclical(lead_hour, 168)
+            doy_sin, doy_cos = _cyclical(doy, 365)
+            lead_time_sqrt = float(np.sqrt(lead_hour))
+
+            # Climatology anomaly
+            climo_normal = climo_tmax_normal(station, month)
+            climo_anomaly = (
+                t2m_f - climo_normal
+                if not (np.isnan(t2m_f) or np.isnan(climo_normal))
+                else float("nan")
+            )
+
+            # Onshore/offshore wind component
+            onshore_wind_component = _onshore_wind_component(
+                wdir_sin, wdir_cos, meta.onshore_bearing_deg
+            )
 
             # Lag residuals: last 3 days of (actual - era5_proxy) at D+1 lead
             lag1 = lag_residuals.get(vdate - timedelta(days=1), float("nan"))
             lag2 = lag_residuals.get(vdate - timedelta(days=2), float("nan"))
             lag3 = lag_residuals.get(vdate - timedelta(days=3), float("nan"))
+
+            # Rolling residual stats over the last _ROLLING_WINDOW_DAYS days
+            roll_vals = [
+                lag_residuals[d]
+                for d in (vdate - timedelta(days=n) for n in range(1, _ROLLING_WINDOW_DAYS + 1))
+                if d in lag_residuals and not np.isnan(lag_residuals[d])
+            ]
+            if len(roll_vals) >= 2:
+                roll_mean = float(np.mean(roll_vals))
+                roll_std = float(np.std(roll_vals))
+            else:
+                roll_mean = roll_std = float("nan")
 
             # Store D+1 residual for future use
             if lead_hour == 24:
@@ -267,10 +300,9 @@ def build_feature_rows(
                 "gefs_tmax_p25":           sp_f["p25"],
                 "gefs_tmax_p75":           sp_f["p75"],
                 "gefs_tmax_p90":           sp_f["p90"],
-                "gefs_ensemble_skewness":  0.0,
-                "gefs_ensemble_kurtosis":  0.0,
-                "gefs_tmin_mean":          t2m_f,  # same source, Tmin proxy
-                "gefs_tmin_std":           sp_f["std"],
+                "gefs_ensemble_skewness":  skewness,
+                "gefs_ensemble_kurtosis":  kurtosis,
+                "gefs_tmax_climo_anomaly": climo_anomaly,
                 # ECMWF = ERA5 (ERA5 is ECMWF's reanalysis)
                 "ecmwf_tmax":              t2m_f,
                 "ecmwf_tmin":             t2m_f,
@@ -289,25 +321,22 @@ def build_feature_rows(
                 "surface_wind_speed":         wind,
                 "wind_dir_sin":               wdir_sin,
                 "wind_dir_cos":               wdir_cos,
+                "onshore_wind_component":     onshore_wind_component,
                 "surface_dew_point_depression": dp_dep,
-                "convective_precip_prob":     precip_p,
-                "total_precip_mm":            tp_mm,
                 # Temporal
                 "lead_time_hours": float(lead_hour),
-                "lead_sin":  lead_sin, "lead_cos": lead_cos,
-                "month_sin": month_sin, "month_cos": month_cos,
+                "lead_time_sqrt": lead_time_sqrt,
                 "day_of_year_sin": doy_sin, "day_of_year_cos": doy_cos,
-                # Station one-hots
-                **{f"station_{icao.lower()}": 1.0 if station == icao else 0.0
-                   for icao in ALL_ICAO},
                 # Physical meta
                 "elevation_delta_m":   meta.elevation_m,
                 "uhi_index":           meta.uhi_index,
                 "coastal_distance_km": meta.coastal_distance_km,
-                # Residual lags
+                # Residual lags + rolling stats
                 "obs_minus_model_lag1": lag1,
                 "obs_minus_model_lag2": lag2,
                 "obs_minus_model_lag3": lag3,
+                "obs_minus_model_roll_mean": roll_mean,
+                "obs_minus_model_roll_std": roll_std,
             }
 
             rows.append(row)
@@ -328,6 +357,27 @@ def main() -> None:
     # Load ERA5 time series for all stations
     era5_ts = build_era5_station_ts(ALL_ICAO)
 
+    # Pre-compute daily Tmax history per station (used for both climatology
+    # normals below and the per-station feature rows in the main loop)
+    daily_tmax_by_station = {
+        station: build_asos_daily_tmax(station, STATION_REGISTRY[station].timezone)
+        for station in ALL_ICAO
+    }
+
+    # Monthly Tmax climatology normals (station -> month -> mean Tmax °F),
+    # written before any build_feature_rows call so climo_tmax_normal can load them
+    normals: dict[str, dict[str, float]] = {}
+    for station, daily_tmax in daily_tmax_by_station.items():
+        if daily_tmax.empty:
+            continue
+        monthly_means = daily_tmax.groupby(daily_tmax.index.month).mean()
+        normals[station] = {str(m): float(v) for m, v in monthly_means.items()}
+
+    CLIMATOLOGY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CLIMATOLOGY_PATH, "w") as f:
+        json.dump(normals, f, indent=2)
+    logger.info("Wrote climatology normals for %d stations to %s", len(normals), CLIMATOLOGY_PATH)
+
     all_rows = []
     for station in ALL_ICAO:
         logger.info("=== %s (%s) ===", station, STATION_REGISTRY[station].city)
@@ -336,7 +386,7 @@ def main() -> None:
             logger.warning("No ERA5 data for %s — skipping", station)
             continue
 
-        daily_tmax = build_asos_daily_tmax(station, STATION_REGISTRY[station].timezone)
+        daily_tmax = daily_tmax_by_station[station]
         if daily_tmax.empty:
             logger.warning("No ASOS data for %s — skipping", station)
             continue

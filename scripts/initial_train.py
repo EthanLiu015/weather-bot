@@ -123,7 +123,8 @@ def train_final_models(df: pd.DataFrame) -> None:
         # Residual model (LightGBM)
         residual_feature_cols = [c for c in [
             "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
-            "lead_time_hours", "month_sin", "month_cos",
+            "obs_minus_model_roll_mean", "obs_minus_model_roll_std",
+            "lead_time_hours", "day_of_year_sin", "day_of_year_cos",
         ] if c in X_st.columns]
 
         mu_pred, _ = ngb.predict_distribution(X_st)

@@ -54,14 +54,14 @@ def test_no_nans_in_core_cyclical_features():
         ecmwf_data=ecmwf,
         asos_history=pd.DataFrame(),
     )
-    for col in ["month_sin", "month_cos", "day_of_year_sin", "day_of_year_cos"]:
+    for col in ["day_of_year_sin", "day_of_year_cos"]:
         assert col in df.columns, f"Missing: {col}"
         vals = df[col].dropna()
         assert len(vals) > 0, f"All NaN in {col}"
         assert vals.between(-1.0, 1.0).all(), f"{col} out of [-1, 1]"
 
 
-def test_station_one_hot_exactly_one_active():
+def test_feature_matrix_has_no_station_one_hot_columns():
     gefs = _make_gefs("KLAX", [24])
     ecmwf = {"KLAX": {"tmax_forecast": 80.0, "tmin_forecast": 65.0}}
     df = build_feature_matrix(
@@ -69,12 +69,63 @@ def test_station_one_hot_exactly_one_active():
         ecmwf_data=ecmwf,
         asos_history=pd.DataFrame(),
     )
-    lax_rows = df[df["station"] == "KLAX"]
-    if not lax_rows.empty:
-        row = lax_rows.iloc[0]
-        assert row["station_klax"] == 1.0
-        assert row["station_kord"] == 0.0
-        assert row["station_klga"] == 0.0
+    assert not df.empty
+    assert not any(c.startswith("station_k") for c in df.columns), (
+        "station one-hots are constant within each per-station model "
+        "(train_final_models trains one model per station) — removed entirely"
+    )
+
+
+def test_onshore_wind_component_present_for_coastal_station_and_zero_inland():
+    gefs = _make_gefs("KSFO", [24])
+    ecmwf = {"KSFO": {}}
+    df = build_feature_matrix(
+        gefs_data=gefs,
+        ecmwf_data=ecmwf,
+        asos_history=pd.DataFrame(),
+    )
+    assert not df.empty
+    row = df.iloc[0]
+    assert "onshore_wind_component" in df.columns
+    assert -1.0 <= row["onshore_wind_component"] <= 1.0
+
+    gefs_inland = _make_gefs("KORD", [24])
+    df_inland = build_feature_matrix(
+        gefs_data=gefs_inland,
+        ecmwf_data={"KORD": {}},
+        asos_history=pd.DataFrame(),
+    )
+    assert df_inland.iloc[0]["onshore_wind_component"] == pytest.approx(0.0)
+
+
+def test_climatology_anomaly_feature_present():
+    gefs = _make_gefs("KORD", [24])
+    ecmwf = {"KORD": {}}
+    df = build_feature_matrix(
+        gefs_data=gefs,
+        ecmwf_data=ecmwf,
+        asos_history=pd.DataFrame(),
+    )
+    assert not df.empty
+    assert "gefs_tmax_climo_anomaly" in df.columns
+
+
+def test_lead_time_sqrt_replaces_lead_cyclical_features():
+    gefs = _make_gefs("KORD", [24, 96])
+    ecmwf = {"KORD": {}}
+    df = build_feature_matrix(
+        gefs_data=gefs,
+        ecmwf_data=ecmwf,
+        asos_history=pd.DataFrame(),
+    )
+    assert not df.empty
+    assert "lead_time_sqrt" in df.columns
+    assert "lead_sin" not in df.columns
+    assert "lead_cos" not in df.columns
+    row24 = df[df["lead_hour"] == 24].iloc[0]
+    row96 = df[df["lead_hour"] == 96].iloc[0]
+    assert row24["lead_time_sqrt"] == pytest.approx(24 ** 0.5)
+    assert row96["lead_time_sqrt"] == pytest.approx(96 ** 0.5)
 
 
 def test_full_31_member_statistics_computed():
@@ -137,9 +188,23 @@ def test_feature_matrix_has_no_regime_cluster_columns():
 def test_get_feature_columns_returns_list():
     cols = get_feature_columns()
     assert isinstance(cols, list)
-    assert len(cols) >= 55
+    assert len(cols) == 46
     assert "nbm_t50" in cols
     assert "gefs_tmax_iqr" in cols
     assert "gefs_ensemble_kurtosis" in cols
     assert "nbm_gefs_delta" in cols
     assert not any(c.startswith("regime_cluster") for c in cols)
+    assert not any(c.startswith("station_k") for c in cols)
+    assert "gefs_tmin_mean" not in cols
+    assert "gefs_tmin_std" not in cols
+    assert "total_precip_mm" not in cols
+    assert "convective_precip_prob" not in cols
+    assert "month_sin" not in cols
+    assert "month_cos" not in cols
+    assert "lead_sin" not in cols
+    assert "lead_cos" not in cols
+    assert "lead_time_sqrt" in cols
+    assert "gefs_tmax_climo_anomaly" in cols
+    assert "onshore_wind_component" in cols
+    assert "obs_minus_model_roll_mean" in cols
+    assert "obs_minus_model_roll_std" in cols

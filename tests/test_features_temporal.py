@@ -71,6 +71,60 @@ def test_lag_features_populated_when_asos_data_is_recent():
     assert not np.isnan(row["obs_minus_model_lag1"]), "Recent lags should not be NaN"
 
 
+def test_rolling_residual_stats_populated_with_enough_history():
+    reference_date = dt.date(2024, 6, 15)
+    dates = [dt.date(2024, 6, d) for d in range(9, 16)]  # 7 days
+    values = [70.0, 71.0, 72.0, 73.0, 74.0, 75.0, 76.0]
+    asos = _asos_column_based("KORD", dates, values)
+
+    df = build_feature_matrix(
+        gefs_data=_make_gefs("KORD"),
+        ecmwf_data={"KORD": {}},
+        asos_history=asos,
+        reference_date=reference_date,
+    )
+
+    assert not df.empty
+    row = df.iloc[0]
+    assert row["obs_minus_model_roll_mean"] == pytest.approx(np.mean(values))
+    assert row["obs_minus_model_roll_std"] == pytest.approx(np.std(values))
+
+
+def test_rolling_residual_stats_nan_with_single_observation():
+    reference_date = dt.date(2024, 6, 15)
+    asos = _asos_column_based("KORD", [dt.date(2024, 6, 15)], [70.0])
+
+    df = build_feature_matrix(
+        gefs_data=_make_gefs("KORD"),
+        ecmwf_data={"KORD": {}},
+        asos_history=asos,
+        reference_date=reference_date,
+    )
+
+    assert not df.empty
+    row = df.iloc[0]
+    assert np.isnan(row["obs_minus_model_roll_mean"])
+    assert np.isnan(row["obs_minus_model_roll_std"])
+
+
+def test_rolling_residual_stats_nan_when_asos_data_is_stale():
+    reference_date = dt.date(2024, 6, 15)
+    stale_dates = [dt.date(2024, 6, 1), dt.date(2024, 6, 2), dt.date(2024, 6, 3)]
+    asos = _asos_column_based("KORD", stale_dates, [70.0, 71.0, 72.0])
+
+    df = build_feature_matrix(
+        gefs_data=_make_gefs("KORD"),
+        ecmwf_data={"KORD": {}},
+        asos_history=asos,
+        reference_date=reference_date,
+    )
+
+    assert not df.empty
+    row = df.iloc[0]
+    assert np.isnan(row["obs_minus_model_roll_mean"])
+    assert np.isnan(row["obs_minus_model_roll_std"])
+
+
 def test_lag_features_only_use_asos_entries_on_or_before_reference_date():
     reference_date = dt.date(2024, 6, 10)
     dates = [dt.date(2024, 6, 8), dt.date(2024, 6, 9), dt.date(2024, 6, 10), dt.date(2024, 6, 11)]

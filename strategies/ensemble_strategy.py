@@ -76,7 +76,7 @@ class EnsembleStrategy:
             record_forecast_tmax(row["station"], target_date, float(row["gefs_tmax_mean"]))
 
     @staticmethod
-    async def _build_live_asos_history(stations: list[str], lookback_days: int = 4) -> "pd.DataFrame":
+    async def _build_live_asos_history(stations: list[str], lookback_days: int = 7) -> "pd.DataFrame":
         """Build asos_history (obs_minus_model residuals) from recent observed
         Tmax and previously-persisted GEFS D+1 forecasts."""
         residuals_by_station: dict[str, dict] = {}

@@ -2,15 +2,16 @@ import datetime as dt_mod
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 
 from config.stations import STATION_REGISTRY, ALL_ICAO
+from processing.climatology import climo_tmax_normal
 
 STATION_META = {
     icao: {
         "elevation_delta_m": s.elevation_m,
         "uhi_index": s.uhi_index,
         "coastal_distance_km": s.coastal_distance_km,
+        "onshore_bearing_deg": s.onshore_bearing_deg,
     }
     for icao, s in STATION_REGISTRY.items()
 }
@@ -38,6 +39,21 @@ def _safe(vals: list[float], fn):
         return float("nan")
 
 
+def _quantile_skewness(p10: float, p50: float, p90: float) -> float:
+    """Bowley-style quantile skewness. ~0 for symmetric, robust to outlier members."""
+    if np.isnan(p10) or np.isnan(p50) or np.isnan(p90) or (p90 - p10) == 0:
+        return 0.0
+    return float((p90 + p10 - 2 * p50) / (p90 - p10))
+
+
+def _quantile_kurtosis(p10: float, p25: float, p75: float, p90: float) -> float:
+    """Tail-heaviness ratio (p90-p10)/(p75-p25). ~2.91 for a normal distribution,
+    higher = heavier tails. Robust to outlier members."""
+    if np.isnan(p10) or np.isnan(p25) or np.isnan(p75) or np.isnan(p90) or (p75 - p25) == 0:
+        return 0.0
+    return float((p90 - p10) / (p75 - p25))
+
+
 def _aggregate_members(member_list: list[dict]) -> dict[str, float]:
     """Compute full distribution statistics across all 31 GEFS members."""
     temps   = [m["temp_f"]     for m in member_list if not np.isnan(m.get("temp_f", float("nan")))]
@@ -46,33 +62,29 @@ def _aggregate_members(member_list: list[dict]) -> dict[str, float]:
     dir_sin = [m["wind_dir_sin"] for m in member_list if not np.isnan(m.get("wind_dir_sin", float("nan")))]
     dir_cos = [m["wind_dir_cos"] for m in member_list if not np.isnan(m.get("wind_dir_cos", float("nan")))]
     tccs    = [m["tcc"]        for m in member_list if not np.isnan(m.get("tcc", float("nan")))]
-    tps     = [m["tp"]         for m in member_list if not np.isnan(m.get("tp", float("nan")))]
 
     def pct(arr, q):
         return float(np.percentile(arr, q)) if arr else float("nan")
 
-    t_arr = np.array(temps) if temps else np.array([float("nan")])
     n = len(temps)
+    p10, p25, p50, p75, p90 = pct(temps, 10), pct(temps, 25), pct(temps, 50), pct(temps, 75), pct(temps, 90)
 
     return {
         # Central tendency
         "gefs_tmax_mean":          _safe(temps, np.mean),
-        "gefs_tmax_median":        pct(temps, 50),
+        "gefs_tmax_median":        p50,
         # Spread
         "gefs_tmax_std":           _safe(temps, np.std) if n > 1 else float("nan"),
         "gefs_tmax_range":         (max(temps) - min(temps)) if n > 1 else float("nan"),
-        "gefs_tmax_iqr":           pct(temps, 75) - pct(temps, 25) if n > 1 else float("nan"),
+        "gefs_tmax_iqr":           p75 - p25 if n > 1 else float("nan"),
         # Quantiles
-        "gefs_tmax_p10":           pct(temps, 10),
-        "gefs_tmax_p25":           pct(temps, 25),
-        "gefs_tmax_p75":           pct(temps, 75),
-        "gefs_tmax_p90":           pct(temps, 90),
-        # Distribution shape
-        "gefs_ensemble_skewness":  float(stats.skew(t_arr)) if n > 2 else 0.0,
-        "gefs_ensemble_kurtosis":  float(stats.kurtosis(t_arr)) if n > 3 else 0.0,
-        # Low tail (for Tmin markets)
-        "gefs_tmin_mean":          _safe(temps, np.min),
-        "gefs_tmin_std":           _safe(temps, np.std) if n > 1 else float("nan"),
+        "gefs_tmax_p10":           p10,
+        "gefs_tmax_p25":           p25,
+        "gefs_tmax_p75":           p75,
+        "gefs_tmax_p90":           p90,
+        # Distribution shape (quantile-based, robust to outlier members)
+        "gefs_ensemble_skewness":  _quantile_skewness(p10, p50, p90) if n > 2 else 0.0,
+        "gefs_ensemble_kurtosis":  _quantile_kurtosis(p10, p25, p75, p90) if n > 3 else 0.0,
         # Atmospheric
         "surface_wind_speed":      _safe(winds, np.mean),
         "wind_dir_sin":            _safe(dir_sin, np.mean),
@@ -82,8 +94,6 @@ def _aggregate_members(member_list: list[dict]) -> dict[str, float]:
             if temps and dpts else float("nan")
         ),
         "cloud_cover_raw":         _safe(tccs, np.mean),
-        "convective_precip_prob":  float(np.mean([1.0 if tp > 0 else 0.0 for tp in tps])) if tps else 0.0,
-        "total_precip_mm":         _safe(tps, np.mean),
     }
 
 
@@ -94,6 +104,9 @@ def _filter_and_sort_asos(hist: pd.Series, ref_ts: pd.Timestamp) -> pd.Series:
     if isinstance(hist.index, pd.DatetimeIndex):
         hist = hist[hist.index <= ref_ts]
     return hist.sort_index()
+
+
+_ROLLING_WINDOW_DAYS = 7
 
 
 def _extract_lags(
@@ -114,6 +127,34 @@ def _extract_lags(
     return lag1, lag2, lag3
 
 
+def _extract_rolling_stats(
+    vals: np.ndarray,
+    index: pd.Index,
+    ref_ts: pd.Timestamp,
+) -> tuple[float, float]:
+    if len(vals) < 2:
+        return float("nan"), float("nan")
+    if isinstance(index, pd.DatetimeIndex) and len(index) > 0:
+        most_recent = index[-1]
+        staleness = (ref_ts - most_recent).days
+        if staleness > _MAX_LAG_STALENESS_DAYS:
+            return float("nan"), float("nan")
+    return float(np.mean(vals)), float(np.std(vals))
+
+
+def _onshore_wind_component(
+    wind_dir_sin: float,
+    wind_dir_cos: float,
+    onshore_bearing_deg: float | None,
+) -> float:
+    """+1 when wind blows directly from the adjacent water (onshore), -1 when
+    directly offshore, 0 for inland stations or missing wind data."""
+    if onshore_bearing_deg is None or np.isnan(wind_dir_sin) or np.isnan(wind_dir_cos):
+        return 0.0
+    bearing_rad = np.radians(onshore_bearing_deg)
+    return float(wind_dir_sin * np.sin(bearing_rad) + wind_dir_cos * np.cos(bearing_rad))
+
+
 def build_feature_matrix(
     gefs_data: dict,
     ecmwf_data: dict,
@@ -129,7 +170,6 @@ def build_feature_matrix(
     ref_date = reference_date or dt_mod.date.today()
     month = ref_date.month
     doy = ref_date.timetuple().tm_yday
-    month_sin, month_cos = _cyclical(month, 12)
     doy_sin, doy_cos = _cyclical(doy, 365)
 
     for station in ALL_STATIONS:
@@ -202,8 +242,9 @@ def build_feature_matrix(
                         ),
                     }
 
-            # Lag residuals from ASOS history
+            # Lag residuals + rolling stats from ASOS history
             lag1 = lag2 = lag3 = float("nan")
+            roll_mean = roll_std = float("nan")
             if asos_history is not None and not asos_history.empty:
                 try:
                     ref_ts = pd.Timestamp(ref_date)
@@ -211,18 +252,31 @@ def build_feature_matrix(
                         if station in asos_history.index.get_level_values(0):
                             hist = asos_history.loc[station]
                             hist = _filter_and_sort_asos(hist, ref_ts)
-                            vals = hist.dropna().values[-3:]
+                            vals = hist.dropna().values[-_ROLLING_WINDOW_DAYS:]
                             lag1, lag2, lag3 = _extract_lags(vals, hist.dropna().index, ref_ts)
+                            roll_mean, roll_std = _extract_rolling_stats(vals, hist.dropna().index, ref_ts)
                     elif station in asos_history.columns:
                         hist = asos_history[station]
                         hist = _filter_and_sort_asos(hist, ref_ts)
-                        vals = hist.dropna().values[-3:]
+                        vals = hist.dropna().values[-_ROLLING_WINDOW_DAYS:]
                         lag1, lag2, lag3 = _extract_lags(vals, hist.dropna().index, ref_ts)
+                        roll_mean, roll_std = _extract_rolling_stats(vals, hist.dropna().index, ref_ts)
                 except Exception:
                     pass
 
             meta = station_meta.get(station, {})
-            lead_sin, lead_cos = _cyclical(lead_hour, 168)
+            lead_time_sqrt = float(np.sqrt(lead_hour))
+
+            climo_normal = climo_tmax_normal(station, month)
+            climo_anomaly = (
+                gefs_mean - climo_normal
+                if not (np.isnan(gefs_mean) or np.isnan(climo_normal))
+                else float("nan")
+            )
+
+            onshore_wind_component = _onshore_wind_component(
+                gefs["wind_dir_sin"], gefs["wind_dir_cos"], meta.get("onshore_bearing_deg")
+            )
 
             row: dict = {
                 "station":   station,
@@ -239,8 +293,7 @@ def build_feature_matrix(
                 "gefs_tmax_p90":          gefs["gefs_tmax_p90"],
                 "gefs_ensemble_skewness": gefs["gefs_ensemble_skewness"],
                 "gefs_ensemble_kurtosis": gefs["gefs_ensemble_kurtosis"],
-                "gefs_tmin_mean":         gefs["gefs_tmin_mean"],
-                "gefs_tmin_std":          gefs["gefs_tmin_std"],
+                "gefs_tmax_climo_anomaly": climo_anomaly,
                 # ECMWF
                 "ecmwf_tmax":             ecmwf_tmax,
                 "ecmwf_tmin":             ecmwf_tmin,
@@ -256,22 +309,14 @@ def build_feature_matrix(
                 "surface_wind_speed":     gefs["surface_wind_speed"],
                 "wind_dir_sin":           gefs["wind_dir_sin"],
                 "wind_dir_cos":           gefs["wind_dir_cos"],
+                "onshore_wind_component": onshore_wind_component,
                 # Moisture
                 "surface_dew_point_depression": gefs["surface_dew_point_depression"],
-                # Precip
-                "convective_precip_prob": gefs["convective_precip_prob"],
-                "total_precip_mm":        gefs["total_precip_mm"],
                 # Temporal
                 "lead_time_hours":        float(lead_hour),
-                "lead_sin":               lead_sin,
-                "lead_cos":               lead_cos,
-                "month_sin":              month_sin,
-                "month_cos":              month_cos,
+                "lead_time_sqrt":         lead_time_sqrt,
                 "day_of_year_sin":        doy_sin,
                 "day_of_year_cos":        doy_cos,
-                # Station one-hots (fixed to full registry → stable feature space)
-                **{f"station_{icao.lower()}": 1.0 if station == icao else 0.0
-                   for icao in ALL_ICAO},
                 # Station physical meta
                 "elevation_delta_m":      meta.get("elevation_delta_m", 0.0),
                 "uhi_index":              meta.get("uhi_index", 0.0),
@@ -280,6 +325,8 @@ def build_feature_matrix(
                 "obs_minus_model_lag1":   lag1,
                 "obs_minus_model_lag2":   lag2,
                 "obs_minus_model_lag3":   lag3,
+                "obs_minus_model_roll_mean": roll_mean,
+                "obs_minus_model_roll_std":  roll_std,
             }
 
             rows.append(row)
@@ -294,7 +341,7 @@ def get_feature_columns() -> list[str]:
         "gefs_tmax_range", "gefs_tmax_iqr",
         "gefs_tmax_p10", "gefs_tmax_p25", "gefs_tmax_p75", "gefs_tmax_p90",
         "gefs_ensemble_skewness", "gefs_ensemble_kurtosis",
-        "gefs_tmin_mean", "gefs_tmin_std",
+        "gefs_tmax_climo_anomaly",
         # ECMWF
         "ecmwf_tmax", "ecmwf_tmin", "ecmwf_gefs_tmax_delta",
         # NBM
@@ -303,16 +350,14 @@ def get_feature_columns() -> list[str]:
         # Cloud
         "cloud_cover_total", "cloud_low_frac", "cloud_mid_frac", "cloud_high_frac",
         # Wind
-        "surface_wind_speed", "wind_dir_sin", "wind_dir_cos",
-        # Moisture / precip
-        "surface_dew_point_depression", "convective_precip_prob", "total_precip_mm",
+        "surface_wind_speed", "wind_dir_sin", "wind_dir_cos", "onshore_wind_component",
+        # Moisture
+        "surface_dew_point_depression",
         # Temporal
-        "lead_time_hours", "lead_sin", "lead_cos",
-        "month_sin", "month_cos", "day_of_year_sin", "day_of_year_cos",
-        # Station one-hots
-    ] + [f"station_{icao.lower()}" for icao in ALL_ICAO] + [
+        "lead_time_hours", "lead_time_sqrt", "day_of_year_sin", "day_of_year_cos",
         # Physical meta
         "elevation_delta_m", "uhi_index", "coastal_distance_km",
-        # Residual lags
+        # Residual lags + rolling stats
         "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
+        "obs_minus_model_roll_mean", "obs_minus_model_roll_std",
     ]

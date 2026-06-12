@@ -11,28 +11,32 @@ class StationMeta:
     uhi_index: float
     coastal_distance_km: float
     timezone: str
+    # Compass bearing (degrees) that an "onshore" wind blows FROM at this
+    # station — i.e. the direction of the adjacent body of water. None for
+    # inland stations where onshore/offshore flow isn't meaningful.
+    onshore_bearing_deg: float | None = None
 
 
 # All stations with active Kalshi temperature markets (high and/or low).
 # Source: Kalshi series API — verified 2026-05-29.
 STATION_REGISTRY: dict[str, StationMeta] = {
     s.icao: s for s in [
-        StationMeta("KLGA",  "New York City",    40.7769, -73.8740,    3,  2.5,    5, "America/New_York"),
+        StationMeta("KLGA",  "New York City",    40.7769, -73.8740,    3,  2.5,    5, "America/New_York", onshore_bearing_deg=160),
         StationMeta("KORD",  "Chicago",          41.9786, -87.9047,  203,  1.8, 1500, "America/Chicago"),
-        StationMeta("KLAX",  "Los Angeles",      33.9425,-118.4081,   38,  2.1,    5, "America/Los_Angeles"),
-        StationMeta("KMIA",  "Miami",            25.7959, -80.2870,    3,  1.9,    3, "America/New_York"),
+        StationMeta("KLAX",  "Los Angeles",      33.9425,-118.4081,   38,  2.1,    5, "America/Los_Angeles", onshore_bearing_deg=270),
+        StationMeta("KMIA",  "Miami",            25.7959, -80.2870,    3,  1.9,    3, "America/New_York", onshore_bearing_deg=90),
         StationMeta("KIAH",  "Houston",          29.9844, -95.3414,   30,  2.2,   80, "America/Chicago"),
         StationMeta("KPHL",  "Philadelphia",     39.8744, -75.2424,   11,  2.0,   50, "America/New_York"),
         StationMeta("KATL",  "Atlanta",          33.6367, -84.4281,  313,  2.3,  400, "America/New_York"),
         StationMeta("KAUS",  "Austin",           30.1945, -97.6699,  149,  1.7,  300, "America/Chicago"),
         StationMeta("KDEN",  "Denver",           39.8561,-104.6737, 1655,  1.5, 1800, "America/Denver"),
-        StationMeta("KMSY",  "New Orleans",      29.9934, -90.2580,    1,  1.8,    5, "America/Chicago"),
+        StationMeta("KMSY",  "New Orleans",      29.9934, -90.2580,    1,  1.8,    5, "America/Chicago", onshore_bearing_deg=180),
         StationMeta("KPHX",  "Phoenix",          33.4373,-112.0078,  337,  3.5,  600, "America/Phoenix"),
-        StationMeta("KSFO",  "San Francisco",    37.6213,-122.3790,    4,  1.4,    1, "America/Los_Angeles"),
-        StationMeta("KSEA",  "Seattle",          47.4489,-122.3094,  131,  1.6,   15, "America/Los_Angeles"),
-        StationMeta("KBOS",  "Boston",           42.3630, -71.0064,    9,  2.2,    1, "America/New_York"),
+        StationMeta("KSFO",  "San Francisco",    37.6213,-122.3790,    4,  1.4,    1, "America/Los_Angeles", onshore_bearing_deg=280),
+        StationMeta("KSEA",  "Seattle",          47.4489,-122.3094,  131,  1.6,   15, "America/Los_Angeles", onshore_bearing_deg=270),
+        StationMeta("KBOS",  "Boston",           42.3630, -71.0064,    9,  2.2,    1, "America/New_York", onshore_bearing_deg=90),
         StationMeta("KDFW",  "Dallas",           32.8998, -97.0403,  182,  2.0,  500, "America/Chicago"),
-        StationMeta("KDCA",  "Washington DC",    38.8521, -77.0377,    5,  2.4,   10, "America/New_York"),
+        StationMeta("KDCA",  "Washington DC",    38.8521, -77.0377,    5,  2.4,   10, "America/New_York", onshore_bearing_deg=135),
         StationMeta("KLAS",  "Las Vegas",        36.0840,-115.1522,  664,  2.8,  450, "America/Los_Angeles"),
         StationMeta("KMSP",  "Minneapolis",      44.8848, -93.2223,  278,  1.7, 2000, "America/Chicago"),
         StationMeta("KOKC",  "Oklahoma City",    35.3931, -97.6008,  397,  1.5,  700, "America/Chicago"),
