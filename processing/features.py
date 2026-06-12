@@ -15,7 +15,6 @@ STATION_META = {
     for icao, s in STATION_REGISTRY.items()
 }
 ALL_STATIONS = ALL_ICAO
-N_REGIME_CLUSTERS = 12
 
 
 def _cyclical(val: float, period: float) -> tuple[float, float]:
@@ -119,7 +118,6 @@ def build_feature_matrix(
     gefs_data: dict,
     ecmwf_data: dict,
     asos_history: pd.DataFrame,
-    regime_labels: pd.Series,
     nbm_data: dict | None = None,
     station_meta: dict | None = None,
     reference_date: dt_mod.date | None = None,
@@ -133,23 +131,6 @@ def build_feature_matrix(
     doy = ref_date.timetuple().tm_yday
     month_sin, month_cos = _cyclical(month, 12)
     doy_sin, doy_cos = _cyclical(doy, 365)
-
-    regime_vec = [0.0] * N_REGIME_CLUSTERS
-    if regime_labels is not None and len(regime_labels) > 0:
-        try:
-            if isinstance(regime_labels.index, pd.DatetimeIndex):
-                ref_ts = pd.Timestamp(ref_date)
-                label_val = regime_labels.asof(ref_ts)
-                if pd.notna(label_val):
-                    label = int(label_val)
-                else:
-                    label = int(regime_labels.iloc[-1])
-            else:
-                label = int(regime_labels.iloc[-1])
-            if 0 <= label < N_REGIME_CLUSTERS:
-                regime_vec[label] = 1.0
-        except Exception:
-            pass
 
     for station in ALL_STATIONS:
         station_gefs = gefs_data.get(station, {})
@@ -300,8 +281,6 @@ def build_feature_matrix(
                 "obs_minus_model_lag2":   lag2,
                 "obs_minus_model_lag3":   lag3,
             }
-            for i, v in enumerate(regime_vec):
-                row[f"regime_cluster_{i}"] = v
 
             rows.append(row)
 
@@ -336,4 +315,4 @@ def get_feature_columns() -> list[str]:
         "elevation_delta_m", "uhi_index", "coastal_distance_km",
         # Residual lags
         "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
-    ] + [f"regime_cluster_{i}" for i in range(N_REGIME_CLUSTERS)]
+    ]

@@ -124,7 +124,7 @@ def train_final_models(df: pd.DataFrame) -> None:
         residual_feature_cols = [c for c in [
             "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
             "lead_time_hours", "month_sin", "month_cos",
-        ] + [f"regime_cluster_{i}" for i in range(12)] if c in X_st.columns]
+        ] if c in X_st.columns]
 
         mu_pred, _ = ngb.predict_distribution(X_st)
         residuals = pd.Series(y_st.values - mu_pred, index=X_st.index)

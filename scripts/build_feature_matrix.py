@@ -33,7 +33,6 @@ logger = logging.getLogger(__name__)
 
 ERA5_DIR = Path("data/era5")
 HIST_DIR = Path("data/historical")
-REGIME_DIR = Path("data/regime_clusters")
 BIAS_DIR = Path("data/bias_correctors")
 
 LEAD_HOURS = [24, 48, 72, 96, 120, 168]
@@ -178,7 +177,6 @@ def build_feature_rows(
     station: str,
     era5_ts: pd.DataFrame,
     daily_tmax: pd.Series,
-    regime_labels: pd.DataFrame,
 ) -> list[dict]:
     meta = STATION_REGISTRY[station]
     tz = meta.timezone
@@ -254,16 +252,6 @@ def build_feature_rows(
             if lead_hour == 24:
                 lag_residuals[vdate] = actual_tmax - t2m_f
 
-            # Regime cluster
-            regime_vec = [0.0] * 12
-            if regime_labels is not None and not regime_labels.empty:
-                vdate_ts = pd.Timestamp(vdate)
-                matches = regime_labels[regime_labels["date"] == vdate_ts]
-                if not matches.empty:
-                    label = int(matches.iloc[0]["cluster"])
-                    if 0 <= label < 12:
-                        regime_vec[label] = 1.0
-
             row: dict = {
                 "station":   station,
                 "date":      vdate,
@@ -321,8 +309,6 @@ def build_feature_rows(
                 "obs_minus_model_lag2": lag2,
                 "obs_minus_model_lag3": lag3,
             }
-            for i, v in enumerate(regime_vec):
-                row[f"regime_cluster_{i}"] = v
 
             rows.append(row)
 
@@ -338,14 +324,6 @@ def main() -> None:
     if out_path.exists():
         logger.info("features.parquet already exists — delete it to rebuild")
         return
-
-    # Load regime labels
-    regime_labels = pd.DataFrame()
-    regime_path = REGIME_DIR / "historical_labels.parquet"
-    if regime_path.exists():
-        regime_labels = pd.read_parquet(regime_path)
-        regime_labels["date"] = pd.to_datetime(regime_labels["date"])
-        logger.info("Regime labels: %d rows", len(regime_labels))
 
     # Load ERA5 time series for all stations
     era5_ts = build_era5_station_ts(ALL_ICAO)
@@ -363,7 +341,7 @@ def main() -> None:
             logger.warning("No ASOS data for %s — skipping", station)
             continue
 
-        rows = build_feature_rows(station, era5_ts[station], daily_tmax, regime_labels)
+        rows = build_feature_rows(station, era5_ts[station], daily_tmax)
         logger.info("%s: %d feature rows", station, len(rows))
         all_rows.extend(rows)
 

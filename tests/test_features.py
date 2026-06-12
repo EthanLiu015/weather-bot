@@ -39,7 +39,6 @@ def test_feature_matrix_has_expected_shape():
         gefs_data=gefs,
         ecmwf_data=ecmwf,
         asos_history=pd.DataFrame(),
-        regime_labels=pd.Series(dtype=float),
     )
     assert not df.empty
     assert "gefs_tmax_mean" in df.columns
@@ -54,7 +53,6 @@ def test_no_nans_in_core_cyclical_features():
         gefs_data=gefs,
         ecmwf_data=ecmwf,
         asos_history=pd.DataFrame(),
-        regime_labels=pd.Series(dtype=float),
     )
     for col in ["month_sin", "month_cos", "day_of_year_sin", "day_of_year_cos"]:
         assert col in df.columns, f"Missing: {col}"
@@ -70,7 +68,6 @@ def test_station_one_hot_exactly_one_active():
         gefs_data=gefs,
         ecmwf_data=ecmwf,
         asos_history=pd.DataFrame(),
-        regime_labels=pd.Series(dtype=float),
     )
     lax_rows = df[df["station"] == "KLAX"]
     if not lax_rows.empty:
@@ -91,7 +88,6 @@ def test_full_31_member_statistics_computed():
         gefs_data=gefs,
         ecmwf_data=ecmwf,
         asos_history=pd.DataFrame(),
-        regime_labels=pd.Series(dtype=float),
     )
     assert not df.empty
     row = df.iloc[0]
@@ -114,7 +110,6 @@ def test_nbm_features_populated():
         gefs_data=gefs,
         ecmwf_data=ecmwf,
         asos_history=pd.DataFrame(),
-        regime_labels=pd.Series(dtype=float),
         nbm_data=nbm,
     )
     assert not df.empty
@@ -124,20 +119,19 @@ def test_nbm_features_populated():
     assert not np.isnan(row["nbm_gefs_delta"])
 
 
-def test_regime_clusters_sum_to_one_or_zero():
+def test_feature_matrix_has_no_regime_cluster_columns():
     gefs = _make_gefs("KORD", [24])
     ecmwf = {"KORD": {}}
     df = build_feature_matrix(
         gefs_data=gefs,
         ecmwf_data=ecmwf,
         asos_history=pd.DataFrame(),
-        regime_labels=pd.Series([3]),
     )
-    regime_cols = [f"regime_cluster_{i}" for i in range(12)]
-    present = [c for c in regime_cols if c in df.columns]
-    if present and not df.empty:
-        row_sum = df[present].sum(axis=1).iloc[0]
-        assert row_sum in (0.0, 1.0)
+    assert not df.empty
+    assert not any(c.startswith("regime_cluster") for c in df.columns), (
+        "regime_cluster_* is built from synthetic random noise (not real ERA5 "
+        "data) and was always-zero at inference — removed entirely"
+    )
 
 
 def test_get_feature_columns_returns_list():
@@ -148,3 +142,4 @@ def test_get_feature_columns_returns_list():
     assert "gefs_tmax_iqr" in cols
     assert "gefs_ensemble_kurtosis" in cols
     assert "nbm_gefs_delta" in cols
+    assert not any(c.startswith("regime_cluster") for c in cols)

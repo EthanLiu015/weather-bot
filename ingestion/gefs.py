@@ -9,6 +9,7 @@ import numpy as np
 import cfgrib  # noqa: F401 — ensures eccodes backend available
 
 from config.stations import station_coords
+from ingestion.cache_pruning import prune_run_cache
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,9 @@ async def fetch_latest_gefs_run(data_dir: str = "data/gefs") -> dict:
                 "GEFS run %s %sz: %d member×station×hour records",
                 date_str, cycle_str, members_found,
             )
+            removed = prune_run_cache(data_dir, keep=2)
+            if removed:
+                logger.info("Pruned old GEFS run cache dirs: %s", removed)
             return result
 
     logger.error("No GEFS data available in last 24 hours")

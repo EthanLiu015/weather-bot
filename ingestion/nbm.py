@@ -9,6 +9,7 @@ import numpy as np
 import xarray as xr
 
 from config.stations import station_coords
+from ingestion.cache_pruning import prune_run_cache
 
 logger = logging.getLogger(__name__)
 
@@ -204,4 +205,10 @@ async def fetch_latest_nbm(data_dir: str = "data/nbm") -> dict:
         if not np.isnan(result[s].get(lh, {}).get("t50", float("nan")))
     )
     logger.info("NBM %s %sz: %d station×hour records with valid t50", date_str, cycle_str, filled)
+
+    if filled > 0:
+        removed = prune_run_cache(data_dir, keep=2)
+        if removed:
+            logger.info("Pruned old NBM run cache dirs: %s", removed)
+
     return result

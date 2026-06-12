@@ -5,6 +5,7 @@ import zoneinfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.executors.asyncio import AsyncIOExecutor
+from config.series import is_low_temp_series
 from config.stations import station_timezones
 from strategies.ensemble_strategy import EnsembleStrategy
 
@@ -92,6 +93,8 @@ def build_scheduler(
 
             all_markets: list[dict] = []
             for series in _SERIES_TO_STATION:
+                if is_low_temp_series(series):
+                    continue
                 for attempt in range(4):
                     try:
                         data = await kalshi_client._request(

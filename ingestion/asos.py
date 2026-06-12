@@ -10,8 +10,25 @@ from config.stations import station_timezones
 
 logger = logging.getLogger(__name__)
 
-METAR_BASE = "https://aviationweather.gov/cgi-bin/data/metar.php"
+METAR_BASE = "https://aviationweather.gov/api/data/metar"
 STATION_TZ = station_timezones()
+
+
+def _extract_metar_lines(raw_text: str, station: str) -> list[str]:
+    """Raw METAR/SPECI report lines for `station`, with the leading
+    "METAR "/"SPECI " report-type token stripped so each line starts with
+    the station id, matching parse_metar_string's expected format."""
+    lines = []
+    for ln in raw_text.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        parts = ln.split(maxsplit=1)
+        if len(parts) == 2 and parts[0] in ("METAR", "SPECI"):
+            ln = parts[1]
+        if ln.startswith(station):
+            lines.append(ln)
+    return lines
 
 
 async def fetch_metar(station: str, hours: int = 24) -> list[dict]:
@@ -21,13 +38,11 @@ async def fetch_metar(station: str, hours: int = 24) -> list[dict]:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(url, timeout=20.0)
                 resp.raise_for_status()
-            lines = [ln.strip() for ln in resp.text.splitlines() if ln.strip()]
             observations = []
-            for line in lines:
-                if line.startswith(station):
-                    parsed = parse_metar_string(line)
-                    if parsed:
-                        observations.append(parsed)
+            for line in _extract_metar_lines(resp.text, station):
+                parsed = parse_metar_string(line)
+                if parsed:
+                    observations.append(parsed)
             return observations
         except Exception as exc:
             wait = 2**attempt

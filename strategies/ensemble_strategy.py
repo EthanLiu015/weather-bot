@@ -9,6 +9,7 @@ from ingestion.asos import fetch_daily_tmax_history
 from ingestion.gefs import fetch_latest_gefs_run, detect_new_run, FORECAST_HOURS
 from ingestion.ecmwf import fetch_latest_ecmwf_run
 from ingestion.nbm import fetch_latest_nbm
+from config.series import is_low_temp_series
 from processing.asos_history import compute_daily_residuals, build_asos_history_df
 from processing.bias_correction import BiasCorrectionRegistry, get_lead_bucket, get_season
 from processing.features import build_feature_matrix, get_feature_columns
@@ -186,7 +187,6 @@ class EnsembleStrategy:
             gefs_data=gefs_raw,
             ecmwf_data=ecmwf_raw,
             asos_history=asos_history,
-            regime_labels=pd.Series(dtype=float),
             nbm_data=nbm_raw,
             station_meta=None,
         )
@@ -306,6 +306,8 @@ class EnsembleStrategy:
         tickers: list[str] = []
         try:
             for series in self._SERIES_TO_STATION:
+                if is_low_temp_series(series):
+                    continue
                 try:
                     data = await self._client._request(
                         "GET", "/markets",

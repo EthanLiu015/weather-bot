@@ -89,7 +89,6 @@ def test_live_residuals_populate_lag_features_via_build_feature_matrix():
         gefs_data={"KORD": {24: [_make_member()]}},
         ecmwf_data={"KORD": {}},
         asos_history=asos,
-        regime_labels=pd.Series(dtype=float),
         reference_date=reference_date,
     )
 
