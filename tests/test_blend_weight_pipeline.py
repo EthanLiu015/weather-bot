@@ -9,8 +9,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from models.blend import ModelBlender
+from models.blend import ModelBlender, windowed_mean_score
 from models.ngboost_model import NGBoostTemperatureModel
+from models.qrf_model import QRFTemperatureModel
 
 
 def _make_xy(n: int = 200, seed: int = 0):
@@ -84,3 +85,62 @@ def test_fit_qrf_and_blend_favors_model_with_lower_crps():
     assert blended_mu[0] > 75.0, (
         f"Blend should favor the lower-CRPS (QRF) model, got blended_mu={blended_mu[0]}"
     )
+
+
+# ── windowed_mean_score: multi-window CRPS averaging for blend weights ──────
+
+def test_windowed_mean_score_with_one_window_equals_global_mean():
+    scores = np.array([1.0, 2.0, 3.0, 4.0])
+    assert windowed_mean_score(scores, n_windows=1) == pytest.approx(scores.mean())
+
+
+def test_windowed_mean_score_weights_each_window_equally_regardless_of_size():
+    # 7 scores split into 3 contiguous windows -> sizes [3, 2, 2]:
+    # [0, 0, 0] mean=0, [0, 0] mean=0, [10, 10] mean=10
+    scores = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 10.0, 10.0])
+    global_mean = float(scores.mean())
+
+    windowed = windowed_mean_score(scores, n_windows=3)
+
+    assert windowed == pytest.approx((0.0 + 0.0 + 10.0) / 3)
+    assert windowed != pytest.approx(global_mean)
+
+
+# ── n_windows support on NGBoost.crps / QRF.log_score ────────────────────────
+
+def test_ngboost_crps_default_matches_single_window():
+    X, y = _make_xy()
+    model = NGBoostTemperatureModel(n_estimators=50, learning_rate=0.1)
+    model.fit(X, y)
+
+    assert model.crps(X, y, n_windows=1) == pytest.approx(model.crps(X, y))
+
+
+def test_ngboost_crps_with_multiple_windows_returns_nonnegative_float():
+    X, y = _make_xy()
+    model = NGBoostTemperatureModel(n_estimators=50, learning_rate=0.1)
+    model.fit(X, y)
+
+    crps = model.crps(X, y, n_windows=3)
+
+    assert isinstance(crps, float)
+    assert crps >= 0.0
+
+
+def test_qrf_log_score_default_matches_single_window():
+    X, y = _make_xy()
+    model = QRFTemperatureModel(n_estimators=50, min_samples_leaf=5)
+    model.fit(X, y)
+
+    assert model.log_score(X, y, n_windows=1) == pytest.approx(model.log_score(X, y))
+
+
+def test_qrf_log_score_with_multiple_windows_returns_nonnegative_float():
+    X, y = _make_xy()
+    model = QRFTemperatureModel(n_estimators=50, min_samples_leaf=5)
+    model.fit(X, y)
+
+    score = model.log_score(X, y, n_windows=3)
+
+    assert isinstance(score, float)
+    assert score >= 0.0

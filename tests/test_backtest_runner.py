@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from backtest.report import FoldResult
 from backtest.runner import BacktestRunner
 
 
@@ -13,13 +14,52 @@ def _make_settings():
     return SimpleNamespace(MIN_EDGE_CENTS=5, STATIONS=["KNYC"])
 
 
-def _make_runner():
+def _make_runner(**kwargs):
+    defaults = dict(
+        settings=_make_settings(),
+        start_date=date(2020, 1, 1),
+        end_date=date(2021, 1, 1),
+    )
+    defaults.update(kwargs)
     with patch.object(BacktestRunner, "_load_kalshi_prices", return_value=pd.DataFrame()):
-        return BacktestRunner(
-            settings=_make_settings(),
-            start_date=date(2020, 1, 1),
-            end_date=date(2021, 1, 1),
-        )
+        return BacktestRunner(**defaults)
+
+
+def _fake_fold_result(fold_month: date) -> FoldResult:
+    return FoldResult(
+        fold_month=fold_month,
+        crps=0.0, mae=0.0, brier_score=0.0,
+        reliability_slope=0.0, simulated_pnl_usd=0.0,
+        num_simulated_trades=0, edge_above_threshold_pct=0.0,
+    )
+
+
+# ── Expanding/anchored training window ───────────────────────────────────────
+
+def test_run_uses_expanding_anchored_training_window():
+    """Each fold's training window should start at the fixed start_date
+    (anchored) and grow as test_month advances, rather than rolling forward
+    with a fixed-size window — this matches the production models, which are
+    trained on all available history rather than a rolling N-year slice."""
+    runner = _make_runner(
+        start_date=date(2020, 1, 1),
+        end_date=date(2020, 4, 1),
+        train_window_years=0,
+    )
+
+    with patch.object(runner, "_run_fold", side_effect=lambda *a: _fake_fold_result(a[2])) as mock_run_fold:
+        runner.run()
+
+    train_starts = [call.args[0] for call in mock_run_fold.call_args_list]
+    train_ends = [call.args[1] for call in mock_run_fold.call_args_list]
+    test_months = [call.args[2] for call in mock_run_fold.call_args_list]
+
+    assert test_months == [date(2020, 1, 1), date(2020, 2, 1), date(2020, 3, 1), date(2020, 4, 1)]
+    # Anchored: every fold's training window starts at the same date
+    assert all(ts == date(2020, 1, 1) for ts in train_starts)
+    # Expanding: training window end grows monotonically with each fold
+    assert train_ends == sorted(train_ends)
+    assert train_ends[-1] > train_ends[0]
 
 
 def _make_features(n: int = 60, start: str = "2023-01-01") -> pd.DataFrame:

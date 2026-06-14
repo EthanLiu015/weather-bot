@@ -53,6 +53,7 @@ def train_final_models(df: pd.DataFrame) -> None:
     from models.calibration import IsotonicCalibrator
     from models.blend import ModelBlender
     from models.registry import save_artifact
+    from backtest.runner import BLEND_VALIDATION_WINDOWS
 
     feature_cols = get_feature_columns()
     target_col = "actual_tmax"
@@ -104,18 +105,19 @@ def train_final_models(df: pd.DataFrame) -> None:
         # Held-out CRPS for both models, used to set the production blend weights.
         # NGBoost's log_score (NLL) and QRF's log_score (CRPS) are different units
         # and computed in-sample above, so they aren't comparable for blending —
-        # use a dedicated 85/15 split with the same CRPS metric for both.
+        # use a dedicated 85/15 split with the same CRPS metric for both, averaged
+        # over BLEND_VALIDATION_WINDOWS contiguous sub-periods of that split.
         val_n = max(30, int(len(X_st) * 0.15))
         X_tr_bw, X_val_bw = X_st.iloc[:-val_n], X_st.iloc[-val_n:]
         y_tr_bw, y_val_bw = y_st.iloc[:-val_n], y_st.iloc[-val_n:]
 
         ngb_bw = NGBoostTemperatureModel(n_estimators=500, learning_rate=0.01)
         ngb_bw.fit(X_tr_bw, y_tr_bw)
-        ngb_crps_oos[station] = ngb_bw.crps(X_val_bw, y_val_bw)
+        ngb_crps_oos[station] = ngb_bw.crps(X_val_bw, y_val_bw, n_windows=BLEND_VALIDATION_WINDOWS)
 
         qrf_bw = QRFTemperatureModel(n_estimators=500, min_samples_leaf=20)
         qrf_bw.fit(X_tr_bw, y_tr_bw)
-        qrf_crps_oos[station] = qrf_bw.log_score(X_val_bw, y_val_bw)
+        qrf_crps_oos[station] = qrf_bw.log_score(X_val_bw, y_val_bw, n_windows=BLEND_VALIDATION_WINDOWS)
 
         logger.info("Held-out CRPS %s: NGBoost=%.4f QRF=%.4f",
                      station, ngb_crps_oos[station], qrf_crps_oos[station])

@@ -65,13 +65,18 @@ class QRFTemperatureModel:
             result[f"cdf_{t}"] = self.predict_prob_above(X, t)
         return pd.DataFrame(result, index=X.index)
 
-    def log_score(self, X: pd.DataFrame, y: pd.Series) -> float:
+    def log_score(self, X: pd.DataFrame, y: pd.Series, n_windows: int = 1) -> float:
+        """CRPS of the predicted quantiles (lower-is-better).
+
+        n_windows > 1 averages CRPS over that many contiguous chunks of
+        (X, y) instead of a single global mean — pass data ordered by time
+        for a multi-window held-out estimate."""
         if self._model is None:
             raise RuntimeError("Model not fitted")
+        from models.blend import windowed_mean_score
         q_df = self.predict_quantiles(X)
-        median_pred = q_df["q50"].values
         crps_scores = ps.crps_ensemble(y.values, q_df.values)
-        return float(np.mean(crps_scores))
+        return windowed_mean_score(crps_scores, n_windows)
 
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)

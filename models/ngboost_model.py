@@ -73,12 +73,17 @@ class NGBoostTemperatureModel:
         scores = self._model.score(X.values, y.values)
         return float(np.mean(scores))
 
-    def crps(self, X: pd.DataFrame, y: pd.Series) -> float:
+    def crps(self, X: pd.DataFrame, y: pd.Series, n_windows: int = 1) -> float:
         """CRPS of the predicted distribution, in the same units (and lower-is-better
-        sense) as QRFTemperatureModel.log_score, so the two can be compared directly."""
+        sense) as QRFTemperatureModel.log_score, so the two can be compared directly.
+
+        n_windows > 1 averages CRPS over that many contiguous chunks of
+        (X, y) instead of a single global mean — pass data ordered by time
+        for a multi-window held-out estimate."""
         import properscoring as ps
+        from models.blend import windowed_mean_score
         mu, sigma = self.predict_distribution(X)
-        return float(np.mean(ps.crps_gaussian(y.values, mu, sigma)))
+        return windowed_mean_score(ps.crps_gaussian(y.values, mu, sigma), n_windows)
 
     def save(self, path: str) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)

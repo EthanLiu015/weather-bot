@@ -19,6 +19,10 @@ from processing.features import get_feature_columns
 
 logger = logging.getLogger(__name__)
 
+# Number of contiguous windows the held-out validation slice is split into
+# when estimating CRPS for NGBoost/QRF blend weights (see windowed_mean_score).
+BLEND_VALIDATION_WINDOWS = 3
+
 
 class BacktestRunner:
     def __init__(
@@ -28,6 +32,10 @@ class BacktestRunner:
         end_date: date,
         train_window_years: int = 3,
     ) -> None:
+        """train_window_years is the minimum amount of history (from
+        start_date) required before the first test month; every fold after
+        that trains on all data accumulated since start_date (expanding
+        window)."""
         self._settings = settings
         self._start = start_date
         self._end = end_date
@@ -38,8 +46,13 @@ class BacktestRunner:
         report = BacktestReport()
         test_month = self._start + relativedelta(years=self._train_window_years)
 
+        # Anchored/expanding window: every fold trains on all data from
+        # start_date up to the day before the test month, so the training
+        # set grows with each fold — matching production models, which are
+        # trained on the full available history rather than a rolling slice.
+        train_start = self._start
+
         while test_month <= self._end:
-            train_start = test_month - relativedelta(years=self._train_window_years)
             train_end = test_month - timedelta(days=1)
             logger.info("Running fold: train %s → %s, test month %s", train_start, train_end, test_month)
 
@@ -102,14 +115,13 @@ class BacktestRunner:
         res_model.fit(X_train, pd.Series(residuals_train, index=y_train.index))
         mu_test = mu_test + res_model.predict(X_test)
 
-        # Blend with QRF using out-of-fold log-score weighting
+        # Blend with QRF using out-of-fold log-score weighting, averaged over
+        # several held-out windows (BLEND_VALIDATION_WINDOWS) rather than a
+        # single trailing slice, so weights are less sensitive to any one period.
         val_n = max(30, int(len(X_train) * 0.15))
         X_val_ngb = X_train.iloc[-val_n:]
         y_val_ngb = y_train.iloc[-val_n:]
-        import properscoring as ps
-        from scipy.stats import norm as _norm_val
-        mu_val, sigma_val = ngb.predict_distribution(X_val_ngb)
-        ngb_log_score = float(np.mean(ps.crps_gaussian(y_val_ngb.values, mu_val, sigma_val)))
+        ngb_log_score = ngb.crps(X_val_ngb, y_val_ngb, n_windows=BLEND_VALIDATION_WINDOWS)
         mu_test, sigma_test = self._fit_qrf_and_blend(
             X_train=X_train,
             y_train=y_train,
@@ -295,7 +307,7 @@ class BacktestRunner:
         qrf = QRFTemperatureModel(n_estimators=n_estimators, min_samples_leaf=10)
         qrf.fit(X_tr, y_tr)
 
-        qrf_log_score = qrf.log_score(X_val, y_val)
+        qrf_log_score = qrf.log_score(X_val, y_val, n_windows=BLEND_VALIDATION_WINDOWS)
         blender = ModelBlender()
         # ngb_log_score / qrf_log_score are CRPS values (lower = better), but
         # compute_weights_from_log_scores treats higher = better, so negate.

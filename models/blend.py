@@ -7,6 +7,18 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 
+def windowed_mean_score(scores: np.ndarray, n_windows: int) -> float:
+    """Average per-row scores over n_windows contiguous (time-ordered)
+    chunks, giving each chunk equal weight regardless of size.
+
+    Used to derive held-out CRPS for blend weighting from several
+    sub-periods of the validation window rather than a single global mean,
+    so the resulting weights are less sensitive to any one period."""
+    chunks = np.array_split(np.asarray(scores), n_windows)
+    chunk_means = [chunk.mean() for chunk in chunks if len(chunk) > 0]
+    return float(np.mean(chunk_means))
+
+
 class ModelBlender:
     def __init__(self) -> None:
         self._ngboost_weight: float = 0.5
