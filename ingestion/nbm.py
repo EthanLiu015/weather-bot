@@ -3,10 +3,10 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import cfgrib
+import eccodes
 import httpx
 import numpy as np
-import xarray as xr
+from gribapi.errors import GribInternalError
 
 from config.stations import station_coords
 from ingestion.cache_pruning import prune_run_cache
@@ -19,23 +19,27 @@ STATION_COORDS = station_coords()
 # NBM runs 4× daily; data available ~1.5h after run time
 NBM_CYCLES = [0, 6, 12, 18]
 
-# Forecast hours to pull (these align with daily Tmax windows)
+# Default lead-hour keys for fetch_latest_nbm's result shape when no run is
+# available yet (the actual keys depend on cycle — see _nbm_lead_fhours).
 NBM_FORECAST_HOURS = [24, 48, 72, 96, 120]
 
-# cfgrib filter configs for NBM probabilistic temperature percentiles
-_PERCENTILE_FILTERS = {
-    "t10":  {"typeOfLevel": "heightAboveGround", "level": 2, "shortName": "2t", "percentileValue": 10},
-    "t25":  {"typeOfLevel": "heightAboveGround", "level": 2, "shortName": "2t", "percentileValue": 25},
-    "t50":  {"typeOfLevel": "heightAboveGround", "level": 2, "shortName": "2t", "percentileValue": 50},
-    "t75":  {"typeOfLevel": "heightAboveGround", "level": 2, "shortName": "2t", "percentileValue": 75},
-    "t90":  {"typeOfLevel": "heightAboveGround", "level": 2, "shortName": "2t", "percentileValue": 90},
-}
+# GRIB key filters for the NBM "core" fields. The ensemble mean and ensemble
+# std-dev share these keys and are distinguished only by `derivedForecast`
+# (absent for the mean, =2 for std dev — WMO table 4.7 "Standard deviation").
+_TMAX_FILTER = {"shortName": "tmax", "typeOfLevel": "heightAboveGround", "level": 2, "typeOfStatisticalProcessing": 2}
+_TMIN_FILTER = {"shortName": "tmin", "typeOfLevel": "heightAboveGround", "level": 2, "typeOfStatisticalProcessing": 3}
+# NBM core files carry separate APCP probability messages for the 1h, 6h, and
+# 12h accumulation windows that share every other key — lengthOfTimeRange is
+# the only field distinguishing the true POP12 message from POP1/POP6.
+_POP12_FILTER = {"shortName": "tp", "typeOfLevel": "surface", "typeOfStatisticalProcessing": 1, "probabilityType": 1, "lowerLimit": 255.0, "lengthOfTimeRange": 12}
 
-_DETERMINISTIC_FILTERS = {
-    "tmax": {"typeOfLevel": "heightAboveGround", "level": 2, "shortName": "tmax"},
-    "tmin": {"typeOfLevel": "heightAboveGround", "level": 2, "shortName": "tmin"},
-    "pop12": {"typeOfLevel": "surface", "shortName": "pop"},
-    "t2m":  {"typeOfLevel": "heightAboveGround", "level": 2, "shortName": "2t"},
+# Normal-quantile z-scores used to derive percentile temperatures from
+# NBM's tmax mean + std-dev fields (NBM does not publish 2m-temp percentiles directly).
+_PERCENTILE_Z_SCORES = {
+    "t10": -1.2815515655446004,
+    "t25": -0.6744897501960817,
+    "t75": 0.6744897501960817,
+    "t90": 1.2815515655446004,
 }
 
 
@@ -65,67 +69,160 @@ async def _download_file(url: str, dest: Path, client: httpx.AsyncClient) -> boo
     return False
 
 
-def _nearest_val(da: xr.DataArray, lat: float, lon: float) -> float:
-    lon_360 = lon % 360
-    try:
-        # NBM uses a Lambert conformal grid — try x/y dims first, fall back to lat/lon
-        if "latitude" in da.coords and "longitude" in da.coords:
-            return float(da.sel(latitude=lat, longitude=lon_360, method="nearest").values)
-        # For projected grids, find nearest point manually
-        lats = da.coords.get("latitude", da.coords.get("lat"))
-        lons = da.coords.get("longitude", da.coords.get("lon"))
-        if lats is None or lons is None:
-            return float("nan")
-        dist = (lats - lat) ** 2 + (lons - lon_360) ** 2
-        idx = int(dist.argmin())
-        return float(da.values.flat[idx])
-    except Exception:
-        return float("nan")
-
-
 def _kelvin_to_f(k: float) -> float:
     return (k - 273.15) * 9 / 5 + 32 if not np.isnan(k) else float("nan")
 
 
-def _parse_nbm_file(path: str, station: str) -> dict[str, float]:
-    lat, lon = STATION_COORDS[station]
-    result: dict[str, float] = {}
+def _kelvin_delta_to_f(k: float) -> float:
+    """Convert a delta/spread quantity (e.g. std dev) from Kelvin to Fahrenheit
+    scale — no offset, since deltas don't shift with the zero point."""
+    return k * 9 / 5 if not np.isnan(k) else float("nan")
 
-    # Try each percentile filter
-    for key, fkeys in _PERCENTILE_FILTERS.items():
-        try:
-            ds = cfgrib.open_dataset(path, filter_by_keys=fkeys, indexpath=None)
-            var = list(ds.data_vars)[0]
-            val_k = _nearest_val(ds[var], lat, lon)
-            result[key] = _kelvin_to_f(val_k)
-        except Exception:
-            result[key] = float("nan")
 
-    # Deterministic fields
-    for key, fkeys in _DETERMINISTIC_FILTERS.items():
-        if key in result:
-            continue
-        try:
-            ds = cfgrib.open_dataset(path, filter_by_keys=fkeys, indexpath=None)
-            var = list(ds.data_vars)[0]
-            val = _nearest_val(ds[var], lat, lon)
-            if key in ("tmax", "tmin", "t2m"):
-                result[key] = _kelvin_to_f(val)
-            else:
-                result[key] = float(val) if not np.isnan(val) else float("nan")
-        except Exception:
-            result[key] = float("nan")
+def _grib_safe_get(gid, key):
+    try:
+        return eccodes.codes_get(gid, key)
+    except Exception:
+        return None
 
-    # Fallback: open_datasets without filters if nothing parsed
-    if all(np.isnan(v) for v in result.values()):
-        try:
-            for ds in cfgrib.open_datasets(path, indexpath=None):
-                for var in ds.data_vars:
-                    if var not in result:
-                        result[var] = _nearest_val(ds[var], lat, lon)
-        except Exception:
-            pass
 
+# Keys identifying a GRIB grid's layout. NBM's CONUS grid is identical across
+# the whole archive (2020-present), so flat-array indices computed once via
+# _grid_nearest_indices can be reused for every later file's codes_get_values
+# array — verified against this signature by _grib_values_at_indices.
+_GRID_SIGNATURE_KEYS = ["Ni", "Nj", "latitudeOfFirstGridPointInDegrees", "longitudeOfFirstGridPointInDegrees", "gridType"]
+
+
+def _grid_signature(gid) -> tuple:
+    return tuple(eccodes.codes_get(gid, k) for k in _GRID_SIGNATURE_KEYS)
+
+
+def _grid_nearest_indices(path: str, points: dict[str, tuple[float, float]]) -> tuple[dict[str, int], tuple]:
+    """Return ({name: flat grid-array index nearest to (lat, lon)}, grid
+    signature) for every point, computed from `path`'s first message.
+    `codes_grib_find_nearest`'s `index` is a single O(grid) search done once
+    per point here — the result is reused across many files via
+    _grib_values_at_indices instead of repeating the search per file."""
+    with open(path, "rb") as f:
+        gid = eccodes.codes_grib_new_from_file(f)
+    try:
+        signature = _grid_signature(gid)
+        indices = {}
+        for name, (lat, lon) in points.items():
+            nearest = eccodes.codes_grib_find_nearest(gid, lat, lon % 360)
+            indices[name] = nearest[0]["index"]
+        return indices, signature
+    finally:
+        eccodes.codes_release(gid)
+
+
+def _grib_values_at_indices(
+    path: str,
+    match_keys: dict,
+    indices: dict[str, int],
+    grid_signature: tuple,
+    derived_forecast: int | None = None,
+) -> dict[str, float]:
+    """Scan GRIB2 messages in `path` for the first message whose keys match
+    `match_keys` and whose `derivedForecast` equals `derived_forecast`, and
+    return {name: value at that grid index} for each (name, index) in
+    `indices`. Returns NaN for every name if the file is missing, no message
+    matches, or the message's grid doesn't match `grid_signature` (the
+    cached `indices` would be meaningless on a different grid)."""
+    nan_result = {name: float("nan") for name in indices}
+    try:
+        with open(path, "rb") as f:
+            while True:
+                gid = eccodes.codes_grib_new_from_file(f)
+                if gid is None:
+                    break
+                try:
+                    if _grib_safe_get(gid, "derivedForecast") != derived_forecast:
+                        continue
+                    if not all(_grib_safe_get(gid, k) == v for k, v in match_keys.items()):
+                        continue
+                    if _grid_signature(gid) != grid_signature:
+                        logger.error("NBM grid signature mismatch for %s; skipping", path)
+                        return nan_result
+                    values = eccodes.codes_get_values(gid)
+                    return {name: float(values[idx]) for name, idx in indices.items()}
+                finally:
+                    eccodes.codes_release(gid)
+    except (OSError, GribInternalError) as exc:
+        # A range fetch that failed mid-transfer can leave a partial/corrupted
+        # GRIB2 file on disk; eccodes raises GribInternalError subclasses
+        # (PrematureEndOfFileError, WrongLengthError, ...) when reading these.
+        logger.warning("Failed to read GRIB message from %s: %s", path, exc)
+    return nan_result
+
+
+def _derive_nbm_percentiles(t50: float, spread: float) -> dict[str, float]:
+    """Derive t10/t25/t75/t90 from the NBM tmax mean (t50) and std dev
+    (spread), assuming a normal distribution — NBM does not publish 2m-temp
+    percentile fields directly."""
+    if np.isnan(t50) or np.isnan(spread):
+        return {key: float("nan") for key in _PERCENTILE_Z_SCORES}
+    return {key: t50 + z * spread for key, z in _PERCENTILE_Z_SCORES.items()}
+
+
+def _parse_nbm_files_for_stations(
+    tmax_path: str,
+    tmin_path: str | None,
+    indices: dict[str, int],
+    grid_signature: tuple,
+) -> dict[str, dict[str, float]]:
+    """Extract tmax/tmin/pop12 from NBM core GRIB2 files for every station in
+    `indices` and derive the percentile fields from tmax's mean and std dev.
+
+    `tmax_path` is the core file for the TMAX window (also carries POP12);
+    `tmin_path` is the core file for the paired TMIN window, or None if
+    unavailable (tmin is left as NaN in that case). `indices`/`grid_signature`
+    come from _grid_nearest_indices.
+    """
+    tmax_k = _grib_values_at_indices(tmax_path, _TMAX_FILTER, indices, grid_signature, derived_forecast=None)
+    tmax_std_k = _grib_values_at_indices(tmax_path, _TMAX_FILTER, indices, grid_signature, derived_forecast=2)
+    pop12 = _grib_values_at_indices(tmax_path, _POP12_FILTER, indices, grid_signature, derived_forecast=None)
+    tmin_k = (
+        _grib_values_at_indices(tmin_path, _TMIN_FILTER, indices, grid_signature, derived_forecast=None)
+        if tmin_path is not None
+        else {name: float("nan") for name in indices}
+    )
+
+    result = {}
+    for name in indices:
+        t50 = _kelvin_to_f(tmax_k[name])
+        spread = _kelvin_delta_to_f(tmax_std_k[name])
+        result[name] = {
+            **_derive_nbm_percentiles(t50, spread),
+            "t50": t50,
+            "tmax": t50,
+            "tmin": _kelvin_to_f(tmin_k[name]),
+            "pop12": pop12[name],
+            "spread": spread,
+        }
+    return result
+
+
+def _nbm_lead_fhours(cycle: int, n_days: int = 5) -> list[tuple[int, int, int]]:
+    """Return `n_days` (lead_hour, tmax_fhour, tmin_fhour) tuples for the
+    given NBM cycle.
+
+    NBM core files carry TMAX/TMIN window messages every 12h, with each
+    window covering either 12-24Z (TMAX) or 00-12Z (TMIN). Which forecast
+    hour holds which field depends on the cycle — e.g. for a 00z run, f024
+    covers 12-24Z (TMAX) and f012 covers 00-12Z (TMIN); for a 12z run this is
+    reversed (f012=TMAX, f024=TMIN). `lead_hour` (the larger forecast hour of
+    each pair) is used as the dict key in fetch_latest_nbm's result.
+    """
+    base = (12 - cycle) % 12 or 12
+    pairs = [(base + 12 * (2 * k), base + 12 * (2 * k + 1)) for k in range(n_days)]
+    result = []
+    for low, high in pairs:
+        if (cycle + low) % 24 == 0:
+            tmax_fhour, tmin_fhour = low, high
+        else:
+            tmax_fhour, tmin_fhour = high, low
+        result.append((high, tmax_fhour, tmin_fhour))
     return result
 
 
@@ -140,6 +237,12 @@ def _latest_nbm_run(now: datetime) -> tuple[str, str] | None:
     return None
 
 
+async def _ensure_downloaded(url: str, dest: Path, client: httpx.AsyncClient) -> bool:
+    if dest.exists():
+        return True
+    return await _download_file(url, dest, client)
+
+
 async def fetch_latest_nbm(data_dir: str = "data/nbm") -> dict:
     """
     Returns:
@@ -149,13 +252,13 @@ async def fetch_latest_nbm(data_dir: str = "data/nbm") -> dict:
     now = datetime.utcnow()
     run_info = _latest_nbm_run(now)
 
+    empty_slot = {
+        "t10": float("nan"), "t25": float("nan"), "t50": float("nan"),
+        "t75": float("nan"), "t90": float("nan"), "tmax": float("nan"),
+        "tmin": float("nan"), "pop12": float("nan"), "spread": float("nan"),
+    }
     empty = {
-        s: {
-            lh: {"t10": float("nan"), "t25": float("nan"), "t50": float("nan"),
-                 "t75": float("nan"), "t90": float("nan"), "tmax": float("nan"),
-                 "tmin": float("nan"), "pop12": float("nan"), "spread": float("nan")}
-            for lh in NBM_FORECAST_HOURS
-        }
+        s: {lh: dict(empty_slot) for lh in NBM_FORECAST_HOURS}
         for s in STATION_COORDS
     }
 
@@ -164,45 +267,48 @@ async def fetch_latest_nbm(data_dir: str = "data/nbm") -> dict:
         return empty
 
     date_str, cycle_str = run_info
+    lead_fhours = _nbm_lead_fhours(int(cycle_str))
     result: dict[str, dict[int, dict]] = {
         s: {} for s in STATION_COORDS
     }
 
+    # Grid indices/signature are computed once from the first downloaded
+    # file and reused for every lead_hour — NBM's CONUS grid is identical
+    # across runs, so this avoids an O(grid) nearest-neighbor search per
+    # station per file (see _grid_nearest_indices).
+    grid_indices: dict[str, int] | None = None
+    grid_signature: tuple | None = None
+
     async with httpx.AsyncClient() as client:
-        for fhour in NBM_FORECAST_HOURS:
-            url = _nbm_url(date_str, cycle_str, fhour)
-            dest = Path(data_dir) / date_str / cycle_str / f"nbm_f{fhour:03d}.grib2"
+        for lead_hour, tmax_fhour, tmin_fhour in lead_fhours:
+            tmax_dest = Path(data_dir) / date_str / cycle_str / f"nbm_f{tmax_fhour:03d}.grib2"
+            tmin_dest = Path(data_dir) / date_str / cycle_str / f"nbm_f{tmin_fhour:03d}.grib2"
 
-            if not dest.exists():
-                ok = await _download_file(url, dest, client)
-                if not ok:
-                    logger.warning("NBM f%03d unavailable", fhour)
-                    for station in STATION_COORDS:
-                        result[station][fhour] = empty[station][fhour]
-                    continue
+            tmax_ok = await _ensure_downloaded(_nbm_url(date_str, cycle_str, tmax_fhour), tmax_dest, client)
+            if not tmax_ok:
+                logger.warning("NBM f%03d unavailable", tmax_fhour)
+                for station in STATION_COORDS:
+                    result[station][lead_hour] = dict(empty_slot)
+                continue
 
+            tmin_ok = await _ensure_downloaded(_nbm_url(date_str, cycle_str, tmin_fhour), tmin_dest, client)
+            if not tmin_ok:
+                logger.warning("NBM f%03d (tmin) unavailable", tmin_fhour)
+
+            if grid_indices is None:
+                grid_indices, grid_signature = _grid_nearest_indices(str(tmax_dest), STATION_COORDS)
+
+            parsed = _parse_nbm_files_for_stations(
+                str(tmax_dest),
+                str(tmin_dest) if tmin_ok else None,
+                grid_indices, grid_signature,
+            )
             for station in STATION_COORDS:
-                parsed = _parse_nbm_file(str(dest), station)
-
-                t10 = parsed.get("t10", float("nan"))
-                t90 = parsed.get("t90", float("nan"))
-                spread = t90 - t10 if not (np.isnan(t10) or np.isnan(t90)) else float("nan")
-
-                result[station][fhour] = {
-                    "t10":   t10,
-                    "t25":   parsed.get("t25", float("nan")),
-                    "t50":   parsed.get("t50", float("nan")),
-                    "t75":   parsed.get("t75", float("nan")),
-                    "t90":   t90,
-                    "tmax":  parsed.get("tmax", float("nan")),
-                    "tmin":  parsed.get("tmin", float("nan")),
-                    "pop12": parsed.get("pop12", float("nan")),
-                    "spread": spread,
-                }
+                result[station][lead_hour] = parsed[station]
 
     filled = sum(
-        1 for s in STATION_COORDS for lh in NBM_FORECAST_HOURS
-        if not np.isnan(result[s].get(lh, {}).get("t50", float("nan")))
+        1 for s in STATION_COORDS for lead_hour, _, _ in lead_fhours
+        if not np.isnan(result[s].get(lead_hour, {}).get("t50", float("nan")))
     )
     logger.info("NBM %s %sz: %d station×hour records with valid t50", date_str, cycle_str, filled)
 
