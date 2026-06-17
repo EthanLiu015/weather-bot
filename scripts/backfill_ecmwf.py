@@ -57,7 +57,7 @@ _WB2_CODEC = numcodecs.Blosc()
 # ── Pure helpers ──────────────────────────────────────────────────────────────
 
 def _wb2_lat_idx(lat: float) -> int:
-    return round((90.0 - lat) / WB2_RES)
+    return round((lat + 90.0) / WB2_RES)
 
 
 def _wb2_lon_idx(lon: float) -> int:

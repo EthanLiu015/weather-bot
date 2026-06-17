@@ -20,7 +20,7 @@ from scripts.backfill_ecmwf import (
 
 
 def test_wb2_lat_idx_for_kord():
-    assert _wb2_lat_idx(41.9786) == 192
+    assert _wb2_lat_idx(41.9786) == 528
 
 
 def test_wb2_lon_idx_for_kord_negative_longitude():
@@ -28,7 +28,7 @@ def test_wb2_lon_idx_for_kord_negative_longitude():
 
 
 def test_wb2_flat_idx_for_kord():
-    assert _wb2_flat_idx(41.9786, -87.9047) == 192 * 1440 + 1088
+    assert _wb2_flat_idx(41.9786, -87.9047) == 528 * 1440 + 1088
 
 
 def test_wb2_lat_idx_equator():

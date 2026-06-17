@@ -188,7 +188,7 @@ def test_feature_matrix_has_no_regime_cluster_columns():
 def test_get_feature_columns_returns_list():
     cols = get_feature_columns()
     assert isinstance(cols, list)
-    assert len(cols) == 46
+    assert len(cols) == 43
     assert "nbm_t50" in cols
     assert "gefs_tmax_iqr" in cols
     assert "gefs_ensemble_kurtosis" in cols

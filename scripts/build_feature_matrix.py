@@ -292,7 +292,6 @@ def build_feature_rows(
                 "actual_tmax": actual_tmax,
                 # GEFS proxies (ERA5 as deterministic + spread from temporal window)
                 "gefs_tmax_mean":          t2m_f,
-                "gefs_tmax_median":        t2m_f,
                 "gefs_tmax_std":           sp_f["std"],
                 "gefs_tmax_range":         sp_f["range"],
                 "gefs_tmax_iqr":           sp_f["iqr"],
@@ -310,7 +309,7 @@ def build_feature_rows(
                 # NBM — unavailable historically
                 "nbm_t10":   float("nan"), "nbm_t25": float("nan"),
                 "nbm_t50":   float("nan"), "nbm_t75": float("nan"),
-                "nbm_t90":   float("nan"), "nbm_tmax": float("nan"),
+                "nbm_t90":   float("nan"),
                 "nbm_tmin":  float("nan"), "nbm_pop12": float("nan"),
                 "nbm_spread": float("nan"), "nbm_gefs_delta": float("nan"),
                 # Atmospheric
@@ -324,7 +323,6 @@ def build_feature_rows(
                 "onshore_wind_component":     onshore_wind_component,
                 "surface_dew_point_depression": dp_dep,
                 # Temporal
-                "lead_time_hours": float(lead_hour),
                 "lead_time_sqrt": lead_time_sqrt,
                 "day_of_year_sin": doy_sin, "day_of_year_cos": doy_cos,
                 # Physical meta

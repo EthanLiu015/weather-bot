@@ -72,7 +72,6 @@ def _aggregate_members(member_list: list[dict]) -> dict[str, float]:
     return {
         # Central tendency
         "gefs_tmax_mean":          _safe(temps, np.mean),
-        "gefs_tmax_median":        p50,
         # Spread
         "gefs_tmax_std":           _safe(temps, np.std) if n > 1 else float("nan"),
         "gefs_tmax_range":         (max(temps) - min(temps)) if n > 1 else float("nan"),
@@ -213,7 +212,7 @@ def build_feature_matrix(
             nbm_row: dict[str, float] = {
                 "nbm_t10": float("nan"), "nbm_t25": float("nan"),
                 "nbm_t50": float("nan"), "nbm_t75": float("nan"),
-                "nbm_t90": float("nan"), "nbm_tmax": float("nan"),
+                "nbm_t90": float("nan"),
                 "nbm_tmin": float("nan"), "nbm_pop12": float("nan"),
                 "nbm_spread": float("nan"), "nbm_gefs_delta": float("nan"),
             }
@@ -231,7 +230,6 @@ def build_feature_matrix(
                         "nbm_t50":       t50,
                         "nbm_t75":       nbm_slot.get("t75", float("nan")),
                         "nbm_t90":       nbm_slot.get("t90", float("nan")),
-                        "nbm_tmax":      nbm_slot.get("tmax", float("nan")),
                         "nbm_tmin":      nbm_slot.get("tmin", float("nan")),
                         "nbm_pop12":     nbm_slot.get("pop12", float("nan")),
                         "nbm_spread":    nbm_slot.get("spread", float("nan")),
@@ -283,7 +281,6 @@ def build_feature_matrix(
                 "lead_hour": lead_hour,
                 # GEFS ensemble distribution
                 "gefs_tmax_mean":         gefs["gefs_tmax_mean"],
-                "gefs_tmax_median":       gefs["gefs_tmax_median"],
                 "gefs_tmax_std":          gefs["gefs_tmax_std"],
                 "gefs_tmax_range":        gefs["gefs_tmax_range"],
                 "gefs_tmax_iqr":          gefs["gefs_tmax_iqr"],
@@ -313,7 +310,6 @@ def build_feature_matrix(
                 # Moisture
                 "surface_dew_point_depression": gefs["surface_dew_point_depression"],
                 # Temporal
-                "lead_time_hours":        float(lead_hour),
                 "lead_time_sqrt":         lead_time_sqrt,
                 "day_of_year_sin":        doy_sin,
                 "day_of_year_cos":        doy_cos,
@@ -337,7 +333,7 @@ def build_feature_matrix(
 def get_feature_columns() -> list[str]:
     return [
         # GEFS distribution
-        "gefs_tmax_mean", "gefs_tmax_median", "gefs_tmax_std",
+        "gefs_tmax_mean", "gefs_tmax_std",
         "gefs_tmax_range", "gefs_tmax_iqr",
         "gefs_tmax_p10", "gefs_tmax_p25", "gefs_tmax_p75", "gefs_tmax_p90",
         "gefs_ensemble_skewness", "gefs_ensemble_kurtosis",
@@ -346,7 +342,7 @@ def get_feature_columns() -> list[str]:
         "ecmwf_tmax", "ecmwf_tmin", "ecmwf_gefs_tmax_delta",
         # NBM
         "nbm_t10", "nbm_t25", "nbm_t50", "nbm_t75", "nbm_t90",
-        "nbm_tmax", "nbm_tmin", "nbm_pop12", "nbm_spread", "nbm_gefs_delta",
+        "nbm_tmin", "nbm_pop12", "nbm_spread", "nbm_gefs_delta",
         # Cloud
         "cloud_cover_total", "cloud_low_frac", "cloud_mid_frac", "cloud_high_frac",
         # Wind
@@ -354,7 +350,7 @@ def get_feature_columns() -> list[str]:
         # Moisture
         "surface_dew_point_depression",
         # Temporal
-        "lead_time_hours", "lead_time_sqrt", "day_of_year_sin", "day_of_year_cos",
+        "lead_time_sqrt", "day_of_year_sin", "day_of_year_cos",
         # Physical meta
         "elevation_delta_m", "uhi_index", "coastal_distance_km",
         # Residual lags + rolling stats
