@@ -105,6 +105,25 @@ def _field_byte_range(idx_lines: list[str], field: str) -> tuple[int, int] | Non
     return _byte_range(idx_lines, index, span)
 
 
+_NBM_PARTIAL_FILL_COLS = ["nbm_t10", "nbm_t25", "nbm_t75", "nbm_t90", "nbm_tmin", "nbm_pop12", "nbm_spread"]
+
+
+def null_partial_nbm_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """Null out columns in rows where nbm_t50 is valid (non-zero) but the
+    remaining percentile/aux fields are all zero — indicating the backfill
+    retrieved the median but the surrounding percentile messages were absent.
+
+    Rows where nbm_t50 is itself zero (entire NBM slot missing) are left
+    unchanged, as are fully-populated rows where t10 is non-zero.
+    """
+    partial_mask = (df["nbm_t50"].notna()) & (df["nbm_t50"] != 0.0) & (df["nbm_t10"] == 0.0) & (df["nbm_spread"] == 0.0)
+    result = df.copy()
+    for col in _NBM_PARTIAL_FILL_COLS:
+        if col in result.columns:
+            result.loc[partial_mask, col] = float("nan")
+    return result
+
+
 def _apply_nbm_backfill(features_df: pd.DataFrame, backfill_df: pd.DataFrame) -> pd.DataFrame:
     """Left-join `backfill_df` (columns: date, station, lead_hour, plus
     NBM_BACKFILL_COLS) onto `features_df`, overwriting the corresponding

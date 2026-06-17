@@ -1,6 +1,8 @@
 import pandas as pd
 import pytest
 
+import numpy as np
+
 from scripts.backfill_nbm import (
     NBM_BACKFILL_COLS,
     _apply_nbm_backfill,
@@ -8,6 +10,7 @@ from scripts.backfill_nbm import (
     _field_byte_range,
     _find_message_index,
     _is_pop12_line,
+    null_partial_nbm_rows,
 )
 
 # Minimal idx excerpts in the real `.idx` line format: "N:offset:d=...:description"
@@ -175,3 +178,87 @@ def test_apply_nbm_backfill_preserves_row_count_and_columns():
 
     assert len(result) == len(features_df)
     assert set(features_df.columns) == set(result.columns)
+
+
+# ── null_partial_nbm_rows ─────────────────────────────────────────────────────
+
+_NBM_PERCENTILE_COLS = ["nbm_t10", "nbm_t25", "nbm_t75", "nbm_t90"]
+_NBM_AUX_COLS = ["nbm_tmin", "nbm_pop12", "nbm_spread"]
+
+
+def _partial_nbm_row(**overrides) -> dict:
+    """Row where nbm_t50 is valid but all other percentiles are 0 (partial fill)."""
+    row = {
+        "station": "KORD",
+        "date": "2024-05-19",
+        "lead_hour": 96,
+        "gefs_tmax_mean": 70.0,
+        "nbm_t10": 0.0,
+        "nbm_t25": 0.0,
+        "nbm_t50": 75.0,
+        "nbm_t75": 0.0,
+        "nbm_t90": 0.0,
+        "nbm_tmin": 0.0,
+        "nbm_pop12": 0.0,
+        "nbm_spread": 0.0,
+        "nbm_gefs_delta": abs(75.0 - 70.0),
+    }
+    row.update(overrides)
+    return row
+
+
+def test_null_partial_nbm_rows_nulls_percentile_cols_when_t50_valid_but_rest_zero():
+    df = pd.DataFrame([_partial_nbm_row()])
+    result = null_partial_nbm_rows(df)
+    for col in _NBM_PERCENTILE_COLS + _NBM_AUX_COLS:
+        assert np.isnan(result.iloc[0][col]), f"Expected NaN for {col}"
+
+
+def test_null_partial_nbm_rows_preserves_t50_when_nulling():
+    df = pd.DataFrame([_partial_nbm_row(nbm_t50=93.0)])
+    result = null_partial_nbm_rows(df)
+    assert result.iloc[0]["nbm_t50"] == pytest.approx(93.0)
+
+
+def test_null_partial_nbm_rows_leaves_fully_valid_rows_unchanged():
+    valid_row = _partial_nbm_row(nbm_t10=65.0, nbm_t25=69.0, nbm_t75=78.0, nbm_t90=82.0,
+                                  nbm_tmin=60.0, nbm_pop12=0.1, nbm_spread=17.0)
+    df = pd.DataFrame([valid_row])
+    result = null_partial_nbm_rows(df)
+    assert result.iloc[0]["nbm_t10"] == pytest.approx(65.0)
+    assert result.iloc[0]["nbm_spread"] == pytest.approx(17.0)
+
+
+def test_null_partial_nbm_rows_leaves_fully_missing_rows_unchanged():
+    # All zeros including t50 means the entire NBM slot was missing — not a partial fill
+    fully_missing = _partial_nbm_row(nbm_t50=0.0)
+    df = pd.DataFrame([fully_missing])
+    result = null_partial_nbm_rows(df)
+    assert result.iloc[0]["nbm_t10"] == pytest.approx(0.0)
+    assert result.iloc[0]["nbm_t50"] == pytest.approx(0.0)
+
+
+def test_null_partial_nbm_rows_preserves_nbm_gefs_delta():
+    df = pd.DataFrame([_partial_nbm_row(nbm_t50=75.0, gefs_tmax_mean=70.0, nbm_gefs_delta=5.0)])
+    result = null_partial_nbm_rows(df)
+    assert result.iloc[0]["nbm_gefs_delta"] == pytest.approx(5.0)
+
+
+def test_null_partial_nbm_rows_preserves_row_count():
+    rows = [
+        _partial_nbm_row(nbm_t50=75.0),   # partial — will be nulled
+        _partial_nbm_row(nbm_t10=65.0, nbm_t25=69.0, nbm_t75=78.0, nbm_t90=82.0,
+                         nbm_tmin=60.0, nbm_pop12=0.1, nbm_spread=17.0),  # valid
+        _partial_nbm_row(nbm_t50=0.0),    # fully missing
+    ]
+    df = pd.DataFrame(rows)
+    result = null_partial_nbm_rows(df)
+    assert len(result) == 3
+
+
+def test_null_partial_nbm_rows_handles_18_station_batch():
+    partial_rows = [_partial_nbm_row(station=f"K{i:03d}") for i in range(18)]
+    df = pd.DataFrame(partial_rows)
+    result = null_partial_nbm_rows(df)
+    assert (result["nbm_t10"].isna()).sum() == 18
+    assert (result["nbm_t50"] == 75.0).sum() == 18
