@@ -347,6 +347,8 @@ def build_feature_rows(
                     if not (np.isnan(lag1) or np.isnan(lag3))
                     else float("nan")
                 ),
+                # ecmwf_diurnal_range: historically t2m_f used for both tmax and tmin → 0
+                "ecmwf_diurnal_range": 0.0 if not np.isnan(t2m_f) else float("nan"),
             }
 
             rows.append(row)

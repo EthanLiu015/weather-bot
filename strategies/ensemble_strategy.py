@@ -99,6 +99,7 @@ class EnsembleStrategy:
         blender,
         calibrator,
         threshold: float,
+        ecmwf_offset: float = 0.0,
     ) -> dict:
         mu, sigma = ngboost_model.predict_distribution(X)
 
@@ -107,6 +108,10 @@ class EnsembleStrategy:
                 mu = mu + residual_model.predict(X)
             except Exception:
                 pass
+
+        # Shift residual predictions to absolute temperature scale.
+        # Models train on (actual_tmax - ecmwf_tmax); ecmwf_offset converts back.
+        mu = mu + ecmwf_offset
 
         if "gefs_tmax_std" in X.columns and "gefs_tmax_range" in X.columns:
             std_arr = X["gefs_tmax_std"].fillna(0).values
@@ -117,7 +122,8 @@ class EnsembleStrategy:
 
         if qrf_model is not None and blender is not None:
             try:
-                qrf_prob = float(qrf_model.predict_prob_above(X, threshold)[0])
+                # QRF also predicts in residual space; shift threshold to match
+                qrf_prob = float(qrf_model.predict_prob_above(X, threshold - ecmwf_offset)[0])
                 raw_prob = float(
                     blender.weights["ngboost"] * raw_prob
                     + blender.weights["qrf"] * qrf_prob
@@ -236,6 +242,11 @@ class EnsembleStrategy:
                 else:
                     closest_row = station_rows.iloc[[0]]
                 X = closest_row[available_cols].fillna(0.0)
+                ecmwf_offset = float(
+                    closest_row["ecmwf_tmax"].iloc[0]
+                    if "ecmwf_tmax" in closest_row.columns
+                    else 0.0
+                )
 
                 ngboost_model  = ngboost_by_station.get(station)
                 qrf_model      = qrf_by_station.get(station)
@@ -265,6 +276,7 @@ class EnsembleStrategy:
                         blender=blender,
                         calibrator=calibrator,
                         threshold=threshold,
+                        ecmwf_offset=ecmwf_offset,
                     )
                 except Exception as exc:
                     logger.warning("Model inference failed for %s: %s", ticker, exc)

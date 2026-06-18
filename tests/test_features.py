@@ -188,7 +188,7 @@ def test_feature_matrix_has_no_regime_cluster_columns():
 def test_get_feature_columns_returns_list():
     cols = get_feature_columns()
     assert isinstance(cols, list)
-    assert len(cols) == 47
+    assert len(cols) == 46
     assert "nbm_t50" in cols
     assert "gefs_tmax_iqr" in cols
     assert "gefs_ensemble_kurtosis" in cols
@@ -219,6 +219,10 @@ def test_get_feature_columns_returns_list():
     assert "gefs_spread_per_lead" in cols
     assert "nbm_spread_per_lead" in cols
     assert "obs_minus_model_accel" in cols
+    # Residual reframing: ecmwf_tmax/tmin are now inference-time offsets, not features
+    assert "ecmwf_tmax" not in cols
+    assert "ecmwf_tmin" not in cols
+    assert "ecmwf_diurnal_range" in cols
 
 
 # ── engineered feature behaviour ─────────────────────────────────────────────
@@ -300,3 +304,21 @@ def test_nbm_spread_per_lead_normalizes_spread_by_sqrt_lead():
 def test_obs_minus_model_accel_is_lag1_minus_lag3():
     cols = get_feature_columns()
     assert "obs_minus_model_accel" in cols
+
+
+def test_ecmwf_diurnal_range_is_tmax_minus_tmin():
+    gefs = _make_gefs_deterministic("KORD", [24], temp_f=70.0)
+    ecmwf = {"KORD": {"tmax_forecast": 82.0, "tmin_forecast": 60.0}}
+    df = build_feature_matrix(gefs_data=gefs, ecmwf_data=ecmwf, asos_history=pd.DataFrame())
+    row = df.iloc[0]
+    assert "ecmwf_diurnal_range" in df.columns
+    assert row["ecmwf_diurnal_range"] == pytest.approx(82.0 - 60.0, abs=0.01)
+
+
+def test_ecmwf_tmax_still_present_as_non_feature_column():
+    """ecmwf_tmax must remain in the DataFrame for inference-time offset use."""
+    gefs = _make_gefs_deterministic("KORD", [24], temp_f=70.0)
+    ecmwf = {"KORD": {"tmax_forecast": 78.0, "tmin_forecast": 58.0}}
+    df = build_feature_matrix(gefs_data=gefs, ecmwf_data=ecmwf, asos_history=pd.DataFrame())
+    assert "ecmwf_tmax" in df.columns, "ecmwf_tmax must stay in DataFrame for inference offset"
+    assert "ecmwf_tmax" not in get_feature_columns(), "ecmwf_tmax must NOT be a model feature"

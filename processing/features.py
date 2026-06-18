@@ -314,6 +314,11 @@ def build_feature_matrix(
                 if not (np.isnan(lag1) or np.isnan(lag3))
                 else float("nan")
             )
+            ecmwf_diurnal_range = (
+                ecmwf_tmax - ecmwf_tmin
+                if not (np.isnan(ecmwf_tmax) or np.isnan(ecmwf_tmin))
+                else float("nan")
+            )
 
             row: dict = {
                 "station":   station,
@@ -367,6 +372,7 @@ def build_feature_matrix(
                 "gefs_spread_per_lead":     gefs_spread_per_lead,
                 "nbm_spread_per_lead":      nbm_spread_per_lead,
                 "obs_minus_model_accel":    obs_minus_model_accel,
+                "ecmwf_diurnal_range":      ecmwf_diurnal_range,
             }
 
             rows.append(row)
@@ -382,8 +388,9 @@ def get_feature_columns() -> list[str]:
         "gefs_tmax_p10", "gefs_tmax_p25", "gefs_tmax_p75", "gefs_tmax_p90",
         "gefs_ensemble_skewness", "gefs_ensemble_kurtosis",
         "gefs_tmax_climo_anomaly",
-        # ECMWF
-        "ecmwf_tmax", "ecmwf_tmin", "ecmwf_gefs_tmax_delta",
+        # ECMWF (ecmwf_tmax and ecmwf_tmin are inference-time offsets, not features;
+        # diurnal_range captures the forecast temperature swing orthogonally)
+        "ecmwf_diurnal_range", "ecmwf_gefs_tmax_delta",
         # NBM
         "nbm_t10", "nbm_t25", "nbm_t50", "nbm_t75", "nbm_t90",
         "nbm_tmin", "nbm_pop12", "nbm_spread", "nbm_gefs_delta",

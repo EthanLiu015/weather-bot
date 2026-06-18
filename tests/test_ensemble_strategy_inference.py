@@ -127,3 +127,49 @@ def test_compute_fair_value_returns_raw_prob_when_no_calibrator():
     )
 
     assert result["cal_prob"] == pytest.approx(result["raw_prob"], abs=1e-6)
+
+
+# ── ecmwf_offset shifts residual predictions to absolute temperature scale ────
+
+def test_ecmwf_offset_shifts_probability_to_absolute_scale():
+    """NGBoost predicts correction ~0; ecmwf_offset converts it to absolute scale.
+
+    If NGBoost predicts residual mu=5.0 and ecmwf_offset=80.0 → absolute mu=85.0.
+    P(tmax > 85 | mu=85, sigma=3) ≈ 0.5, matching a zero-offset model at threshold=5.
+    """
+    ngb_residual = _make_ngboost(mu=5.0, sigma=3.0)   # correction model
+    ngb_absolute = _make_ngboost(mu=85.0, sigma=3.0)  # reference absolute model
+    threshold = 85.0
+    ecmwf_tmax = 80.0
+    X = _make_X()
+
+    result_with_offset = EnsembleStrategy._compute_fair_value(
+        X=X, ngboost_model=ngb_residual, qrf_model=None,
+        residual_model=None, blender=None, calibrator=None,
+        threshold=threshold, ecmwf_offset=ecmwf_tmax,
+    )
+    result_absolute = EnsembleStrategy._compute_fair_value(
+        X=X, ngboost_model=ngb_absolute, qrf_model=None,
+        residual_model=None, blender=None, calibrator=None,
+        threshold=threshold, ecmwf_offset=0.0,
+    )
+
+    assert result_with_offset["raw_prob"] == pytest.approx(result_absolute["raw_prob"], abs=0.001)
+
+
+def test_ecmwf_offset_zero_preserves_existing_behaviour():
+    """ecmwf_offset=0.0 must not change the output for backward compatibility."""
+    ngb = _make_ngboost(mu=72.0, sigma=3.0)
+    X = _make_X()
+
+    result_default = EnsembleStrategy._compute_fair_value(
+        X=X, ngboost_model=ngb, qrf_model=None,
+        residual_model=None, blender=None, calibrator=None, threshold=72.0,
+    )
+    result_explicit_zero = EnsembleStrategy._compute_fair_value(
+        X=X, ngboost_model=ngb, qrf_model=None,
+        residual_model=None, blender=None, calibrator=None,
+        threshold=72.0, ecmwf_offset=0.0,
+    )
+
+    assert result_default["raw_prob"] == pytest.approx(result_explicit_zero["raw_prob"], abs=1e-6)
