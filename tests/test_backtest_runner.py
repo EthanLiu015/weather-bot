@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from backtest.report import FoldResult
-from backtest.runner import BacktestRunner
+from backtest.runner import BacktestRunner, RESIDUAL_SIGMA_FLOOR
 
 
 def _make_settings():
@@ -181,3 +181,42 @@ def test_get_market_mid_returns_none_at_exact_boundary():
     result = runner._get_market_mid("KNYC", date(2023, 6, 1), threshold=75.1)
 
     assert result is None
+
+
+# ── Forecast noise includes ecmwf_diurnal_range ───────────────────────────────
+
+def test_add_forecast_noise_perturbs_ecmwf_diurnal_range():
+    """ecmwf_diurnal_range is ECMWF-derived; it must receive noise like other ECMWF features."""
+    runner = _make_runner()
+    rng = np.random.default_rng(1)
+    n = 20
+    dates = pd.date_range("2023-06-01", periods=n, freq="D").date
+    meta = pd.DataFrame({
+        "date": dates,
+        "station": "KNYC",
+        "lead_hour": 24,
+    })
+    avail_cols = ["gefs_tmax_mean", "ecmwf_diurnal_range"]
+    X = pd.DataFrame({
+        "gefs_tmax_mean": rng.normal(72, 3, n),
+        "ecmwf_diurnal_range": np.full(n, 15.0),
+    })
+
+    X_noisy = runner._add_forecast_noise(X, meta, avail_cols)
+
+    assert not np.allclose(X_noisy["ecmwf_diurnal_range"].values, 15.0), (
+        "ecmwf_diurnal_range should be perturbed by forecast noise"
+    )
+
+
+# ── Residual sigma floor ──────────────────────────────────────────────────────
+
+def test_residual_sigma_floor_constant_is_at_least_two_degrees():
+    """Floor prevents overconfident Kelly sizing after residual reframing shrinks sigma."""
+    assert RESIDUAL_SIGMA_FLOOR >= 2.0
+
+
+def test_residual_sigma_floor_matches_inference_floor():
+    """Backtest and inference must use the same floor to keep calibration consistent."""
+    from strategies.ensemble_strategy import RESIDUAL_SIGMA_FLOOR as INFERENCE_FLOOR
+    assert RESIDUAL_SIGMA_FLOOR == INFERENCE_FLOOR

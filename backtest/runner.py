@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 # when estimating CRPS for NGBoost/QRF blend weights (see windowed_mean_score).
 BLEND_VALIDATION_WINDOWS = 3
 
+# Minimum predicted sigma (°F) applied after residual reframing shrinks the
+# target distribution from ~18°F to ~5°F std. Must match RESIDUAL_SIGMA_FLOOR
+# in strategies/ensemble_strategy.py so backtest and live inference are consistent.
+RESIDUAL_SIGMA_FLOOR = 2.0
+
 
 class BacktestRunner:
     def __init__(
@@ -99,37 +104,46 @@ class BacktestRunner:
         X_test = test_df[avail_cols].fillna(0.0)
         y_test = test_df[target_col]
 
+        # Residual reframing: ecmwf_tmax is an inference-time offset, not a feature.
+        # Models train on (actual_tmax - ecmwf_tmax); ecmwf_test converts back at eval.
+        ecmwf_train = train_df["ecmwf_tmax"].fillna(train_df["ecmwf_tmax"].mean()).values
+        ecmwf_test = test_df["ecmwf_tmax"].fillna(test_df["ecmwf_tmax"].mean()).values
+        y_train_residual = pd.Series(y_train.values - ecmwf_train, index=y_train.index)
+
         # Add forecast-error noise to ERA5-derived temperature features during training.
         # ERA5 reanalysis is near-perfect; real GEFS/ECMWF forecasts have uncertainty.
         # Noise std by lead bucket (°F): D1-2≈3°F, D3-4≈5°F, D5-7≈7°F
         X_train = self._add_forecast_noise(X_train, train_df, avail_cols)
 
         ngb = NGBoostTemperatureModel(n_estimators=200, learning_rate=0.05)
-        ngb.fit(X_train, y_train)
-        mu_test, sigma_test = ngb.predict_distribution(X_test)
+        ngb.fit(X_train, y_train_residual)
+        mu_corr_test, sigma_test = ngb.predict_distribution(X_test)
 
-        # Apply residual correction: train ResidualModel on NGBoost residuals
-        mu_train, _ = ngb.predict_distribution(X_train)
-        residuals_train = y_train.values - mu_train
+        # ResidualModel corrects NGBoost's own residual errors. Both y_train_residual
+        # and mu_corr_train are in residual space, so residuals_train is the
+        # second-order correction (added in absolute space via ecmwf offset below).
+        mu_corr_train, sigma_corr_train = ngb.predict_distribution(X_train)
+        residuals_train = y_train_residual.values - mu_corr_train
         res_model = ResidualModel(station="all")
         res_model.fit(X_train, pd.Series(residuals_train, index=y_train.index))
-        mu_test = mu_test + res_model.predict(X_test)
+        mu_corr_test = mu_corr_test + res_model.predict(X_test)
 
-        # Blend with QRF using out-of-fold log-score weighting, averaged over
-        # several held-out windows (BLEND_VALIDATION_WINDOWS) rather than a
-        # single trailing slice, so weights are less sensitive to any one period.
+        # Blend with QRF using out-of-fold log-score weighting on residual targets
+        # so CRPS values are comparable between NGBoost and QRF (same units).
         val_n = max(30, int(len(X_train) * 0.15))
         X_val_ngb = X_train.iloc[-val_n:]
-        y_val_ngb = y_train.iloc[-val_n:]
+        y_val_ngb = y_train_residual.iloc[-val_n:]
         ngb_log_score = ngb.crps(X_val_ngb, y_val_ngb, n_windows=BLEND_VALIDATION_WINDOWS)
-        mu_test, sigma_test = self._fit_qrf_and_blend(
+        mu_blended_residual, sigma_test = self._fit_qrf_and_blend(
             X_train=X_train,
-            y_train=y_train,
+            y_train=y_train_residual,
             X_test=X_test,
-            ngb_mu=mu_test,
+            ngb_mu=mu_corr_test,
             ngb_sigma=sigma_test,
             ngb_log_score=ngb_log_score,
         )
+        # Shift blended residual predictions to absolute temperature scale
+        mu_test = mu_blended_residual + ecmwf_test
 
         # Widen sigma when ensemble members cluster tightly (overconfidence signal)
         if "gefs_tmax_std" in X_test.columns and "gefs_tmax_range" in X_test.columns:
@@ -140,13 +154,25 @@ class BacktestRunner:
                 range_arr=X_test["gefs_tmax_range"].fillna(0).values,
             )
 
+        # Apply minimum sigma floor: residual reframing shrinks target std from
+        # ~18°F to ~5°F, which can produce overconfident distributions.
+        sigma_test = np.maximum(sigma_test, RESIDUAL_SIGMA_FLOOR)
+
         # ── Forecast skill metrics use a single global threshold ──────────────
+        # NGBoost now predicts residuals; compute calibration probs in absolute space
+        # using the blended absolute mu rather than calling predict_prob_above directly.
+        from scipy.stats import norm as _norm_fold
         global_threshold = float(y_train.mean())
-        prob_forecasts = ngb.predict_prob_above(X_test, global_threshold)
+        prob_forecasts = 1.0 - _norm_fold.cdf(
+            global_threshold, loc=mu_test, scale=np.maximum(sigma_test, 0.01)
+        )
         outcomes = (y_test > global_threshold).astype(float).values
 
         calibrator = IsotonicCalibrator()
-        prob_train = ngb.predict_prob_above(X_train, global_threshold)
+        mu_train_abs_cal = mu_corr_train + ecmwf_train
+        prob_train = 1.0 - _norm_fold.cdf(
+            global_threshold, loc=mu_train_abs_cal, scale=np.maximum(sigma_corr_train, 0.01)
+        )
         outcomes_train = (y_train > global_threshold).astype(float).values
         calibrator.fit(prob_train, outcomes_train)
         cal_probs = calibrator._iso.predict(prob_forecasts) if calibrator._iso is not None else prob_forecasts
@@ -199,7 +225,10 @@ class BacktestRunner:
             ))
             for _, row in d1_test.iterrows()  # only D1 rows in test; use training analogue
         ])
-        mu_train_pred, sigma_train_pred = ngb.predict_distribution(X_train[avail_cols])
+        # mu_corr_train is in residual space; add ecmwf_train to get absolute predictions
+        # for the trade calibrator (thresholds are absolute temperatures).
+        mu_train_pred = mu_corr_train + ecmwf_train
+        sigma_train_pred = sigma_corr_train
         train_row_thresholds = np.array([
             float(station_month_median.get(
                 (row["station"], pd.to_datetime(row["date"]).month),
@@ -395,7 +424,7 @@ class BacktestRunner:
         Falls back to lead-time-scaled Gaussian when distributions unavailable.
         """
         TEMP_COLS = [c for c in avail_cols if any(
-            k in c for k in ("gefs_tmax", "gefs_tmin", "ecmwf_tmax", "ecmwf_tmin", "nbm_t")
+            k in c for k in ("gefs_tmax", "gefs_tmin", "ecmwf_tmax", "ecmwf_tmin", "ecmwf_diurnal", "nbm_t")
         )]
         if not TEMP_COLS or "lead_hour" not in meta_df.columns:
             return X

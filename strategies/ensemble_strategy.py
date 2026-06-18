@@ -5,6 +5,12 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm as _scipy_norm
 
+# Minimum predicted sigma (°F) after residual reframing. Residual targets have
+# std ~5°F vs ~18°F absolute; models can produce near-zero sigma on easy cases.
+# This floor prevents overconfident Kelly sizing on any single forecast.
+# Must match RESIDUAL_SIGMA_FLOOR in backtest/runner.py.
+RESIDUAL_SIGMA_FLOOR = 2.0
+
 from ingestion.asos import fetch_daily_tmax_history
 from ingestion.gefs import fetch_latest_gefs_run, detect_new_run, FORECAST_HOURS
 from ingestion.ecmwf import fetch_latest_ecmwf_run
@@ -117,6 +123,11 @@ class EnsembleStrategy:
             std_arr = X["gefs_tmax_std"].fillna(0).values
             range_arr = X["gefs_tmax_range"].fillna(0).values
             _, sigma = apply_spread_inflation_from_stats(mu, sigma, std_arr, range_arr)
+
+        # Enforce minimum sigma: residual reframing shrinks the target std from
+        # ~18°F to ~5°F, which can produce overconfident distributions on easy
+        # forecasts and drive excessive Kelly bet sizing.
+        sigma = np.maximum(sigma, RESIDUAL_SIGMA_FLOOR)
 
         raw_prob = float(1.0 - _scipy_norm.cdf(threshold, loc=mu[0], scale=max(sigma[0], 0.01)))
 

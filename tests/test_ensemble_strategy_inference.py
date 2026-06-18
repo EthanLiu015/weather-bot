@@ -5,7 +5,7 @@ import pytest
 from scipy.stats import norm
 from unittest.mock import MagicMock
 
-from strategies.ensemble_strategy import EnsembleStrategy
+from strategies.ensemble_strategy import EnsembleStrategy, RESIDUAL_SIGMA_FLOOR
 
 
 def _make_X(gefs_std: float = 3.0, gefs_range: float = 10.0) -> pd.DataFrame:
@@ -155,6 +155,31 @@ def test_ecmwf_offset_shifts_probability_to_absolute_scale():
     )
 
     assert result_with_offset["raw_prob"] == pytest.approx(result_absolute["raw_prob"], abs=0.001)
+
+
+def test_compute_fair_value_enforces_sigma_floor():
+    """Residual models can produce unrealistically tight sigma; floor prevents it."""
+    ngb_tight = _make_ngboost(mu=0.0, sigma=0.1)   # sigma << floor
+    ngb_floor = _make_ngboost(mu=0.0, sigma=RESIDUAL_SIGMA_FLOOR)
+    X = _make_X()
+    threshold = 2.0
+
+    result_tight = EnsembleStrategy._compute_fair_value(
+        X=X, ngboost_model=ngb_tight, qrf_model=None,
+        residual_model=None, blender=None, calibrator=None, threshold=threshold,
+    )
+    result_floor = EnsembleStrategy._compute_fair_value(
+        X=X, ngboost_model=ngb_floor, qrf_model=None,
+        residual_model=None, blender=None, calibrator=None, threshold=threshold,
+    )
+
+    assert result_tight["raw_prob"] == pytest.approx(result_floor["raw_prob"], abs=0.01), (
+        "sigma=0.1 should be clipped to RESIDUAL_SIGMA_FLOOR before probability computation"
+    )
+
+
+def test_residual_sigma_floor_is_at_least_two_degrees():
+    assert RESIDUAL_SIGMA_FLOOR >= 2.0, "Floor must be ≥ 2°F to prevent overconfident Kelly sizing"
 
 
 def test_ecmwf_offset_zero_preserves_existing_behaviour():
