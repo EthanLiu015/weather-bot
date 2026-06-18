@@ -231,14 +231,8 @@ def build_feature_rows(
             tcc_pct  = float(tcc) * 100.0 if not np.isnan(tcc) else float("nan")
             dp_dep   = t2m_f - d2m_f if not (np.isnan(t2m_f) or np.isnan(d2m_f)) else float("nan")
 
-            # Cloud fractions
-            if not np.isnan(tcc):
-                cloud_total = min(max(float(tcc), 0.0), 1.0)
-                cloud_low   = cloud_total * 0.5
-                cloud_mid   = cloud_total * 0.3
-                cloud_high  = cloud_total * 0.2
-            else:
-                cloud_total = cloud_low = cloud_mid = cloud_high = float("nan")
+            # Cloud cover total
+            cloud_total = min(max(float(tcc), 0.0), 1.0) if not np.isnan(tcc) else float("nan")
 
             # Spread proxies from ±SPREAD_WINDOW_HOURS of ERA5 (already in °F)
             sp_f = _spread_proxy(era5_ts, closest_time, "t2m", SPREAD_WINDOW_HOURS)
@@ -314,9 +308,6 @@ def build_feature_rows(
                 "nbm_spread": float("nan"), "nbm_gefs_delta": float("nan"),
                 # Atmospheric
                 "cloud_cover_total":          cloud_total,
-                "cloud_low_frac":             cloud_low,
-                "cloud_mid_frac":             cloud_mid,
-                "cloud_high_frac":            cloud_high,
                 "surface_wind_speed":         wind,
                 "wind_dir_sin":               wdir_sin,
                 "wind_dir_cos":               wdir_cos,

@@ -187,8 +187,9 @@ def build_feature_matrix(
 
             gefs = _aggregate_members(member_list)
 
-            # Cloud fractions from raw TCC
-            cloud_total, cloud_low, cloud_mid, cloud_high = _cloud_fractions(gefs["cloud_cover_raw"])
+            # Cloud cover from raw TCC
+            tcc = gefs["cloud_cover_raw"]
+            cloud_total = float("nan") if np.isnan(tcc) else min(max(float(tcc) / 100.0, 0.0), 1.0)
 
             # ECMWF — per-day lookup
             lead_day = max(1, round(lead_hour / 24))
@@ -299,9 +300,6 @@ def build_feature_matrix(
                 **nbm_row,
                 # Cloud
                 "cloud_cover_total":      cloud_total,
-                "cloud_low_frac":         cloud_low,
-                "cloud_mid_frac":         cloud_mid,
-                "cloud_high_frac":        cloud_high,
                 # Wind
                 "surface_wind_speed":     gefs["surface_wind_speed"],
                 "wind_dir_sin":           gefs["wind_dir_sin"],
@@ -344,7 +342,7 @@ def get_feature_columns() -> list[str]:
         "nbm_t10", "nbm_t25", "nbm_t50", "nbm_t75", "nbm_t90",
         "nbm_tmin", "nbm_pop12", "nbm_spread", "nbm_gefs_delta",
         # Cloud
-        "cloud_cover_total", "cloud_low_frac", "cloud_mid_frac", "cloud_high_frac",
+        "cloud_cover_total",
         # Wind
         "surface_wind_speed", "wind_dir_sin", "wind_dir_cos", "onshore_wind_component",
         # Moisture

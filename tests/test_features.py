@@ -188,13 +188,17 @@ def test_feature_matrix_has_no_regime_cluster_columns():
 def test_get_feature_columns_returns_list():
     cols = get_feature_columns()
     assert isinstance(cols, list)
-    assert len(cols) == 43
+    assert len(cols) == 40
     assert "nbm_t50" in cols
     assert "gefs_tmax_iqr" in cols
     assert "gefs_ensemble_kurtosis" in cols
     assert "nbm_gefs_delta" in cols
     assert not any(c.startswith("regime_cluster") for c in cols)
     assert not any(c.startswith("station_k") for c in cols)
+    assert "cloud_cover_total" in cols
+    assert "cloud_low_frac" not in cols
+    assert "cloud_mid_frac" not in cols
+    assert "cloud_high_frac" not in cols
     assert "gefs_tmin_mean" not in cols
     assert "gefs_tmin_std" not in cols
     assert "total_precip_mm" not in cols
