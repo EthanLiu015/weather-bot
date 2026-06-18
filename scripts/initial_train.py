@@ -56,13 +56,15 @@ def train_final_models(df: pd.DataFrame) -> None:
     from backtest.runner import BLEND_VALIDATION_WINDOWS
 
     feature_cols = get_feature_columns()
-    target_col = "actual_tmax"
 
-    if target_col not in df.columns:
+    if "actual_tmax" not in df.columns:
         logger.error("No 'actual_tmax' column in feature data")
         return
+    if "ecmwf_tmax" not in df.columns:
+        logger.error("No 'ecmwf_tmax' column — required for residual reframing")
+        return
 
-    logger.info("=== Training final models ===")
+    logger.info("=== Training final models (residual reframing: target = actual_tmax - ecmwf_tmax) ===")
     CALIBRATOR_DIR.mkdir(parents=True, exist_ok=True)
 
     blender = ModelBlender()
@@ -78,13 +80,16 @@ def train_final_models(df: pd.DataFrame) -> None:
         station_df = df[df["station"] == station].copy()
         avail_cols = [c for c in feature_cols if c in station_df.columns]
         X_st = station_df[avail_cols].fillna(0.0)
-        y_st = station_df[target_col]
+        # Residual reframing: train on correction, not absolute temperature.
+        # ecmwf_tmax is added back as an inference-time offset in _compute_fair_value.
+        y_st = station_df["actual_tmax"] - station_df["ecmwf_tmax"]
 
         if len(X_st) < 200:
             logger.warning("Skipping %s — only %d rows", station, len(X_st))
             continue
 
-        logger.info("--- %s: %d rows ---", station, len(X_st))
+        logger.info("--- %s: %d rows, residual std=%.2f°F ---",
+                    station, len(X_st), float(y_st.std()))
 
         # NGBoost
         ngb = NGBoostTemperatureModel(n_estimators=500, learning_rate=0.01)
@@ -122,7 +127,9 @@ def train_final_models(df: pd.DataFrame) -> None:
         logger.info("Held-out CRPS %s: NGBoost=%.4f QRF=%.4f",
                      station, ngb_crps_oos[station], qrf_crps_oos[station])
 
-        # Residual model (LightGBM)
+        # Residual model (LightGBM) corrects the NGBoost's own residual errors.
+        # y_st and mu_pred are both in residual space, so residuals is the
+        # second-order correction (added in absolute space at inference).
         residual_feature_cols = [c for c in [
             "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
             "obs_minus_model_roll_mean", "obs_minus_model_roll_std",
@@ -137,7 +144,8 @@ def train_final_models(df: pd.DataFrame) -> None:
             save_artifact(res_model, "residual", station)
             logger.info("Residual model saved for %s (mean_residual=%.2f°F)", station, residuals.mean())
 
-        # Isotonic calibration per lead bucket
+        # Isotonic calibration per lead bucket — operate in residual space so
+        # the calibrator sees the same distribution as the model's raw output.
         for lead_bucket, lh_min, lh_max in [("D1-2", 0, 48), ("D3-4", 49, 96), ("D5-7", 97, 999)]:
             mask = (station_df["lead_hour"] >= lh_min) & (station_df["lead_hour"] <= lh_max)
             sub = station_df[mask]
@@ -146,7 +154,7 @@ def train_final_models(df: pd.DataFrame) -> None:
                 continue
 
             X_sub = sub[avail_cols].fillna(0.0)
-            y_sub = sub[target_col]
+            y_sub = sub["actual_tmax"] - sub["ecmwf_tmax"]
             threshold = float(y_sub.median())
             raw_probs = ngb.predict_prob_above(X_sub, threshold)
             outcomes = (y_sub > threshold).astype(float).values
