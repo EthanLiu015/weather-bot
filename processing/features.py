@@ -277,6 +277,44 @@ def build_feature_matrix(
                 gefs["wind_dir_sin"], gefs["wind_dir_cos"], meta.get("onshore_bearing_deg")
             )
 
+            # ── Engineered delta / spread / acceleration features ──────────
+            nbm_t50_val = nbm_row["nbm_t50"]
+            gefs_ecmwf_delta_signed = (
+                gefs_mean - ecmwf_tmax
+                if not (np.isnan(gefs_mean) or np.isnan(ecmwf_tmax))
+                else float("nan")
+            )
+            nbm_ecmwf_delta_signed = (
+                nbm_t50_val - ecmwf_tmax
+                if not (np.isnan(nbm_t50_val) or np.isnan(ecmwf_tmax))
+                else float("nan")
+            )
+            _valid_temps = [t for t in [ecmwf_tmax, nbm_t50_val, gefs_mean] if not np.isnan(t)]
+            multi_model_spread = (
+                max(_valid_temps) - min(_valid_temps) if len(_valid_temps) >= 2 else float("nan")
+            )
+            ecmwf_climo_anomaly = (
+                ecmwf_tmax - climo_normal
+                if not (np.isnan(ecmwf_tmax) or np.isnan(climo_normal))
+                else float("nan")
+            )
+            gefs_spread_per_lead = (
+                gefs["gefs_tmax_std"] / lead_time_sqrt
+                if (not np.isnan(gefs["gefs_tmax_std"]) and lead_time_sqrt > 0)
+                else float("nan")
+            )
+            nbm_spread_val = nbm_row["nbm_spread"]
+            nbm_spread_per_lead = (
+                nbm_spread_val / lead_time_sqrt
+                if (not np.isnan(nbm_spread_val) and lead_time_sqrt > 0)
+                else float("nan")
+            )
+            obs_minus_model_accel = (
+                lag1 - lag3
+                if not (np.isnan(lag1) or np.isnan(lag3))
+                else float("nan")
+            )
+
             row: dict = {
                 "station":   station,
                 "lead_hour": lead_hour,
@@ -321,6 +359,14 @@ def build_feature_matrix(
                 "obs_minus_model_lag3":   lag3,
                 "obs_minus_model_roll_mean": roll_mean,
                 "obs_minus_model_roll_std":  roll_std,
+                # Engineered: signed deltas, cross-model spread, normalized spread, accel
+                "gefs_ecmwf_delta_signed":  gefs_ecmwf_delta_signed,
+                "nbm_ecmwf_delta_signed":   nbm_ecmwf_delta_signed,
+                "multi_model_spread":       multi_model_spread,
+                "ecmwf_climo_anomaly":      ecmwf_climo_anomaly,
+                "gefs_spread_per_lead":     gefs_spread_per_lead,
+                "nbm_spread_per_lead":      nbm_spread_per_lead,
+                "obs_minus_model_accel":    obs_minus_model_accel,
             }
 
             rows.append(row)
@@ -354,4 +400,8 @@ def get_feature_columns() -> list[str]:
         # Residual lags + rolling stats
         "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
         "obs_minus_model_roll_mean", "obs_minus_model_roll_std",
+        # Engineered: signed deltas, cross-model spread, normalized spread, accel
+        "gefs_ecmwf_delta_signed", "nbm_ecmwf_delta_signed", "multi_model_spread",
+        "ecmwf_climo_anomaly", "gefs_spread_per_lead", "nbm_spread_per_lead",
+        "obs_minus_model_accel",
     ]

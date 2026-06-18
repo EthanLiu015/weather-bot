@@ -326,6 +326,27 @@ def build_feature_rows(
                 "obs_minus_model_lag3": lag3,
                 "obs_minus_model_roll_mean": roll_mean,
                 "obs_minus_model_roll_std": roll_std,
+                # Engineered: signed deltas, cross-model spread, normalized spread, accel
+                # (ecmwf_tmax == gefs_tmax_mean == t2m_f in historical, so signed delta = 0)
+                "gefs_ecmwf_delta_signed": 0.0 if not np.isnan(t2m_f) else float("nan"),
+                "nbm_ecmwf_delta_signed":  float("nan"),  # NBM unavailable historically
+                "multi_model_spread":      float("nan"),  # only 1 model available historically
+                "ecmwf_climo_anomaly": (
+                    t2m_f - climo_normal
+                    if not (np.isnan(t2m_f) or np.isnan(climo_normal))
+                    else float("nan")
+                ),
+                "gefs_spread_per_lead": (
+                    sp_f["std"] / lead_time_sqrt
+                    if (not np.isnan(sp_f["std"]) and lead_time_sqrt > 0)
+                    else float("nan")
+                ),
+                "nbm_spread_per_lead": float("nan"),  # NBM spread unavailable historically
+                "obs_minus_model_accel": (
+                    lag1 - lag3
+                    if not (np.isnan(lag1) or np.isnan(lag3))
+                    else float("nan")
+                ),
             }
 
             rows.append(row)

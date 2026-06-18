@@ -188,7 +188,7 @@ def test_feature_matrix_has_no_regime_cluster_columns():
 def test_get_feature_columns_returns_list():
     cols = get_feature_columns()
     assert isinstance(cols, list)
-    assert len(cols) == 40
+    assert len(cols) == 47
     assert "nbm_t50" in cols
     assert "gefs_tmax_iqr" in cols
     assert "gefs_ensemble_kurtosis" in cols
@@ -212,3 +212,91 @@ def test_get_feature_columns_returns_list():
     assert "onshore_wind_component" in cols
     assert "obs_minus_model_roll_mean" in cols
     assert "obs_minus_model_roll_std" in cols
+    assert "nbm_ecmwf_delta_signed" in cols
+    assert "gefs_ecmwf_delta_signed" in cols
+    assert "multi_model_spread" in cols
+    assert "ecmwf_climo_anomaly" in cols
+    assert "gefs_spread_per_lead" in cols
+    assert "nbm_spread_per_lead" in cols
+    assert "obs_minus_model_accel" in cols
+
+
+# ── engineered feature behaviour ─────────────────────────────────────────────
+
+def _make_gefs_deterministic(station: str, lead_hours: list[int], temp_f: float = 72.0) -> dict:
+    """Single-temp GEFS so gefs_tmax_mean == temp_f and gefs_tmax_std ≈ 0."""
+    members = [dict(_make_member(temp_f), member=f"p{i:02d}") for i in range(5)]
+    return {station: {lh: members for lh in lead_hours}}
+
+
+def test_gefs_ecmwf_delta_signed_is_gefs_minus_ecmwf():
+    gefs = _make_gefs_deterministic("KORD", [24], temp_f=75.0)
+    ecmwf = {"KORD": {"tmax_forecast": 70.0, "tmin_forecast": 60.0}}
+    df = build_feature_matrix(gefs_data=gefs, ecmwf_data=ecmwf, asos_history=pd.DataFrame())
+    row = df.iloc[0]
+    expected = row["gefs_tmax_mean"] - row["ecmwf_tmax"]
+    assert row["gefs_ecmwf_delta_signed"] == pytest.approx(expected, abs=0.1)
+
+
+def test_nbm_ecmwf_delta_signed_is_nbm_t50_minus_ecmwf():
+    gefs = _make_gefs_deterministic("KORD", [24], temp_f=70.0)
+    ecmwf = {"KORD": {"tmax_forecast": 68.0, "tmin_forecast": 55.0}}
+    nbm = {"KORD": {24: {"t10": 65.0, "t25": 67.0, "t50": 73.0, "t75": 76.0,
+                          "t90": 79.0, "tmax": 80.0, "tmin": 61.0, "pop12": 0.0, "spread": 14.0}}}
+    df = build_feature_matrix(gefs_data=gefs, ecmwf_data=ecmwf, asos_history=pd.DataFrame(), nbm_data=nbm)
+    row = df.iloc[0]
+    assert row["nbm_ecmwf_delta_signed"] == pytest.approx(73.0 - 68.0, abs=0.01)
+
+
+def test_multi_model_spread_is_range_across_all_three_models():
+    gefs = _make_gefs_deterministic("KORD", [24], temp_f=70.0)
+    ecmwf = {"KORD": {"tmax_forecast": 65.0, "tmin_forecast": 55.0}}
+    nbm = {"KORD": {24: {"t10": 60.0, "t25": 62.0, "t50": 75.0, "t75": 78.0,
+                          "t90": 80.0, "tmax": 81.0, "tmin": 58.0, "pop12": 0.0, "spread": 20.0}}}
+    df = build_feature_matrix(gefs_data=gefs, ecmwf_data=ecmwf, asos_history=pd.DataFrame(), nbm_data=nbm)
+    row = df.iloc[0]
+    # ecmwf=65, gefs≈70, nbm_t50=75 → spread = 75 - 65 = 10
+    assert row["multi_model_spread"] == pytest.approx(
+        max(row["ecmwf_tmax"], row["nbm_t50"], row["gefs_tmax_mean"])
+        - min(row["ecmwf_tmax"], row["nbm_t50"], row["gefs_tmax_mean"]),
+        abs=0.1,
+    )
+
+
+def test_ecmwf_climo_anomaly_present_and_signed():
+    gefs = _make_gefs_deterministic("KORD", [24], temp_f=95.0)
+    ecmwf = {"KORD": {"tmax_forecast": 95.0, "tmin_forecast": 75.0}}
+    df = build_feature_matrix(gefs_data=gefs, ecmwf_data=ecmwf, asos_history=pd.DataFrame())
+    row = df.iloc[0]
+    assert "ecmwf_climo_anomaly" in df.columns
+    # 95°F in summer should be a positive anomaly for KORD
+    assert not np.isnan(row["ecmwf_climo_anomaly"])
+
+
+def test_gefs_spread_per_lead_normalizes_std_by_sqrt_lead():
+    gefs = _make_gefs("KORD", [24, 96])
+    ecmwf = {"KORD": {}}
+    df = build_feature_matrix(gefs_data=gefs, ecmwf_data=ecmwf, asos_history=pd.DataFrame())
+    for _, row in df.iterrows():
+        expected = row["gefs_tmax_std"] / np.sqrt(row["lead_hour"])
+        assert row["gefs_spread_per_lead"] == pytest.approx(expected, abs=0.001)
+
+
+def test_nbm_spread_per_lead_normalizes_spread_by_sqrt_lead():
+    gefs = _make_gefs("KORD", [24, 96])
+    ecmwf = {"KORD": {}}
+    nbm = {"KORD": {
+        24:  {"t10": 65.0, "t25": 68.0, "t50": 72.0, "t75": 76.0, "t90": 79.0,
+              "tmax": 80.0, "tmin": 62.0, "pop12": 0.1, "spread": 14.0},
+        96:  {"t10": 60.0, "t25": 64.0, "t50": 70.0, "t75": 76.0, "t90": 82.0,
+              "tmax": 83.0, "tmin": 58.0, "pop12": 0.2, "spread": 22.0},
+    }}
+    df = build_feature_matrix(gefs_data=gefs, ecmwf_data=ecmwf, asos_history=pd.DataFrame(), nbm_data=nbm)
+    for _, row in df.iterrows():
+        expected = row["nbm_spread"] / np.sqrt(row["lead_hour"])
+        assert row["nbm_spread_per_lead"] == pytest.approx(expected, abs=0.001)
+
+
+def test_obs_minus_model_accel_is_lag1_minus_lag3():
+    cols = get_feature_columns()
+    assert "obs_minus_model_accel" in cols
