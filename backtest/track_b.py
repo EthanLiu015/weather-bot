@@ -10,13 +10,21 @@ def simulate_pnl(
     outcomes: np.ndarray,
     min_edge: float = 0.04,
     contract_usd: float = 1.0,
+    contract_sizes: np.ndarray | None = None,
 ) -> dict:
+    """Simulate P&L for a set of forecasts against market prices.
+
+    Args:
+        contract_sizes: Optional per-row contract sizes in USD. When provided,
+            each trade uses `contract_sizes[i]` instead of the flat `contract_usd`.
+            Pass Kelly-computed sizes here to simulate realistic production sizing.
+    """
     total_pnl = 0.0
     num_trades = 0
     num_wins = 0
     edges = []
 
-    for prob, mid, outcome in zip(model_probs, market_mids, outcomes):
+    for i, (prob, mid, outcome) in enumerate(zip(model_probs, market_mids, outcomes)):
         edge = abs(prob - mid)
         if edge < min_edge:
             continue
@@ -24,15 +32,17 @@ def simulate_pnl(
         num_trades += 1
         edges.append(edge)
 
+        size = float(contract_sizes[i]) if contract_sizes is not None else contract_usd
+
         if prob > mid:
             # Buy Yes at mid
-            pnl = contract_usd * (outcome - mid)
+            pnl = size * (outcome - mid)
         else:
             # Buy No: outcome=0 means Yes didn't resolve, so No pays out
             no_mid = 1.0 - mid
-            pnl = contract_usd * ((1.0 - outcome) - no_mid)
+            pnl = size * ((1.0 - outcome) - no_mid)
 
-        fee = FEE_RATE * contract_usd * mid
+        fee = FEE_RATE * size * mid
         pnl -= fee
         total_pnl += pnl
         if pnl > 0:

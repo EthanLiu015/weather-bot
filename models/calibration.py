@@ -2,6 +2,7 @@ import pickle
 import logging
 from pathlib import Path
 import numpy as np
+import pandas as pd
 from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import brier_score_loss
 from sklearn.linear_model import LinearRegression
@@ -91,3 +92,30 @@ class IsotonicCalibrator:
         instance._outcomes = data["outcomes"]
         instance._reliability_slope_val = data.get("reliability_slope")
         return instance
+
+
+_CALIBRATION_PERCENTILES = [5, 15, 25, 35, 50, 65, 75, 85, 95]
+
+
+def build_calibration_dataset(
+    ngb_model,
+    X: "pd.DataFrame",
+    y_residual: "pd.Series",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build calibrator training data spanning the full probability spectrum.
+
+    Evaluates the NGBoost model at 9 percentile-spaced thresholds of y_residual
+    rather than a single median threshold. This ensures the isotonic calibrator
+    has training coverage from ~0.05 to ~0.95 raw probabilities, matching the
+    range seen at inference when Kalshi thresholds fall far from the median.
+
+    Returns:
+        raw_probs: stacked probabilities across all thresholds, shape (9*n,)
+        outcomes:  corresponding binary outcomes, shape (9*n,)
+    """
+    thresholds = np.percentile(y_residual, _CALIBRATION_PERCENTILES)
+    prob_rows, outcome_rows = [], []
+    for thr in thresholds:
+        prob_rows.append(ngb_model.predict_prob_above(X, thr))
+        outcome_rows.append((y_residual.values > thr).astype(float))
+    return np.concatenate(prob_rows), np.concatenate(outcome_rows)

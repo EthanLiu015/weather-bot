@@ -50,7 +50,7 @@ def train_final_models(df: pd.DataFrame) -> None:
     from models.ngboost_model import NGBoostTemperatureModel
     from models.qrf_model import QRFTemperatureModel
     from models.residual_model import ResidualModel
-    from models.calibration import IsotonicCalibrator
+    from models.calibration import IsotonicCalibrator, build_calibration_dataset
     from models.blend import ModelBlender
     from models.registry import save_artifact
     from backtest.runner import BLEND_VALIDATION_WINDOWS
@@ -155,9 +155,10 @@ def train_final_models(df: pd.DataFrame) -> None:
 
             X_sub = sub[avail_cols].fillna(0.0)
             y_sub = sub["actual_tmax"] - sub["ecmwf_tmax"]
-            threshold = float(y_sub.median())
-            raw_probs = ngb.predict_prob_above(X_sub, threshold)
-            outcomes = (y_sub > threshold).astype(float).values
+            # Spectrum calibration: train over a grid of percentile thresholds so
+            # the calibrator covers the full [0.05, 0.95] raw-prob range seen at
+            # inference when Kalshi thresholds fall far from the residual median.
+            raw_probs, outcomes = build_calibration_dataset(ngb, X_sub, y_sub)
 
             cal = IsotonicCalibrator()
             cal.fit(raw_probs, outcomes)

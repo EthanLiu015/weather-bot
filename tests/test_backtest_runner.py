@@ -183,6 +183,170 @@ def test_get_market_mid_returns_none_at_exact_boundary():
     assert result is None
 
 
+# ── Per-station model training ───────────────────────────────────────────────
+
+def test_run_fold_calls_fit_qrf_and_blend_once_per_station():
+    """_run_fold must train a separate NGBoost+QRF per station, mirroring the
+    per-station loop in initial_train.py so backtest metrics reflect production."""
+    runner = _make_runner()
+    train_start = date(2020, 1, 1)
+    train_end = date(2022, 12, 31)
+    test_month = date(2023, 1, 1)
+
+    rng = np.random.default_rng(5)
+    n_per = 120
+    stations = ["KNYC", "KLAX"]
+
+    def _make_station_df(station, start, n):
+        return pd.DataFrame({
+            "date": pd.date_range(start, periods=n, freq="D").date,
+            "station": station,
+            "lead_hour": 24,
+            "actual_tmax": rng.normal(72, 4, n),
+            "ecmwf_tmax": rng.normal(70, 3, n),
+            "ecmwf_diurnal_range": np.full(n, 15.0),
+            "gefs_tmax_mean": rng.normal(71, 3, n),
+        })
+
+    train_df = pd.concat([
+        _make_station_df("KNYC", "2020-01-01", n_per),
+        _make_station_df("KLAX", "2020-01-01", n_per),
+    ], ignore_index=True)
+    test_df = pd.concat([
+        _make_station_df("KNYC", "2023-01-01", 10),
+        _make_station_df("KLAX", "2023-01-01", 10),
+    ], ignore_index=True)
+
+    call_count = {"n": 0}
+    original_fit_qrf = runner._fit_qrf_and_blend
+
+    def counting_fit(X_train, y_train, X_test, **kw):
+        call_count["n"] += 1
+        return original_fit_qrf(X_train, y_train, X_test, **kw)
+
+    def fake_load(start, end):
+        if end < test_month:
+            return train_df
+        return test_df
+
+    with patch.object(runner, "_load_historical_features", side_effect=fake_load), \
+         patch.object(runner, "_fit_qrf_and_blend", side_effect=counting_fit):
+        try:
+            runner._run_fold(train_start, train_end, test_month)
+        except Exception:
+            pass
+
+    assert call_count["n"] == len(stations), (
+        f"Expected _fit_qrf_and_blend called {len(stations)} times (once per station); "
+        f"got {call_count['n']}"
+    )
+
+
+def test_run_fold_skips_station_with_insufficient_train_data():
+    """Stations with < 100 training rows must be excluded without raising."""
+    runner = _make_runner()
+    train_start = date(2020, 1, 1)
+    train_end = date(2022, 12, 31)
+    test_month = date(2023, 1, 1)
+
+    rng = np.random.default_rng(7)
+
+    def _df(station, start, n, dr=15.0):
+        return pd.DataFrame({
+            "date": pd.date_range(start, periods=n, freq="D").date,
+            "station": station,
+            "lead_hour": 24,
+            "actual_tmax": rng.normal(72, 4, n),
+            "ecmwf_tmax": rng.normal(70, 3, n),
+            "ecmwf_diurnal_range": np.full(n, dr),
+            "gefs_tmax_mean": rng.normal(71, 3, n),
+        })
+
+    train_df = pd.concat([
+        _df("KNYC", "2020-01-01", 120),   # enough data
+        _df("KLAX", "2020-01-01", 50),    # too few → should be skipped
+    ], ignore_index=True)
+    test_df = pd.concat([
+        _df("KNYC", "2023-01-01", 10),
+        _df("KLAX", "2023-01-01", 10),
+    ], ignore_index=True)
+
+    def fake_load(start, end):
+        if end < test_month:
+            return train_df
+        return test_df
+
+    with patch.object(runner, "_load_historical_features", side_effect=fake_load):
+        try:
+            result = runner._run_fold(train_start, train_end, test_month)
+            assert result is not None
+        except Exception as e:
+            pytest.fail(f"_run_fold raised unexpectedly: {e}")
+
+
+# ── Zero ecmwf_diurnal_range rows excluded from training ─────────────────────
+
+def test_run_fold_excludes_zero_diurnal_range_from_training():
+    """Rows where ecmwf_diurnal_range=0 are ERA5 artefacts (tmax=tmin=t2m);
+    they must be filtered from training to prevent the model learning a spurious
+    zero-range signal that won't appear at inference time.
+    Uses 300 total rows so 150 non-zero rows survive both the diurnal-range
+    filter and the per-station 100-row minimum."""
+    runner = _make_runner()
+    train_start = date(2020, 1, 1)
+    train_end = date(2022, 12, 31)
+    test_month = date(2023, 1, 1)
+
+    rng = np.random.default_rng(42)
+    n_train = 300
+
+    # First half has diurnal_range=0 (ERA5 artefacts); second half is valid
+    train_df = pd.DataFrame({
+        "date": pd.date_range("2020-01-01", periods=n_train, freq="D").date,
+        "station": "KNYC",
+        "lead_hour": 24,
+        "actual_tmax": rng.normal(72, 4, n_train),
+        "ecmwf_tmax": rng.normal(70, 3, n_train),
+        "ecmwf_diurnal_range": np.where(np.arange(n_train) < 150, 0.0, 15.0),
+        "gefs_tmax_mean": rng.normal(71, 3, n_train),
+    })
+    test_df = pd.DataFrame({
+        "date": pd.date_range("2023-01-01", periods=10, freq="D").date,
+        "station": "KNYC",
+        "lead_hour": 24,
+        "actual_tmax": rng.normal(72, 4, 10),
+        "ecmwf_tmax": rng.normal(70, 3, 10),
+        "ecmwf_diurnal_range": np.full(10, 15.0),
+        "gefs_tmax_mean": rng.normal(71, 3, 10),
+    })
+
+    captured_X_trains = []
+
+    original_fit_qrf = runner._fit_qrf_and_blend
+
+    def capturing_fit(X_train, y_train, X_test, **kw):
+        captured_X_trains.append(X_train.copy())
+        return original_fit_qrf(X_train, y_train, X_test, **kw)
+
+    def fake_load(start, end):
+        if end < test_month:
+            return train_df
+        return test_df
+
+    with patch.object(runner, "_load_historical_features", side_effect=fake_load), \
+         patch.object(runner, "_fit_qrf_and_blend", side_effect=capturing_fit):
+        try:
+            runner._run_fold(train_start, train_end, test_month)
+        except Exception:
+            pass
+
+    assert captured_X_trains, "Expected _fit_qrf_and_blend to be called"
+    X_used = captured_X_trains[0]
+    assert len(X_used) <= 150, (
+        f"Zero diurnal_range rows should be excluded; got {len(X_used)} rows, expected ≤150"
+    )
+
+
 # ── Forecast noise includes ecmwf_diurnal_range ───────────────────────────────
 
 def test_add_forecast_noise_perturbs_ecmwf_diurnal_range():

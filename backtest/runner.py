@@ -10,7 +10,7 @@ from backtest.track_a import track_a_metrics
 from backtest.track_b import simulate_pnl
 from backtest.report import BacktestReport, FoldResult
 from models.ngboost_model import NGBoostTemperatureModel
-from models.calibration import IsotonicCalibrator
+from models.calibration import IsotonicCalibrator, _CALIBRATION_PERCENTILES
 from models.residual_model import ResidualModel
 from models.qrf_model import QRFTemperatureModel
 from models.blend import ModelBlender
@@ -90,6 +90,15 @@ class BacktestRunner:
         avail_cols = [c for c in feature_cols if c in train_df.columns]
         target_col = "actual_tmax"
 
+        # Filter ERA5 artefact rows where ecmwf_diurnal_range=0 (tmax=tmin=t2m_f historically).
+        # A constant-zero range is a learnable signal that marks ERA5, not real ECMWF forecasts.
+        if "ecmwf_diurnal_range" in train_df.columns:
+            before = len(train_df)
+            train_df = train_df[train_df["ecmwf_diurnal_range"] != 0.0]
+            dropped = before - len(train_df)
+            if dropped:
+                logger.debug("Fold %s: dropped %d zero-ecmwf_diurnal_range rows", test_month, dropped)
+
         if target_col not in train_df.columns:
             logger.warning("No target column in fold %s — skipping model training", test_month)
             return FoldResult(
@@ -99,64 +108,105 @@ class BacktestRunner:
                 num_simulated_trades=0, edge_above_threshold_pct=0.0,
             )
 
-        X_train = train_df[avail_cols].fillna(0.0)
-        y_train = train_df[target_col]
-        X_test = test_df[avail_cols].fillna(0.0)
-        y_test = test_df[target_col]
+        # ── Per-station model training ────────────────────────────────────────
+        # Train a separate NGBoost+QRF per station to mirror initial_train.py.
+        # Accumulate predictions into Series indexed by the global DataFrame
+        # index so they can be re-aligned with the full train/test DataFrames.
+        mu_test_s = pd.Series(np.nan, index=test_df.index, dtype=float)
+        sigma_test_s = pd.Series(np.nan, index=test_df.index, dtype=float)
+        mu_corr_train_s = pd.Series(np.nan, index=train_df.index, dtype=float)
+        sigma_corr_train_s = pd.Series(np.nan, index=train_df.index, dtype=float)
+        ecmwf_train_s = pd.Series(np.nan, index=train_df.index, dtype=float)
+        y_train_residual_s = pd.Series(np.nan, index=train_df.index, dtype=float)
 
-        # Residual reframing: ecmwf_tmax is an inference-time offset, not a feature.
-        # Models train on (actual_tmax - ecmwf_tmax); ecmwf_test converts back at eval.
-        ecmwf_train = train_df["ecmwf_tmax"].fillna(train_df["ecmwf_tmax"].mean()).values
-        ecmwf_test = test_df["ecmwf_tmax"].fillna(test_df["ecmwf_tmax"].mean()).values
-        y_train_residual = pd.Series(y_train.values - ecmwf_train, index=y_train.index)
+        for station in train_df["station"].unique():
+            st_train = train_df[train_df["station"] == station]
+            st_test = test_df[test_df["station"] == station]
 
-        # Add forecast-error noise to ERA5-derived temperature features during training.
-        # ERA5 reanalysis is near-perfect; real GEFS/ECMWF forecasts have uncertainty.
-        # Noise std by lead bucket (°F): D1-2≈3°F, D3-4≈5°F, D5-7≈7°F
-        X_train = self._add_forecast_noise(X_train, train_df, avail_cols)
+            if len(st_train) < 100:
+                logger.warning("Fold %s: skipping %s — only %d train rows",
+                               test_month, station, len(st_train))
+                continue
+            if st_test.empty:
+                logger.warning("Fold %s: no test rows for %s", test_month, station)
+                continue
 
-        ngb = NGBoostTemperatureModel(n_estimators=200, learning_rate=0.05)
-        ngb.fit(X_train, y_train_residual)
-        mu_corr_test, sigma_test = ngb.predict_distribution(X_test)
+            ecmwf_st_train = st_train["ecmwf_tmax"].fillna(st_train["ecmwf_tmax"].mean()).values
+            ecmwf_st_test = st_test["ecmwf_tmax"].fillna(st_test["ecmwf_tmax"].mean()).values
+            y_st = st_train[target_col]
+            y_st_resid = pd.Series(y_st.values - ecmwf_st_train, index=st_train.index)
 
-        # ResidualModel corrects NGBoost's own residual errors. Both y_train_residual
-        # and mu_corr_train are in residual space, so residuals_train is the
-        # second-order correction (added in absolute space via ecmwf offset below).
-        mu_corr_train, sigma_corr_train = ngb.predict_distribution(X_train)
-        residuals_train = y_train_residual.values - mu_corr_train
-        res_model = ResidualModel(station="all")
-        res_model.fit(X_train, pd.Series(residuals_train, index=y_train.index))
-        mu_corr_test = mu_corr_test + res_model.predict(X_test)
+            X_st_train = self._add_forecast_noise(
+                st_train[avail_cols].fillna(0.0), st_train, avail_cols
+            )
+            X_st_test = st_test[avail_cols].fillna(0.0)
 
-        # Blend with QRF using out-of-fold log-score weighting on residual targets
-        # so CRPS values are comparable between NGBoost and QRF (same units).
-        val_n = max(30, int(len(X_train) * 0.15))
-        X_val_ngb = X_train.iloc[-val_n:]
-        y_val_ngb = y_train_residual.iloc[-val_n:]
-        ngb_log_score = ngb.crps(X_val_ngb, y_val_ngb, n_windows=BLEND_VALIDATION_WINDOWS)
-        mu_blended_residual, sigma_test = self._fit_qrf_and_blend(
-            X_train=X_train,
-            y_train=y_train_residual,
-            X_test=X_test,
-            ngb_mu=mu_corr_test,
-            ngb_sigma=sigma_test,
-            ngb_log_score=ngb_log_score,
-        )
-        # Shift blended residual predictions to absolute temperature scale
-        mu_test = mu_blended_residual + ecmwf_test
+            ngb_st = NGBoostTemperatureModel(n_estimators=200, learning_rate=0.05)
+            ngb_st.fit(X_st_train, y_st_resid)
+            mu_corr_st_test, sigma_st_test = ngb_st.predict_distribution(X_st_test)
 
-        # Widen sigma when ensemble members cluster tightly (overconfidence signal)
-        if "gefs_tmax_std" in X_test.columns and "gefs_tmax_range" in X_test.columns:
-            _, sigma_test = apply_spread_inflation_from_stats(
-                mu=mu_test,
-                sigma=sigma_test,
-                std_arr=X_test["gefs_tmax_std"].fillna(0).values,
-                range_arr=X_test["gefs_tmax_range"].fillna(0).values,
+            mu_corr_st_train, sigma_corr_st_train = ngb_st.predict_distribution(X_st_train)
+            residuals_st = y_st_resid.values - mu_corr_st_train
+            res_model_st = ResidualModel(station=station)
+            res_model_st.fit(X_st_train, pd.Series(residuals_st, index=st_train.index))
+            mu_corr_st_test = mu_corr_st_test + res_model_st.predict(X_st_test)
+
+            val_n = max(30, int(len(X_st_train) * 0.15))
+            ngb_log_st = ngb_st.crps(
+                X_st_train.iloc[-val_n:], y_st_resid.iloc[-val_n:],
+                n_windows=BLEND_VALIDATION_WINDOWS,
+            )
+            mu_blended_st, sigma_blended_st = self._fit_qrf_and_blend(
+                X_train=X_st_train,
+                y_train=y_st_resid,
+                X_test=X_st_test,
+                ngb_mu=mu_corr_st_test,
+                ngb_sigma=sigma_st_test,
+                ngb_log_score=ngb_log_st,
+            )
+            mu_abs_st = mu_blended_st + ecmwf_st_test
+
+            if "gefs_tmax_std" in X_st_test.columns and "gefs_tmax_range" in X_st_test.columns:
+                _, sigma_blended_st = apply_spread_inflation_from_stats(
+                    mu=mu_abs_st,
+                    sigma=sigma_blended_st,
+                    std_arr=X_st_test["gefs_tmax_std"].fillna(0).values,
+                    range_arr=X_st_test["gefs_tmax_range"].fillna(0).values,
+                )
+            sigma_blended_st = np.maximum(sigma_blended_st, RESIDUAL_SIGMA_FLOOR)
+
+            mu_test_s.loc[st_test.index] = mu_abs_st
+            sigma_test_s.loc[st_test.index] = sigma_blended_st
+            mu_corr_train_s.loc[st_train.index] = mu_corr_st_train
+            sigma_corr_train_s.loc[st_train.index] = sigma_corr_st_train
+            ecmwf_train_s.loc[st_train.index] = ecmwf_st_train
+            y_train_residual_s.loc[st_train.index] = y_st_resid
+
+        # Restrict to rows covered by at least one station model
+        valid_test = mu_test_s.notna()
+        valid_train = mu_corr_train_s.notna()
+
+        if not valid_test.any():
+            logger.warning("Fold %s: no predictions produced (all stations below min rows)", test_month)
+            return FoldResult(
+                fold_month=test_month,
+                crps=float("nan"), mae=float("nan"), brier_score=float("nan"),
+                reliability_slope=float("nan"), simulated_pnl_usd=0.0,
+                num_simulated_trades=0, edge_above_threshold_pct=0.0,
             )
 
-        # Apply minimum sigma floor: residual reframing shrinks target std from
-        # ~18°F to ~5°F, which can produce overconfident distributions.
-        sigma_test = np.maximum(sigma_test, RESIDUAL_SIGMA_FLOOR)
+        mu_test = mu_test_s[valid_test].values
+        sigma_test = sigma_test_s[valid_test].values
+        y_test = test_df.loc[valid_test, target_col]
+        test_df = test_df.loc[valid_test]
+
+        train_df = train_df.loc[valid_train]
+        y_train = train_df[target_col]
+        ecmwf_train = ecmwf_train_s[valid_train].values
+        y_train_residual = y_train_residual_s[valid_train]
+        mu_corr_train = mu_corr_train_s[valid_train].values
+        sigma_corr_train = sigma_corr_train_s[valid_train].values
+        X_test = test_df[avail_cols].fillna(0.0)
 
         # ── Forecast skill metrics use a single global threshold ──────────────
         # NGBoost now predicts residuals; compute calibration probs in absolute space
@@ -168,13 +218,18 @@ class BacktestRunner:
         )
         outcomes = (y_test > global_threshold).astype(float).values
 
+        # Spectrum calibration: train over a grid of residual percentile thresholds
+        # so the calibrator covers [0.05, 0.95] raw-prob range seen at inference.
         calibrator = IsotonicCalibrator()
         mu_train_abs_cal = mu_corr_train + ecmwf_train
-        prob_train = 1.0 - _norm_fold.cdf(
-            global_threshold, loc=mu_train_abs_cal, scale=np.maximum(sigma_corr_train, 0.01)
-        )
-        outcomes_train = (y_train > global_threshold).astype(float).values
-        calibrator.fit(prob_train, outcomes_train)
+        cal_thresholds = np.percentile(y_train_residual, _CALIBRATION_PERCENTILES) + float(np.mean(ecmwf_train))
+        cal_prob_rows, cal_outcome_rows = [], []
+        for abs_thr in cal_thresholds:
+            cal_prob_rows.append(1.0 - _norm_fold.cdf(
+                abs_thr, loc=mu_train_abs_cal, scale=np.maximum(sigma_corr_train, 0.01)
+            ))
+            cal_outcome_rows.append((y_train.values > abs_thr).astype(float))
+        calibrator.fit(np.concatenate(cal_prob_rows), np.concatenate(cal_outcome_rows))
         cal_probs = calibrator._iso.predict(prob_forecasts) if calibrator._iso is not None else prob_forecasts
 
         logger.info("Fold debug: len(mu)=%d len(obs)=%d mu_range=[%.1f,%.1f]",
@@ -257,11 +312,33 @@ class BacktestRunner:
             market_type=market_type,
         )
 
+        # Kelly-sized contracts: mirrors live trading sizing so backtest P&L is
+        # comparable to production. CI proxy = 2σ / |μ|, clamped to [0, 1].
+        from trading.kelly import compute_size
+        horizon_multipliers = getattr(self._settings, "HORIZON_MULTIPLIERS",
+                                      {1: 1.0, 2: 0.8, 3: 0.5, 4: 0.3, 5: 0.2})
+        contract_sizes = np.array([
+            compute_size(
+                fair_value=float(p),
+                market_price=float(m),
+                ci_width=float(min(2.0 * s / max(abs(mu), 1.0), 1.0)),
+                horizon_days=max(1, int(lh) // 24),
+                kelly_fraction=getattr(self._settings, "KELLY_FRACTION", 0.25),
+                max_exposure_usd=getattr(self._settings, "MAX_EXPOSURE_PER_TICKER_USD", 200.0),
+                horizon_multipliers=horizon_multipliers,
+                strategy_lock=False,
+            )
+            for p, m, s, mu, lh in zip(
+                trade_probs, market_mids, sigma_d1, mu_d1, d1_test["lead_hour"]
+            )
+        ], dtype=float)
+
         sim = simulate_pnl(
             model_probs=trade_probs,
             market_mids=market_mids,
             outcomes=trade_outcomes,
             min_edge=self._settings.MIN_EDGE_CENTS / 100.0,
+            contract_sizes=contract_sizes,
         )
 
         # Split PnL by price source: real Kalshi vs climatological
@@ -270,6 +347,7 @@ class BacktestRunner:
             market_mids=market_mids[is_real],
             outcomes=trade_outcomes[is_real],
             min_edge=self._settings.MIN_EDGE_CENTS / 100.0,
+            contract_sizes=contract_sizes[is_real],
         ) if is_real.any() else {"simulated_pnl_usd": 0.0, "num_simulated_trades": 0}
 
         clim_sim = simulate_pnl(
@@ -277,6 +355,7 @@ class BacktestRunner:
             market_mids=market_mids[~is_real],
             outcomes=trade_outcomes[~is_real],
             min_edge=self._settings.MIN_EDGE_CENTS / 100.0,
+            contract_sizes=contract_sizes[~is_real],
         ) if (~is_real).any() else {"simulated_pnl_usd": 0.0, "num_simulated_trades": 0}
 
         return FoldResult(
