@@ -16,6 +16,7 @@ from models.qrf_model import QRFTemperatureModel
 from models.blend import ModelBlender
 from models.spread_inflation import apply_spread_inflation_from_stats
 from processing.features import get_feature_columns
+from processing.bias_correction import LEAD_BUCKET_HOUR_RANGES
 
 logger = logging.getLogger(__name__)
 
@@ -131,56 +132,75 @@ class BacktestRunner:
                 logger.warning("Fold %s: no test rows for %s", test_month, station)
                 continue
 
-            ecmwf_st_train = st_train["ecmwf_tmax"].fillna(st_train["ecmwf_tmax"].mean()).values
-            ecmwf_st_test = st_test["ecmwf_tmax"].fillna(st_test["ecmwf_tmax"].mean()).values
-            y_st = st_train[target_col]
-            y_st_resid = pd.Series(y_st.values - ecmwf_st_train, index=st_train.index)
-
-            X_st_train = self._add_forecast_noise(
-                st_train[avail_cols].fillna(0.0), st_train, avail_cols
-            )
-            X_st_test = st_test[avail_cols].fillna(0.0)
-
-            ngb_st = NGBoostTemperatureModel(n_estimators=200, learning_rate=0.05)
-            ngb_st.fit(X_st_train, y_st_resid)
-            mu_corr_st_test, sigma_st_test = ngb_st.predict_distribution(X_st_test)
-
-            mu_corr_st_train, sigma_corr_st_train = ngb_st.predict_distribution(X_st_train)
-            residuals_st = y_st_resid.values - mu_corr_st_train
-            res_model_st = ResidualModel(station=station)
-            res_model_st.fit(X_st_train, pd.Series(residuals_st, index=st_train.index))
-            mu_corr_st_test = mu_corr_st_test + res_model_st.predict(X_st_test)
-
-            val_n = max(30, int(len(X_st_train) * 0.15))
-            ngb_log_st = ngb_st.crps(
-                X_st_train.iloc[-val_n:], y_st_resid.iloc[-val_n:],
-                n_windows=BLEND_VALIDATION_WINDOWS,
-            )
-            mu_blended_st, sigma_blended_st = self._fit_qrf_and_blend(
-                X_train=X_st_train,
-                y_train=y_st_resid,
-                X_test=X_st_test,
-                ngb_mu=mu_corr_st_test,
-                ngb_sigma=sigma_st_test,
-                ngb_log_score=ngb_log_st,
-            )
-            mu_abs_st = mu_blended_st + ecmwf_st_test
-
-            if "gefs_tmax_std" in X_st_test.columns and "gefs_tmax_range" in X_st_test.columns:
-                _, sigma_blended_st = apply_spread_inflation_from_stats(
-                    mu=mu_abs_st,
-                    sigma=sigma_blended_st,
-                    std_arr=X_st_test["gefs_tmax_std"].fillna(0).values,
-                    range_arr=X_st_test["gefs_tmax_range"].fillna(0).values,
+            for lead_bucket, lh_min, lh_max in LEAD_BUCKET_HOUR_RANGES:
+                bucket_mask_train = (
+                    (st_train["lead_hour"] >= lh_min) & (st_train["lead_hour"] <= lh_max)
                 )
-            sigma_blended_st = np.maximum(sigma_blended_st, RESIDUAL_SIGMA_FLOOR)
+                bucket_mask_test = (
+                    (st_test["lead_hour"] >= lh_min) & (st_test["lead_hour"] <= lh_max)
+                )
+                bt_train = st_train[bucket_mask_train]
+                bt_test = st_test[bucket_mask_test]
 
-            mu_test_s.loc[st_test.index] = mu_abs_st
-            sigma_test_s.loc[st_test.index] = sigma_blended_st
-            mu_corr_train_s.loc[st_train.index] = mu_corr_st_train
-            sigma_corr_train_s.loc[st_train.index] = sigma_corr_st_train
-            ecmwf_train_s.loc[st_train.index] = ecmwf_st_train
-            y_train_residual_s.loc[st_train.index] = y_st_resid
+                if len(bt_train) < 100:
+                    logger.warning("Fold %s: skipping %s/%s — only %d train rows",
+                                   test_month, station, lead_bucket, len(bt_train))
+                    continue
+                if bt_test.empty:
+                    logger.debug("Fold %s: no test rows for %s/%s",
+                                 test_month, station, lead_bucket)
+                    continue
+
+                ecmwf_bt_train = bt_train["ecmwf_tmax"].fillna(bt_train["ecmwf_tmax"].mean()).values
+                ecmwf_bt_test = bt_test["ecmwf_tmax"].fillna(bt_test["ecmwf_tmax"].mean()).values
+                y_bt = bt_train[target_col]
+                y_bt_resid = pd.Series(y_bt.values - ecmwf_bt_train, index=bt_train.index)
+
+                X_bt_train = self._add_forecast_noise(
+                    bt_train[avail_cols].fillna(0.0), bt_train, avail_cols
+                )
+                X_bt_test = bt_test[avail_cols].fillna(0.0)
+
+                ngb_bt = NGBoostTemperatureModel(n_estimators=200, learning_rate=0.05)
+                ngb_bt.fit(X_bt_train, y_bt_resid)
+                mu_corr_bt_test, sigma_bt_test = ngb_bt.predict_distribution(X_bt_test)
+
+                mu_corr_bt_train, sigma_corr_bt_train = ngb_bt.predict_distribution(X_bt_train)
+                residuals_bt = y_bt_resid.values - mu_corr_bt_train
+                res_model_bt = ResidualModel(station=station)
+                res_model_bt.fit(X_bt_train, pd.Series(residuals_bt, index=bt_train.index))
+                mu_corr_bt_test = mu_corr_bt_test + res_model_bt.predict(X_bt_test)
+
+                val_n = max(30, int(len(X_bt_train) * 0.15))
+                ngb_log_bt = ngb_bt.crps(
+                    X_bt_train.iloc[-val_n:], y_bt_resid.iloc[-val_n:],
+                    n_windows=BLEND_VALIDATION_WINDOWS,
+                )
+                mu_blended_bt, sigma_blended_bt = self._fit_qrf_and_blend(
+                    X_train=X_bt_train,
+                    y_train=y_bt_resid,
+                    X_test=X_bt_test,
+                    ngb_mu=mu_corr_bt_test,
+                    ngb_sigma=sigma_bt_test,
+                    ngb_log_score=ngb_log_bt,
+                )
+                mu_abs_bt = mu_blended_bt + ecmwf_bt_test
+
+                if "gefs_tmax_std" in X_bt_test.columns and "gefs_tmax_range" in X_bt_test.columns:
+                    _, sigma_blended_bt = apply_spread_inflation_from_stats(
+                        mu=mu_abs_bt,
+                        sigma=sigma_blended_bt,
+                        std_arr=X_bt_test["gefs_tmax_std"].fillna(0).values,
+                        range_arr=X_bt_test["gefs_tmax_range"].fillna(0).values,
+                    )
+                sigma_blended_bt = np.maximum(sigma_blended_bt, RESIDUAL_SIGMA_FLOOR)
+
+                mu_test_s.loc[bt_test.index] = mu_abs_bt
+                sigma_test_s.loc[bt_test.index] = sigma_blended_bt
+                mu_corr_train_s.loc[bt_train.index] = mu_corr_bt_train
+                sigma_corr_train_s.loc[bt_train.index] = sigma_corr_bt_train
+                ecmwf_train_s.loc[bt_train.index] = ecmwf_bt_train
+                y_train_residual_s.loc[bt_train.index] = y_bt_resid
 
         # Restrict to rows covered by at least one station model
         valid_test = mu_test_s.notna()

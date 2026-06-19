@@ -284,6 +284,68 @@ def test_run_fold_skips_station_with_insufficient_train_data():
             pytest.fail(f"_run_fold raised unexpectedly: {e}")
 
 
+# ── Per-lead-bucket model training ───────────────────────────────────────────
+
+def test_run_fold_calls_fit_qrf_and_blend_once_per_station_lead_bucket():
+    """_run_fold must train a separate NGBoost+QRF per (station, lead_bucket).
+    With 1 station and 3 lead buckets (D1-2, D3-4, D5-7), expect 3 _fit_qrf_and_blend calls."""
+    runner = _make_runner()
+    train_start = date(2020, 1, 1)
+    train_end = date(2022, 12, 31)
+    test_month = date(2023, 1, 1)
+
+    rng = np.random.default_rng(99)
+    n_per_bucket = 120  # >= 100 minimum per (station, lead_bucket)
+
+    # One station, three lead buckets (24h, 72h, 120h)
+    def _rows(lead_hour, n, start):
+        return pd.DataFrame({
+            "date": pd.date_range(start, periods=n, freq="D").date,
+            "station": "KNYC",
+            "lead_hour": lead_hour,
+            "actual_tmax": rng.normal(72, 4, n),
+            "ecmwf_tmax": rng.normal(70, 3, n),
+            "ecmwf_diurnal_range": np.full(n, 15.0),
+            "gefs_tmax_mean": rng.normal(71, 3, n),
+        })
+
+    train_df = pd.concat([
+        _rows(24, n_per_bucket, "2020-01-01"),
+        _rows(72, n_per_bucket, "2020-01-01"),
+        _rows(120, n_per_bucket, "2020-01-01"),
+    ], ignore_index=True)
+    test_df = pd.concat([
+        _rows(24, 10, "2023-01-01"),
+        _rows(72, 10, "2023-01-01"),
+        _rows(120, 10, "2023-01-01"),
+    ], ignore_index=True)
+
+    call_count = {"n": 0}
+    original_fit_qrf = runner._fit_qrf_and_blend
+
+    def counting_fit(X_train, y_train, X_test, **kw):
+        call_count["n"] += 1
+        return original_fit_qrf(X_train, y_train, X_test, **kw)
+
+    def fake_load(start, end):
+        if end < test_month:
+            return train_df
+        return test_df
+
+    with patch.object(runner, "_load_historical_features", side_effect=fake_load), \
+         patch.object(runner, "_fit_qrf_and_blend", side_effect=counting_fit):
+        try:
+            runner._run_fold(train_start, train_end, test_month)
+        except Exception:
+            pass
+
+    # 1 station × 3 lead buckets = 3 model fits
+    assert call_count["n"] == 3, (
+        f"Expected 3 _fit_qrf_and_blend calls (1 station × 3 lead buckets); "
+        f"got {call_count['n']}"
+    )
+
+
 # ── Zero ecmwf_diurnal_range rows excluded from training ─────────────────────
 
 def test_run_fold_excludes_zero_diurnal_range_from_training():

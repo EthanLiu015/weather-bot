@@ -259,14 +259,15 @@ class EnsembleStrategy:
                     else 0.0
                 )
 
-                ngboost_model  = ngboost_by_station.get(station)
-                qrf_model      = qrf_by_station.get(station)
-                residual_model = residual_by_station.get(station)
-                if ngboost_model is None:
-                    logger.debug("No model for station %s", station)
-                    continue
-
                 lead_bucket = "D1-2" if horizon <= 2 else "D3-4" if horizon <= 4 else "D5-7"
+                model_key = f"{station}_{lead_bucket}"
+
+                ngboost_model  = ngboost_by_station.get(model_key) or ngboost_by_station.get(station)
+                qrf_model      = qrf_by_station.get(model_key) or qrf_by_station.get(station)
+                residual_model = residual_by_station.get(model_key) or residual_by_station.get(station)
+                if ngboost_model is None:
+                    logger.debug("No model for station %s lead_bucket %s", station, lead_bucket)
+                    continue
 
                 if bucket_coverage.get(lead_bucket, 1.0) < GATE_COVERAGE_THRESHOLD:
                     logger.info(

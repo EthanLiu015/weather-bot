@@ -12,6 +12,7 @@ SEASONS = {
     9: "SON", 10: "SON", 11: "SON",
 }
 LEAD_BUCKETS = ["D1-2", "D3-4", "D5-7"]
+LEAD_BUCKET_HOUR_RANGES = [("D1-2", 0, 48), ("D3-4", 49, 96), ("D5-7", 97, 999)]
 
 
 def get_lead_bucket(lead_time_hours: int) -> str:

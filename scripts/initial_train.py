@@ -47,6 +47,7 @@ def train_final_models(df: pd.DataFrame) -> None:
     blend weights) without repeating the ~1.5hr walk-forward backtest.
     """
     from processing.features import get_feature_columns
+    from processing.bias_correction import LEAD_BUCKET_HOUR_RANGES
     from models.ngboost_model import NGBoostTemperatureModel
     from models.qrf_model import QRFTemperatureModel
     from models.residual_model import ResidualModel
@@ -79,93 +80,92 @@ def train_final_models(df: pd.DataFrame) -> None:
     for station in stations_in_data:
         station_df = df[df["station"] == station].copy()
         avail_cols = [c for c in feature_cols if c in station_df.columns]
-        X_st = station_df[avail_cols].fillna(0.0)
-        # Residual reframing: train on correction, not absolute temperature.
-        # ecmwf_tmax is added back as an inference-time offset in _compute_fair_value.
-        y_st = station_df["actual_tmax"] - station_df["ecmwf_tmax"]
 
-        if len(X_st) < 200:
-            logger.warning("Skipping %s — only %d rows", station, len(X_st))
-            continue
+        logger.info("--- Station %s: %d total rows ---", station, len(station_df))
 
-        logger.info("--- %s: %d rows, residual std=%.2f°F ---",
-                    station, len(X_st), float(y_st.std()))
-
-        # NGBoost
-        ngb = NGBoostTemperatureModel(n_estimators=500, learning_rate=0.01)
-        ngb.fit(X_st, y_st)
-        ngb_score = ngb.log_score(X_st, y_st)
-        ngb_scores[station] = ngb_score
-        save_artifact(ngb, "ngboost", station, crps_val=abs(ngb_score))
-        logger.info("NGBoost %s log_score=%.4f", station, ngb_score)
-
-        # QRF
-        qrf = QRFTemperatureModel(n_estimators=500, min_samples_leaf=20)
-        qrf.fit(X_st, y_st)
-        qrf_score = qrf.log_score(X_st, y_st)
-        qrf_scores[station] = qrf_score
-        save_artifact(qrf, "qrf", station, crps_val=abs(qrf_score))
-        logger.info("QRF %s crps=%.4f", station, qrf_score)
-
-        # Held-out CRPS for both models, used to set the production blend weights.
-        # NGBoost's log_score (NLL) and QRF's log_score (CRPS) are different units
-        # and computed in-sample above, so they aren't comparable for blending —
-        # use a dedicated 85/15 split with the same CRPS metric for both, averaged
-        # over BLEND_VALIDATION_WINDOWS contiguous sub-periods of that split.
-        val_n = max(30, int(len(X_st) * 0.15))
-        X_tr_bw, X_val_bw = X_st.iloc[:-val_n], X_st.iloc[-val_n:]
-        y_tr_bw, y_val_bw = y_st.iloc[:-val_n], y_st.iloc[-val_n:]
-
-        ngb_bw = NGBoostTemperatureModel(n_estimators=500, learning_rate=0.01)
-        ngb_bw.fit(X_tr_bw, y_tr_bw)
-        ngb_crps_oos[station] = ngb_bw.crps(X_val_bw, y_val_bw, n_windows=BLEND_VALIDATION_WINDOWS)
-
-        qrf_bw = QRFTemperatureModel(n_estimators=500, min_samples_leaf=20)
-        qrf_bw.fit(X_tr_bw, y_tr_bw)
-        qrf_crps_oos[station] = qrf_bw.log_score(X_val_bw, y_val_bw, n_windows=BLEND_VALIDATION_WINDOWS)
-
-        logger.info("Held-out CRPS %s: NGBoost=%.4f QRF=%.4f",
-                     station, ngb_crps_oos[station], qrf_crps_oos[station])
-
-        # Residual model (LightGBM) corrects the NGBoost's own residual errors.
-        # y_st and mu_pred are both in residual space, so residuals is the
-        # second-order correction (added in absolute space at inference).
-        residual_feature_cols = [c for c in [
-            "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
-            "obs_minus_model_roll_mean", "obs_minus_model_roll_std",
-            "lead_time_sqrt", "day_of_year_sin", "day_of_year_cos",
-        ] if c in X_st.columns]
-
-        mu_pred, _ = ngb.predict_distribution(X_st)
-        residuals = pd.Series(y_st.values - mu_pred, index=X_st.index)
-        if residual_feature_cols and residuals.abs().mean() > 0.01:
-            res_model = ResidualModel(station=station)
-            res_model.fit(X_st[residual_feature_cols], residuals)
-            save_artifact(res_model, "residual", station)
-            logger.info("Residual model saved for %s (mean_residual=%.2f°F)", station, residuals.mean())
-
-        # Isotonic calibration per lead bucket — operate in residual space so
-        # the calibrator sees the same distribution as the model's raw output.
-        for lead_bucket, lh_min, lh_max in [("D1-2", 0, 48), ("D3-4", 49, 96), ("D5-7", 97, 999)]:
+        # Per-lead-bucket NGBoost + QRF + calibrator
+        ngb_by_bucket: dict[str, NGBoostTemperatureModel] = {}
+        for lead_bucket, lh_min, lh_max in LEAD_BUCKET_HOUR_RANGES:
             mask = (station_df["lead_hour"] >= lh_min) & (station_df["lead_hour"] <= lh_max)
             sub = station_df[mask]
-            if len(sub) < 100:
-                logger.debug("Skipping calibrator %s/%s — only %d rows", station, lead_bucket, len(sub))
+            model_key = f"{station}_{lead_bucket}"
+
+            if len(sub) < 200:
+                logger.warning("Skipping %s — only %d rows (need 200)", model_key, len(sub))
                 continue
 
             X_sub = sub[avail_cols].fillna(0.0)
+            # Residual reframing: train on correction, not absolute temperature.
+            # ecmwf_tmax is added back as an inference-time offset in _compute_fair_value.
             y_sub = sub["actual_tmax"] - sub["ecmwf_tmax"]
-            # Spectrum calibration: train over a grid of percentile thresholds so
-            # the calibrator covers the full [0.05, 0.95] raw-prob range seen at
-            # inference when Kalshi thresholds fall far from the residual median.
-            raw_probs, outcomes = build_calibration_dataset(ngb, X_sub, y_sub)
 
+            logger.info("%s: %d rows, residual std=%.2f°F", model_key, len(sub), float(y_sub.std()))
+
+            # NGBoost
+            ngb = NGBoostTemperatureModel(n_estimators=500, learning_rate=0.01)
+            ngb.fit(X_sub, y_sub)
+            ngb_score = ngb.log_score(X_sub, y_sub)
+            ngb_scores[model_key] = ngb_score
+            ngb_by_bucket[lead_bucket] = ngb
+            save_artifact(ngb, "ngboost", model_key, crps_val=abs(ngb_score))
+            logger.info("NGBoost %s log_score=%.4f", model_key, ngb_score)
+
+            # QRF
+            qrf = QRFTemperatureModel(n_estimators=500, min_samples_leaf=20)
+            qrf.fit(X_sub, y_sub)
+            qrf_score = qrf.log_score(X_sub, y_sub)
+            qrf_scores[model_key] = qrf_score
+            save_artifact(qrf, "qrf", model_key, crps_val=abs(qrf_score))
+            logger.info("QRF %s crps=%.4f", model_key, qrf_score)
+
+            # Held-out CRPS for blend weights (85/15 split, averaged across windows)
+            val_n = max(30, int(len(X_sub) * 0.15))
+            X_tr_bw, X_val_bw = X_sub.iloc[:-val_n], X_sub.iloc[-val_n:]
+            y_tr_bw, y_val_bw = y_sub.iloc[:-val_n], y_sub.iloc[-val_n:]
+
+            ngb_bw = NGBoostTemperatureModel(n_estimators=500, learning_rate=0.01)
+            ngb_bw.fit(X_tr_bw, y_tr_bw)
+            ngb_crps_oos[model_key] = ngb_bw.crps(X_val_bw, y_val_bw, n_windows=BLEND_VALIDATION_WINDOWS)
+
+            qrf_bw = QRFTemperatureModel(n_estimators=500, min_samples_leaf=20)
+            qrf_bw.fit(X_tr_bw, y_tr_bw)
+            qrf_crps_oos[model_key] = qrf_bw.log_score(X_val_bw, y_val_bw, n_windows=BLEND_VALIDATION_WINDOWS)
+
+            logger.info("Held-out CRPS %s: NGBoost=%.4f QRF=%.4f",
+                        model_key, ngb_crps_oos[model_key], qrf_crps_oos[model_key])
+
+            # Calibrator uses the same bucket's NGBoost — spectrum calibration
+            # covers full [0.05, 0.95] raw-prob range seen at inference.
+            raw_probs, outcomes = build_calibration_dataset(ngb, X_sub, y_sub)
             cal = IsotonicCalibrator()
             cal.fit(raw_probs, outcomes)
-            cal_path = CALIBRATOR_DIR / f"{station}_{lead_bucket}.pkl"
+            cal_path = CALIBRATOR_DIR / f"{model_key}.pkl"
             cal.save(str(cal_path))
-            logger.info("Calibrator saved: %s/%s (n=%d, slope=%.3f)",
-                        station, lead_bucket, len(sub), cal.reliability_slope())
+            logger.info("Calibrator saved: %s (n=%d, slope=%.3f)",
+                        model_key, len(sub), cal.reliability_slope())
+
+        # Residual model (LightGBM) corrects systematic NGBoost errors using all
+        # station data across lead buckets (second-order correction at inference).
+        X_st_all = station_df[avail_cols].fillna(0.0)
+        y_st_all = station_df["actual_tmax"] - station_df["ecmwf_tmax"]
+
+        if len(X_st_all) >= 200 and ngb_by_bucket:
+            residual_feature_cols = [c for c in [
+                "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
+                "obs_minus_model_roll_mean", "obs_minus_model_roll_std",
+                "lead_time_sqrt", "day_of_year_sin", "day_of_year_cos",
+            ] if c in X_st_all.columns]
+
+            # Use D1-2 model (most data) for full-station residual prediction
+            ref_ngb = next(iter(ngb_by_bucket.values()))
+            mu_pred, _ = ref_ngb.predict_distribution(X_st_all)
+            residuals = pd.Series(y_st_all.values - mu_pred, index=X_st_all.index)
+            if residual_feature_cols and residuals.abs().mean() > 0.01:
+                res_model = ResidualModel(station=station)
+                res_model.fit(X_st_all[residual_feature_cols], residuals)
+                save_artifact(res_model, "residual", station)
+                logger.info("Residual model saved for %s (mean_residual=%.2f°F)",
+                            station, residuals.mean())
 
     # Compute blend weights from held-out CRPS (lower = better; negate since
     # compute_weights_from_log_scores treats higher = better)

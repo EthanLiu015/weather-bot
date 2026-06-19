@@ -68,6 +68,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         from models.calibration import IsotonicCalibrator
         from models.registry import load_latest_artifact
         from config.stations import ALL_ICAO
+        from processing.bias_correction import LEAD_BUCKET_HOUR_RANGES
         from pathlib import Path
 
         try:
@@ -80,24 +81,32 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         app.state.blender = blender
         model_registry["blender"] = blender
 
-        # Load per-station NGBoost + QRF + ResidualModel
+        # Load per-(station, lead_bucket) NGBoost + QRF + ResidualModel
         ngboost_models, qrf_models, residual_models = {}, {}, {}
         for station in ALL_ICAO:
-            try:
-                ngboost_models[station] = load_latest_artifact(NGBoostTemperatureModel, "ngboost", station)
-                logger.info("Loaded NGBoost for %s", station)
-            except FileNotFoundError:
-                logger.debug("No NGBoost artifact for %s", station)
-            try:
-                qrf_models[station] = load_latest_artifact(QRFTemperatureModel, "qrf", station)
-                logger.info("Loaded QRF for %s", station)
-            except FileNotFoundError:
-                logger.debug("No QRF artifact for %s", station)
-            try:
-                residual_models[station] = load_latest_artifact(ResidualModel, "residual", station)
-                logger.info("Loaded ResidualModel for %s", station)
-            except FileNotFoundError:
-                logger.debug("No ResidualModel artifact for %s", station)
+            for lead_bucket, _, _ in LEAD_BUCKET_HOUR_RANGES:
+                model_key = f"{station}_{lead_bucket}"
+                try:
+                    ngboost_models[model_key] = load_latest_artifact(
+                        NGBoostTemperatureModel, "ngboost", model_key
+                    )
+                    logger.info("Loaded NGBoost for %s", model_key)
+                except FileNotFoundError:
+                    logger.debug("No NGBoost artifact for %s", model_key)
+                try:
+                    qrf_models[model_key] = load_latest_artifact(
+                        QRFTemperatureModel, "qrf", model_key
+                    )
+                    logger.info("Loaded QRF for %s", model_key)
+                except FileNotFoundError:
+                    logger.debug("No QRF artifact for %s", model_key)
+                try:
+                    residual_models[model_key] = load_latest_artifact(
+                        ResidualModel, "residual", model_key
+                    )
+                    logger.info("Loaded ResidualModel for %s", model_key)
+                except FileNotFoundError:
+                    logger.debug("No ResidualModel artifact for %s", model_key)
 
         # Load calibrators
         calibrators = {}

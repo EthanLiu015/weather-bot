@@ -198,3 +198,149 @@ def test_ecmwf_offset_zero_preserves_existing_behaviour():
     )
 
     assert result_default["raw_prob"] == pytest.approx(result_explicit_zero["raw_prob"], abs=1e-6)
+
+
+# ── Per-lead-bucket model registry key scheme ─────────────────────────────────
+
+def test_lead_bucket_hour_ranges_is_importable():
+    """LEAD_BUCKET_HOUR_RANGES must be exported from processing.bias_correction."""
+    from processing.bias_correction import LEAD_BUCKET_HOUR_RANGES  # noqa: F401
+
+
+def test_lead_bucket_hour_ranges_covers_all_buckets():
+    """Every bucket name in LEAD_BUCKETS must appear in LEAD_BUCKET_HOUR_RANGES."""
+    from processing.bias_correction import LEAD_BUCKETS, LEAD_BUCKET_HOUR_RANGES
+    names = [name for name, _, _ in LEAD_BUCKET_HOUR_RANGES]
+    for bucket in LEAD_BUCKETS:
+        assert bucket in names, f"{bucket} missing from LEAD_BUCKET_HOUR_RANGES"
+
+
+def test_run_cycle_selects_d1_model_for_short_horizon(monkeypatch):
+    """For horizon=1 day, run_cycle must look up 'KNYC_D1-2' in the registry,
+    not bare 'KNYC'. This ensures per-lead-bucket specialisation at inference."""
+    import asyncio
+    import pandas as pd
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    d1_model = _make_ngboost(mu=5.0, sigma=3.0)
+    d3_model = _make_ngboost(mu=5.0, sigma=5.0)
+
+    registry = {
+        "ngboost": {"KNYC_D1-2": d1_model, "KNYC_D3-4": d3_model},
+        "qrf": {},
+        "residual": {},
+        "blender": None,
+        "calibrators": {},
+    }
+    shared_state = MagicMock()
+    shared_state.snapshot.return_value = {}
+
+    strategy = EnsembleStrategy(
+        shared_state=shared_state,
+        model_registry=registry,
+        kalshi_client=MagicMock(),
+        settings=MagicMock(STATIONS=["KNYC"], MIN_EDGE_CENTS=4, MAX_CI_WIDTH=0.12),
+    )
+
+    feature_row = pd.DataFrame([{
+        "station": "KNYC",
+        "lead_hour": 24,
+        "gefs_tmax_mean": 72.0,
+        "gefs_tmax_std": 3.0,
+        "gefs_tmax_range": 10.0,
+        "gefs_tmax_p10": 68.0,
+        "gefs_tmax_p90": 78.0,
+        "ecmwf_tmax": 70.0,
+        "lead_time_hours": 24.0,
+    }])
+
+    full_coverage = {"D1-2": 1.0, "D3-4": 1.0, "D5-7": 1.0}
+
+    with patch.object(strategy, "fetch_active_temperature_tickers",
+                      new_callable=AsyncMock, return_value=["KXXX-D1-T72-B1"]), \
+         patch.object(strategy, "_ticker_to_station", return_value="KNYC"), \
+         patch.object(strategy, "_ticker_to_threshold", return_value=72.0), \
+         patch.object(strategy, "_ticker_to_horizon", return_value=1), \
+         patch.object(strategy, "_compute_coverage_by_bucket", return_value=full_coverage), \
+         patch("strategies.ensemble_strategy.fetch_latest_gefs_run",
+               new_callable=AsyncMock, return_value={}), \
+         patch("strategies.ensemble_strategy.fetch_latest_ecmwf_run",
+               new_callable=AsyncMock, return_value={}), \
+         patch("strategies.ensemble_strategy.fetch_latest_nbm",
+               new_callable=AsyncMock, return_value={}), \
+         patch("strategies.ensemble_strategy.build_feature_matrix",
+               return_value=feature_row), \
+         patch("strategies.ensemble_strategy.get_session"):
+        asyncio.run(strategy.run_cycle())
+
+    # D1-2 model must have been called; D3-4 model must NOT have been called
+    assert d1_model.predict_distribution.called, (
+        "D1-2 model should be called for horizon=1"
+    )
+    assert not d3_model.predict_distribution.called, (
+        "D3-4 model should NOT be called for horizon=1"
+    )
+
+
+def test_run_cycle_selects_d3_model_for_medium_horizon(monkeypatch):
+    """For horizon=3 days, run_cycle must look up 'KNYC_D3-4' in the registry."""
+    import asyncio
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    d1_model = _make_ngboost(mu=5.0, sigma=3.0)
+    d3_model = _make_ngboost(mu=5.0, sigma=5.0)
+
+    registry = {
+        "ngboost": {"KNYC_D1-2": d1_model, "KNYC_D3-4": d3_model},
+        "qrf": {},
+        "residual": {},
+        "blender": None,
+        "calibrators": {},
+    }
+    shared_state = MagicMock()
+    shared_state.snapshot.return_value = {}
+
+    strategy = EnsembleStrategy(
+        shared_state=shared_state,
+        model_registry=registry,
+        kalshi_client=MagicMock(),
+        settings=MagicMock(STATIONS=["KNYC"], MIN_EDGE_CENTS=4, MAX_CI_WIDTH=0.12),
+    )
+
+    feature_row = pd.DataFrame([{
+        "station": "KNYC",
+        "lead_hour": 72,
+        "gefs_tmax_mean": 72.0,
+        "gefs_tmax_std": 3.0,
+        "gefs_tmax_range": 10.0,
+        "gefs_tmax_p10": 68.0,
+        "gefs_tmax_p90": 78.0,
+        "ecmwf_tmax": 70.0,
+        "lead_time_hours": 72.0,
+    }])
+
+    full_coverage = {"D1-2": 1.0, "D3-4": 1.0, "D5-7": 1.0}
+
+    with patch.object(strategy, "fetch_active_temperature_tickers",
+                      new_callable=AsyncMock, return_value=["KXXX-D3-T72-B1"]), \
+         patch.object(strategy, "_ticker_to_station", return_value="KNYC"), \
+         patch.object(strategy, "_ticker_to_threshold", return_value=72.0), \
+         patch.object(strategy, "_ticker_to_horizon", return_value=3), \
+         patch.object(strategy, "_compute_coverage_by_bucket", return_value=full_coverage), \
+         patch("strategies.ensemble_strategy.fetch_latest_gefs_run",
+               new_callable=AsyncMock, return_value={}), \
+         patch("strategies.ensemble_strategy.fetch_latest_ecmwf_run",
+               new_callable=AsyncMock, return_value={}), \
+         patch("strategies.ensemble_strategy.fetch_latest_nbm",
+               new_callable=AsyncMock, return_value={}), \
+         patch("strategies.ensemble_strategy.build_feature_matrix",
+               return_value=feature_row), \
+         patch("strategies.ensemble_strategy.get_session"):
+        asyncio.run(strategy.run_cycle())
+
+    assert d3_model.predict_distribution.called, (
+        "D3-4 model should be called for horizon=3"
+    )
+    assert not d1_model.predict_distribution.called, (
+        "D1-2 model should NOT be called for horizon=3"
+    )
