@@ -378,6 +378,31 @@ class BacktestRunner:
             contract_sizes=contract_sizes[~is_real],
         ) if (~is_real).any() else {"simulated_pnl_usd": 0.0, "num_simulated_trades": 0}
 
+        # Save trade-level data for parameter stability and Monte Carlo analysis.
+        trades_df = pd.DataFrame({
+            "fold_month": test_month.isoformat(),
+            "station": d1_test["station"].values if "station" in d1_test.columns else "",
+            "date": d1_test["date"].values if "date" in d1_test.columns else "",
+            "lead_hour": d1_test["lead_hour"].values if "lead_hour" in d1_test.columns else 24,
+            "threshold": row_thresholds,
+            "trade_prob": trade_probs,
+            "market_mid": market_mids,
+            "outcome": trade_outcomes,
+            "contract_size": contract_sizes,
+            "sigma": sigma_d1,
+            "mu": mu_d1,
+            "is_real_price": is_real,
+        })
+        trades_path = Path("data/backtest_trades.parquet")
+        if trades_path.exists():
+            existing = pd.read_parquet(trades_path)
+            existing_months = set(existing["fold_month"].unique())
+            if test_month.isoformat() not in existing_months:
+                pd.concat([existing, trades_df], ignore_index=True).to_parquet(trades_path, index=False)
+        else:
+            trades_path.parent.mkdir(parents=True, exist_ok=True)
+            trades_df.to_parquet(trades_path, index=False)
+
         return FoldResult(
             fold_month=test_month,
             crps=metrics["crps"],
