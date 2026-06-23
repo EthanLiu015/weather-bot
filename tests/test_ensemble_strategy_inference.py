@@ -5,7 +5,12 @@ import pytest
 from scipy.stats import norm
 from unittest.mock import MagicMock
 
-from strategies.ensemble_strategy import EnsembleStrategy, RESIDUAL_SIGMA_FLOOR
+from strategies.ensemble_strategy import (
+    EnsembleStrategy,
+    RESIDUAL_SIGMA_FLOOR,
+    FAIR_VALUE_FLOOR,
+    FAIR_VALUE_CEIL,
+)
 
 
 def _make_X(gefs_std: float = 3.0, gefs_range: float = 10.0) -> pd.DataFrame:
@@ -127,6 +132,81 @@ def test_compute_fair_value_returns_raw_prob_when_no_calibrator():
     )
 
     assert result["cal_prob"] == pytest.approx(result["raw_prob"], abs=1e-6)
+
+
+# ── Fair value clamped away from 0/1 to prevent overconfident Kelly sizing ────
+
+def test_compute_fair_value_clamps_calibrated_prob_at_ceiling():
+    """A calibrator returning 1.0 (zero loss probability) must be clamped to the
+    ceiling so Kelly sizing cannot bet on a 'certain' outcome.
+
+    Surfaced by the 2026-06-22 shadow run: KSFO_D1-2 produced cal_prob=1.000 at
+    a low-variance coastal station, which would drive aggressive sizing.
+    """
+    ngb = _make_ngboost(mu=72.0, sigma=3.0)
+    X = _make_X()
+    calibrator = MagicMock()
+    calibrator.calibrate.return_value = (1.0, 0.98, 1.0)
+
+    result = EnsembleStrategy._compute_fair_value(
+        X=X, ngboost_model=ngb, qrf_model=None,
+        residual_model=None, blender=None,
+        calibrator=calibrator, threshold=72.0,
+    )
+
+    assert result["cal_prob"] == pytest.approx(FAIR_VALUE_CEIL)
+
+
+def test_compute_fair_value_clamps_calibrated_prob_at_floor():
+    """A calibrator returning 0.0 must be clamped up to the floor."""
+    ngb = _make_ngboost(mu=72.0, sigma=3.0)
+    X = _make_X()
+    calibrator = MagicMock()
+    calibrator.calibrate.return_value = (0.0, 0.0, 0.02)
+
+    result = EnsembleStrategy._compute_fair_value(
+        X=X, ngboost_model=ngb, qrf_model=None,
+        residual_model=None, blender=None,
+        calibrator=calibrator, threshold=72.0,
+    )
+
+    assert result["cal_prob"] == pytest.approx(FAIR_VALUE_FLOOR)
+
+
+def test_compute_fair_value_leaves_in_range_prob_unchanged():
+    """A calibrated prob already inside (floor, ceil) must pass through untouched."""
+    ngb = _make_ngboost(mu=72.0, sigma=3.0)
+    X = _make_X()
+    calibrator = MagicMock()
+    calibrator.calibrate.return_value = (0.65, 0.60, 0.70)
+
+    result = EnsembleStrategy._compute_fair_value(
+        X=X, ngboost_model=ngb, qrf_model=None,
+        residual_model=None, blender=None,
+        calibrator=calibrator, threshold=72.0,
+    )
+
+    assert result["cal_prob"] == pytest.approx(0.65)
+
+
+def test_compute_fair_value_clamps_uncalibrated_extreme_prob():
+    """Even without a calibrator, an extreme raw_prob must be clamped so the
+    no-calibrator path cannot emit a fair value of ~1.0 either."""
+    ngb = _make_ngboost(mu=120.0, sigma=3.0)  # mu far above threshold → raw_prob ≈ 1.0
+    X = _make_X()
+
+    result = EnsembleStrategy._compute_fair_value(
+        X=X, ngboost_model=ngb, qrf_model=None,
+        residual_model=None, blender=None,
+        calibrator=None, threshold=72.0,
+    )
+
+    assert result["cal_prob"] <= FAIR_VALUE_CEIL
+    assert result["cal_prob"] == pytest.approx(FAIR_VALUE_CEIL)
+
+
+def test_fair_value_bounds_are_sane():
+    assert 0.0 < FAIR_VALUE_FLOOR < FAIR_VALUE_CEIL < 1.0
 
 
 # ── ecmwf_offset shifts residual predictions to absolute temperature scale ────

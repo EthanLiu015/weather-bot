@@ -87,6 +87,22 @@ def test_get_market_mid_returns_mid_for_correct_market_type():
     assert result == pytest.approx(0.45)
 
 
+def test_get_market_mid_rejects_empty_book_half_price():
+    """An exact 0.5 mid is the (yes_bid=0 + yes_ask=1)/2 empty-book artifact, not
+    a tradeable price. Treating it as real lets a skilled model 'beat' a constant
+    coin-flip and silently inflates backtest P&L — must be rejected."""
+    runner = _make_runner()
+    runner._kalshi_prices = pd.DataFrame([{
+        "station": "KNYC",
+        "date": date(2023, 6, 1),
+        "market_type": "above",
+        "threshold": 70.0,
+        "d1_mid": 0.5,
+    }])
+    result = runner._get_market_mid("KNYC", date(2023, 6, 1), threshold=70.0, market_type="above")
+    assert result is None
+
+
 # ── Gap 10: multi-day lead hour evaluation ───────────────────────────────────
 
 def test_filter_by_lead_hours_returns_all_specified_leads():

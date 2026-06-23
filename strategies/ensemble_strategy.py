@@ -11,6 +11,14 @@ from scipy.stats import norm as _scipy_norm
 # Must match RESIDUAL_SIGMA_FLOOR in backtest/runner.py.
 RESIDUAL_SIGMA_FLOOR = 2.0
 
+# Clamp the returned fair value away from 0/1. Low-variance coastal stations
+# (e.g. KSFO, KLAX) can produce raw probabilities ≥ 0.99 that calibrate to
+# exactly 1.0 — a "zero loss probability" fair value drives overconfident Kelly
+# sizing on thin edge cushions. Bounding to [0.02, 0.98] preserves a residual
+# uncertainty margin without affecting any in-range forecast.
+FAIR_VALUE_FLOOR = 0.02
+FAIR_VALUE_CEIL = 0.98
+
 from ingestion.asos import fetch_daily_tmax_history
 from ingestion.gefs import fetch_latest_gefs_run, detect_new_run, FORECAST_HOURS
 from ingestion.ecmwf import fetch_latest_ecmwf_run
@@ -148,6 +156,8 @@ class EnsembleStrategy:
         else:
             cal_prob = raw_prob
             ci_width = 0.1
+
+        cal_prob = min(FAIR_VALUE_CEIL, max(FAIR_VALUE_FLOOR, float(cal_prob)))
 
         return {"raw_prob": raw_prob, "cal_prob": float(cal_prob), "ci_width": float(ci_width)}
 

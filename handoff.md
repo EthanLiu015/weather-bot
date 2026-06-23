@@ -115,7 +115,30 @@ All 293 tests pass. New tests cover:
 
 ---
 
-## Next Steps (in priority order)
+## Session Update (2026-06-22) — Steps 1–6 executed
+
+All six next-step items below were run this session. Summary of outcomes:
+
+- **Step 1 (param stability):** Sharpe flat at ~3.05 across every grid value. `kelly_fraction` and `max_exposure_usd` are pure leverage (P&L scales linearly, win_rate identical, Sharpe unchanged) — the script's "optimal=1.0/$500" is just "bet more," not a real edge. `min_edge_cents` mild peak ~0.08–0.10, `sigma_floor` inert. **Keep config as-is — flat plateau, not a fragile peak.** Outputs in `data/stability/`. Caveat: `max_monthly_drawdown=0.000` everywhere is a climatology-pricing artifact.
+- **Step 2 (Monte Carlo):** Ruin prob 0.0% across fold/trade bootstraps. Outcome perturbation stays profitable through 20% flipping (mean $191k at 20%, prob_neg 0%) — comfortably clears the 10% cushion bar. Outputs in `data/montecarlo/`.
+- **Step 6 (P&L variance):** **Systematic/seasonal, not noise.** Edge-per-trade tracks forecast difficulty: shoulder/winter months (Feb–Mar ~$23/trade, Sep–Oct ~$19) vs summer (Jun/Aug ~$9). corr(pnl_per_trade, CRPS)=+0.37 — climatology is a worse benchmark when weather variance is high, so relative edge grows. Plot + table in `data/fold_variance/`. NOTE: this is edge-vs-climatology seasonality; real markets likely price it.
+- **Step 3 (retrain):** DONE. All 20 stations × 3 buckets retrained with composite keys (`KATL_D1-2`). 60/60 ngboost+qrf+calibrators present, blender weights ngboost 0.529 / qrf 0.471. Took ~21 min (NOT 2–4 hr — `train_final_models` fits each station once, no walk-forward). Old models backed up to `data/models_backup_20260622_111846/`. GOTCHA: call `train_final_models` directly (not `main()`, which re-runs the 17 hr backtest); it needs `init_db()` first because `save_artifact` writes DB metadata.
+- **Step 5 (Kalshi data gap):** Re-fetched + merged. Coverage now **2026-03-26 → 2026-06-21 (88 days, +31%)**. KEY FINDING: Kalshi's settled-markets endpoint serves only a **rolling ~10-week window** — re-fetching rolled forward (gained June, dropped late March). **2024 backfill is impossible via the API**; the only path is forward-accumulation (schedule the fetch periodically + union). Candlestick endpoint 404s for expired markets (falls back to prev bid/ask proxy; that's why the fetch takes ~22 min of retries).
+- **Step 4 (shadow verification):** Inference path verified OFFLINE on recent feature rows (not yet a live-API cycle). Checks PASS: all 20×3 buckets produce forecasts; composite keys resolve 60/60 (no bare-key fallback); Kelly non-zero on visible edge 60/60. **Check 2 FINDING:** 4/60 fair values out of [0.05,0.95], all coastal CA (KSFO/KLAX), raw_prob already 0.97–0.995 pre-calibration (low-variance marine climate + learned ECMWF cold-bias correction — not a calibrator bug). **KSFO_D1-2 = exactly 1.000** → recommend clamping cal_prob to e.g. [0.02, 0.98] to prevent overconfident Kelly sizing (needs failing test + approval first).
+
+### Follow-up items DONE (same session, after the above)
+
+- **Fair-value clamp (TDD):** Added `FAIR_VALUE_FLOOR=0.02` / `FAIR_VALUE_CEIL=0.98` in `strategies/ensemble_strategy.py`; `_compute_fair_value` now clamps the returned `cal_prob` to [0.02, 0.98]. 5 new tests in `tests/test_ensemble_strategy_inference.py` (ceiling, floor, in-range passthrough, uncalibrated-extreme, bounds-sane). Full suite **298 passed** (was 293). Verified: former offenders (KSFO_D1-2 etc.) now cap at exactly 0.980; no cal_prob = 1.0 anywhere. NOTE clamp is [0.02,0.98], intentionally wider than the [0.05,0.95] sanity band — 0.98 is legitimate high confidence at low-variance marine stations; the goal was killing the exactly-1.0 "zero-loss" value that breaks Kelly.
+
+- **Live `run_cycle` (executed):** Ran one real inference-only cycle (registry load + live KalshiClient paper mode + live ingestion). CONFIRMED: production registry loads in the live path (60 ngboost / 60 qrf / 60 residual / 60 calibrators); Kalshi paper client connects ("NO real orders will be submitted"); ingestion degrades gracefully on missing data. **GEFS finding (timing, not a bug):** the latest run (today 18z) wasn't published yet at run time → NOMADS returns **403** for a not-yet-existing run dir. Verified: today's `18z`→403 but `06z`→200 (User-Agent irrelevant). So no live forecasts were produced this cycle — purely because the newest model run wasn't out. Live forecast-production behavior (fair values in range, all 3 buckets, non-zero Kelly) was already confirmed offline on recent features.
+
+**Recommended next (optional robustness):** `fetch_latest_gefs_run` tries only the latest cycle and logs "not yet available" when it 403s; consider a fallback to the most recent *published* run (06z/12z) so a manually-triggered cycle isn't empty between model publications. Needs TDD + approval.
+
+**Original pending items (now both done above):** (a) live `run_cycle`; (b) cal_prob clamp.
+
+---
+
+## Original Next Steps (now executed — see Session Update above)
 
 ### 1. Run parameter stability analysis (immediate — ~5 minutes)
 ```bash

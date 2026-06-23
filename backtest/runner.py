@@ -624,6 +624,14 @@ class BacktestRunner:
         mid = closest["d1_mid"]
         if pd.isna(mid) or mid <= 0 or mid >= 1:
             return None
+        # Defense-in-depth against the empty-book artifact: a settled market's
+        # collapsed book (yes_bid=0, yes_ask=1) mids to exactly 0.5, which is a
+        # fabricated price, not a tradeable one. Reject it so a skilled model
+        # can't 'beat' a constant coin-flip and silently inflate P&L. A genuine
+        # market that happens to sit at 0.5 has ~no edge anyway, so skipping it
+        # costs nothing. (The fetch now drops these at source via _compute_d1_mid.)
+        if float(mid) == 0.5:
+            return None
         return float(mid)
 
     def _climatological_mids(

@@ -133,6 +133,24 @@ class ReadOnlyKalshiClient:
 # Ticker parsing
 # ---------------------------------------------------------------------------
 
+def _compute_d1_mid(prev_bid, prev_ask, last_price=None) -> float:
+    """Derive a D-1 mid from the prior session's yes bid/ask, returning NaN when
+    the book is not a genuine two-sided quote.
+
+    Settled markets report previous_yes_bid=0 / previous_yes_ask=1 (a collapsed
+    book); its midpoint (0+1)/2 = 0.5 is a fabricated price that silently turns
+    every backtest into 'beat a coin flip'. A real price requires 0 < bid <= ask < 1.
+    `last_price` is intentionally NOT used as a fallback: for settled markets it is
+    the near-resolution trade price and would leak the outcome into the backtest.
+    """
+    if prev_bid is None or prev_ask is None:
+        return float("nan")
+    bid, ask = float(prev_bid), float(prev_ask)
+    if bid <= 0.0 or ask >= 1.0 or bid > ask:
+        return float("nan")
+    return (bid + ask) / 2.0
+
+
 def _parse_ticker(ticker: str, series: str) -> dict | None:
     """
     Parse ticker like KXHIGHCHI-26MAY31-T81 or KXHIGHCHI-26MAY31-B80.5
@@ -182,17 +200,13 @@ async def fetch_series_markets(
             if not parsed:
                 continue
 
-            # Get D+1 mid from previous_yes_bid/ask (prices from prior trading session)
-            prev_bid = m.get("previous_yes_bid_dollars")
-            prev_ask = m.get("previous_yes_ask_dollars")
-            last_price = m.get("last_price_dollars")
-
-            if prev_bid is not None and prev_ask is not None:
-                d1_mid = (float(prev_bid) + float(prev_ask)) / 2.0
-            elif last_price is not None:
-                d1_mid = float(last_price)
-            else:
-                d1_mid = float("nan")
+            # Get D+1 mid from previous_yes_bid/ask (prices from prior trading
+            # session). Empty/collapsed books (bid=0, ask=1) yield NaN — not a
+            # fabricated 0.5 — so they are dropped rather than treated as real.
+            d1_mid = _compute_d1_mid(
+                m.get("previous_yes_bid_dollars"),
+                m.get("previous_yes_ask_dollars"),
+            )
 
             result = m.get("result")
             settlement = 1.0 if result == "yes" else 0.0 if result == "no" else float("nan")
