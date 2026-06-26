@@ -8,7 +8,55 @@ The full pipeline: ingest live weather forecasts → build feature matrix → ru
 
 ---
 
-## Current State (as of this handoff)
+## ⚠️ READ FIRST — Critical correction (2026-06-23)
+
+**Every "real Kalshi price" performance number in the older sections below is FAKE. Do not cite the $95,983 P&L or any real-price Sharpe (3.05 / 4.0 / 5.6 / 41).** They were artifacts of three compounding bugs, found and (mostly) fixed this session:
+
+1. **Fetch fabricated 0.5 prices** ✅ FIXED. `d1_mid = (prev_yes_bid + prev_yes_ask)/2` collapsed to **0.5** for 94% of settled markets (empty book = bid 0 / ask 1). `_get_market_mid` accepted them as real → the model "beat" a constant coin-flip. Fix: `scripts/fetch_kalshi_history.py::_compute_d1_mid` returns NaN for empty/degenerate/crossed books; never uses `last_price` (look-ahead).
+2. **No empty-book guard** ✅ FIXED. `backtest/runner.py::_get_market_mid` now rejects `d1_mid == 0.5` (defense-in-depth).
+3. **Backtest evaluates synthetic thresholds, prices them with real markets at *different* thresholds** ❌ NOT FIXED (architectural). The backtest scores synthetic station×month-median markets (~50/50) but `_get_market_mid` matches a real Kalshi price from a market at a nearby-but-different threshold (within 5°F). Price refers to threshold A, outcome to threshold B → no correspondence. Proof: real-price fold market Brier = **0.498** (vs 0.068 on the raw data); Sharpe a fake **41**.
+
+**Real candlestick prices ARE now obtainable** (the candlestick endpoint needed `/series/{series_ticker}/markets/{ticker}/candlesticks`, not `/markets/{ticker}/candlesticks` → it had 404'd; the old D-1 48–24h window is also empty because these markets only trade in the final ~24h). Re-fetched → `data/historical/kalshi_prices.parquet` = **13,631 genuine prices** (Apr 11 – Jun 22 2026): 0.5% at 0.5, **corr(price, settlement) = +0.71, market Brier 0.068**. The market is a STRONG forecaster — any real edge will be thin at best.
+
+**Honest current state: there is NO trustworthy real-price backtest.** The only defensible metrics are the calibration numbers (CRPS 3.56, Brier 0.058, reliability slope 0.984) and the robustness/Monte-Carlo *structure* — all independent of pricing. See [[kalshi-price-history-rolling-window]] in memory.
+
+### Other things done this session (2026-06-22 → 06-23)
+- **Param stability + Monte Carlo run.** Sharpe flat ~3.05 across 32 configs (CV 0.58%); kelly/exposure are pure leverage. 0% ruin prob; survives 20% outcome-perturbation. (All vs climatology — same caveat.) Outputs in `data/stability/`, `data/montecarlo/`, `data/fold_variance/` (P&L variance is seasonal, corr(pnl/trade, CRPS)=+0.37).
+- **Production models retrained** per-lead-bucket (`KATL_D1-2` composite keys). 60/60 ngboost+qrf+calibrators; blender ngboost 0.529 / qrf 0.471. Run `train_final_models()` DIRECTLY (not `main()`, which re-runs the 17-hr backtest); needs `init_db()` first.
+- **Fair-value clamp** (TDD): `FAIR_VALUE_FLOOR=0.02`/`CEIL=0.98` in `strategies/ensemble_strategy.py` — kills the cal_prob=1.0 overconfidence at coastal stations (KSFO/KLAX).
+- **Test suite: 310 passing** (was 293).
+- **Storage:** pruned ~26 GB of regenerable GEFS/NBM caches + model backup; `data/` 36 GB → 9.4 GB. `data/era5` (rebuild source) and `data/historical/` KEPT.
+
+### Data file state (current)
+- `data/historical/kalshi_prices.parquet` — **genuine** prices (13,631; Apr 11–Jun 22). Backups: `*.backup_20260622_*` (old fabricated) and `*.prefix_fix_backup_20260623_*`.
+- `data/backtest_trades.parquet` — restored to the ORIGINAL 24-fold run (fake-price; used by montecarlo/param_stability). The 2-fold real-price experiment is saved aside as `data/backtest_trades.realprice_mismatch_experiment.parquet`.
+- `data/backtest_results_realprice.csv` — the 2-fold (Apr/May) real-price run (mismatched; do not trust P&L).
+
+---
+
+## 🔜 NEXT SESSION — Build the real-markets evaluation harness
+
+**Goal:** the first trustworthy real-price evaluation. Score the strategy against the ACTUAL Kalshi markets at their real thresholds/settlements, not synthetic median-threshold markets.
+
+**Why a new harness (not a runner.py tweak):** `backtest/runner.py` is built around synthetic station×month-median thresholds for the climatology benchmark. Real markets have their own thresholds and binary settlements. The two can't be reconciled by nearest-threshold matching (that's bug #3).
+
+**Inputs available:**
+- `data/historical/kalshi_prices.parquet` — real markets with columns `ticker, series, station, date, threshold, market_type (above/below), d1_mid (real decision-time price), settlement (1.0/0.0), volume`.
+- `data/historical/features.parquet` — model features per (station, date, lead_hour); covers through 2026-05-27 (so real-market eval overlaps ~Apr 11 – May 27).
+- Trained models via `models.registry.load_latest_artifact` (per `{station}_{lead_bucket}`), `_compute_fair_value` in `strategies/ensemble_strategy.py`.
+
+**Harness spec (proposed):**
+1. For each real market row (station, date, threshold, market_type) with a non-null `settlement` AND a real `d1_mid`:
+2. Get the model's fair value AT THAT EXACT threshold/type/date via the ensemble (`_compute_fair_value` with `threshold=market.threshold`, correct `market_type` — note "below" = `1 - P(above)`).
+3. **No look-ahead:** do NOT use the all-data production models for the eval window. Either (a) train walk-forward models up to date−1, or (b) restrict eval to a window the production models did not train on. Decide first — this is the crux of validity.
+4. edge = fair − d1_mid; trade if |edge| ≥ MIN_EDGE; size via `compute_size` (or flat $1 for a clean Sharpe); settle P&L against `settlement` with the 5% fee.
+5. Aggregate: per-market P&L, win rate, **model Brier vs settlement compared to market Brier (0.068)** — if model Brier ≥ 0.068, there is NO edge. Report daily/monthly Sharpe with explicit sample-size caveats (~6–7 weeks of overlap only).
+
+**Watch out for:** market_type direction (above vs below); the features×real-price overlap is short (Apr 11–May 27) → small sample, fragile Sharpe; the production models have look-ahead over this window (must address in step 3); volume-weight or filter illiquid markets.
+
+---
+
+## Current State (as of this handoff) — ⚠️ partly superseded by the correction above
 
 ### What works end-to-end
 - Live ingestion: GEFS (20 ensemble members), ECMWF, NBM all ingest and build a feature matrix
@@ -16,7 +64,7 @@ The full pipeline: ingest live weather forecasts → build feature matrix → ru
 - Strategy loop (`EnsembleStrategy.run_cycle`): fetches active tickers, builds features, selects the correct per-lead-bucket model, computes calibrated fair value, applies Kelly sizing, submits paper trades
 - Risk controls: drawdown limits, per-ticker cooldowns, CI-width gate
 - `PAPER_TRADING = True`, `BOT_ACTIVE = True` — no live money is at risk
-- 293 passing tests (full suite)
+- 310 passing tests (full suite, as of 2026-06-23)
 
 ### Backtest results (just completed — 24 folds, May 2024 → Apr 2026)
 Models trained with per-lead-bucket specialisation (D1-2, D3-4, D5-7) on expanding window.
@@ -31,10 +79,9 @@ Models trained with per-lead-bucket specialisation (D1-2, D3-4, D5-7) on expandi
 | Total simulated P&L (21 clim folds) | $156,753 |
 | Monthly mean / std | $7,464 / $2,538 |
 | Annualised Sharpe (clim baseline) | **10.2** |
-| **vs. Real Kalshi prices (Mar–Apr 2026)** | |
-| Total real-price P&L | $95,983 over 639 trades |
+| **vs. Real Kalshi prices** | ❌ **FAKE — see correction banner above.** The "$95,983 / 639 trades" was the model beating a fabricated constant 0.5, NOT real prices. Do not cite. |
 
-**Critical caveat on the Sharpe / P&L figures:** The majority of folds (21 of 24) use *climatological probabilities* as the synthetic market price, not real Kalshi order-book mid prices. Beating climatology is a necessary but not sufficient condition for profitability — real Kalshi markets already incorporate some weather signal. The only folds with real market prices are March and April 2026 (639 trades, $95,983 P&L). Those numbers look good but the sample is too small to draw conclusions. The parameter stability and Monte Carlo analyses still need to be run to properly evaluate the strategy.
+**Critical caveat (now superseded):** This section predates the 2026-06-23 discovery that the "real Kalshi price" pipeline was feeding a fabricated 0.5 to 94% of trades (bug #1) and that the backtest can't consume real prices anyway (bug #3). Treat ALL real-price numbers here as invalid. The climatology-vs numbers (Sharpe ~3.05/10.2) are real but only measure edge-vs-climatology, which is necessary-not-sufficient. Param-stability + Monte Carlo were since run (see correction banner).
 
 ### Saved outputs ready for analysis
 - `data/backtest_results.csv` — 24-fold fold-level metrics

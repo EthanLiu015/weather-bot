@@ -39,12 +39,26 @@ def load_feature_data() -> pd.DataFrame:
     return df
 
 
-def train_final_models(df: pd.DataFrame) -> None:
-    """Step 3: train final per-station models on ALL data and persist a global
-    blend-weight artifact.
+def train_models(
+    df: pd.DataFrame,
+    n_estimators: int = 500,
+    learning_rate: float = 0.01,
+    min_rows: int = 200,
+) -> dict:
+    """Train per-station/lead-bucket models IN MEMORY and return them as a bundle.
 
-    Split out from main() so it can be re-run on its own (e.g. to recompute
-    blend weights) without repeating the ~1.5hr walk-forward backtest.
+    This is the single source of truth for the production training recipe
+    (residual reframing, per-lead-bucket NGBoost+QRF, spectrum calibration,
+    held-out blend weights, per-station residual model). `train_final_models`
+    persists the returned bundle to the registry; the real-markets eval harness
+    consumes it directly without touching the registry (so it can train on a
+    look-ahead-free pre-window subset without clobbering production models).
+
+    Returns a dict with keys:
+        ngboost/qrf/calibrator: {model_key -> model}, model_key = f"{st}_{bucket}"
+        residual: {station -> ResidualModel}
+        blender: ModelBlender
+        ngb_scores/qrf_scores: {model_key -> in-sample score} (for crps metadata)
     """
     from processing.features import get_feature_columns
     from processing.bias_correction import LEAD_BUCKET_HOUR_RANGES
@@ -53,22 +67,20 @@ def train_final_models(df: pd.DataFrame) -> None:
     from models.residual_model import ResidualModel
     from models.calibration import IsotonicCalibrator, build_calibration_dataset
     from models.blend import ModelBlender
-    from models.registry import save_artifact
     from backtest.runner import BLEND_VALIDATION_WINDOWS
 
     feature_cols = get_feature_columns()
 
     if "actual_tmax" not in df.columns:
-        logger.error("No 'actual_tmax' column in feature data")
-        return
+        raise ValueError("No 'actual_tmax' column in feature data")
     if "ecmwf_tmax" not in df.columns:
-        logger.error("No 'ecmwf_tmax' column — required for residual reframing")
-        return
-
-    logger.info("=== Training final models (residual reframing: target = actual_tmax - ecmwf_tmax) ===")
-    CALIBRATOR_DIR.mkdir(parents=True, exist_ok=True)
+        raise ValueError("No 'ecmwf_tmax' column — required for residual reframing")
 
     blender = ModelBlender()
+    ngboost_models: dict[str, NGBoostTemperatureModel] = {}
+    qrf_models: dict[str, QRFTemperatureModel] = {}
+    calibrators: dict[str, IsotonicCalibrator] = {}
+    residual_models: dict[str, ResidualModel] = {}
     ngb_scores: dict[str, float] = {}
     qrf_scores: dict[str, float] = {}
     ngb_crps_oos: dict[str, float] = {}
@@ -90,8 +102,8 @@ def train_final_models(df: pd.DataFrame) -> None:
             sub = station_df[mask]
             model_key = f"{station}_{lead_bucket}"
 
-            if len(sub) < 200:
-                logger.warning("Skipping %s — only %d rows (need 200)", model_key, len(sub))
+            if len(sub) < min_rows:
+                logger.warning("Skipping %s — only %d rows (need %d)", model_key, len(sub), min_rows)
                 continue
 
             X_sub = sub[avail_cols].fillna(0.0)
@@ -102,20 +114,20 @@ def train_final_models(df: pd.DataFrame) -> None:
             logger.info("%s: %d rows, residual std=%.2f°F", model_key, len(sub), float(y_sub.std()))
 
             # NGBoost
-            ngb = NGBoostTemperatureModel(n_estimators=500, learning_rate=0.01)
+            ngb = NGBoostTemperatureModel(n_estimators=n_estimators, learning_rate=learning_rate)
             ngb.fit(X_sub, y_sub)
             ngb_score = ngb.log_score(X_sub, y_sub)
             ngb_scores[model_key] = ngb_score
             ngb_by_bucket[lead_bucket] = ngb
-            save_artifact(ngb, "ngboost", model_key, crps_val=abs(ngb_score))
+            ngboost_models[model_key] = ngb
             logger.info("NGBoost %s log_score=%.4f", model_key, ngb_score)
 
             # QRF
-            qrf = QRFTemperatureModel(n_estimators=500, min_samples_leaf=20)
+            qrf = QRFTemperatureModel(n_estimators=n_estimators, min_samples_leaf=20)
             qrf.fit(X_sub, y_sub)
             qrf_score = qrf.log_score(X_sub, y_sub)
             qrf_scores[model_key] = qrf_score
-            save_artifact(qrf, "qrf", model_key, crps_val=abs(qrf_score))
+            qrf_models[model_key] = qrf
             logger.info("QRF %s crps=%.4f", model_key, qrf_score)
 
             # Held-out CRPS for blend weights (85/15 split, averaged across windows)
@@ -123,11 +135,11 @@ def train_final_models(df: pd.DataFrame) -> None:
             X_tr_bw, X_val_bw = X_sub.iloc[:-val_n], X_sub.iloc[-val_n:]
             y_tr_bw, y_val_bw = y_sub.iloc[:-val_n], y_sub.iloc[-val_n:]
 
-            ngb_bw = NGBoostTemperatureModel(n_estimators=500, learning_rate=0.01)
+            ngb_bw = NGBoostTemperatureModel(n_estimators=n_estimators, learning_rate=learning_rate)
             ngb_bw.fit(X_tr_bw, y_tr_bw)
             ngb_crps_oos[model_key] = ngb_bw.crps(X_val_bw, y_val_bw, n_windows=BLEND_VALIDATION_WINDOWS)
 
-            qrf_bw = QRFTemperatureModel(n_estimators=500, min_samples_leaf=20)
+            qrf_bw = QRFTemperatureModel(n_estimators=n_estimators, min_samples_leaf=20)
             qrf_bw.fit(X_tr_bw, y_tr_bw)
             qrf_crps_oos[model_key] = qrf_bw.log_score(X_val_bw, y_val_bw, n_windows=BLEND_VALIDATION_WINDOWS)
 
@@ -139,9 +151,8 @@ def train_final_models(df: pd.DataFrame) -> None:
             raw_probs, outcomes = build_calibration_dataset(ngb, X_sub, y_sub)
             cal = IsotonicCalibrator()
             cal.fit(raw_probs, outcomes)
-            cal_path = CALIBRATOR_DIR / f"{model_key}.pkl"
-            cal.save(str(cal_path))
-            logger.info("Calibrator saved: %s (n=%d, slope=%.3f)",
+            calibrators[model_key] = cal
+            logger.info("Calibrator fit: %s (n=%d, slope=%.3f)",
                         model_key, len(sub), cal.reliability_slope())
 
         # Residual model (LightGBM) corrects systematic NGBoost errors using all
@@ -149,7 +160,7 @@ def train_final_models(df: pd.DataFrame) -> None:
         X_st_all = station_df[avail_cols].fillna(0.0)
         y_st_all = station_df["actual_tmax"] - station_df["ecmwf_tmax"]
 
-        if len(X_st_all) >= 200 and ngb_by_bucket:
+        if len(X_st_all) >= min_rows and ngb_by_bucket:
             residual_feature_cols = [c for c in [
                 "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
                 "obs_minus_model_roll_mean", "obs_minus_model_roll_std",
@@ -163,19 +174,57 @@ def train_final_models(df: pd.DataFrame) -> None:
             if residual_feature_cols and residuals.abs().mean() > 0.01:
                 res_model = ResidualModel(station=station)
                 res_model.fit(X_st_all[residual_feature_cols], residuals)
-                save_artifact(res_model, "residual", station)
-                logger.info("Residual model saved for %s (mean_residual=%.2f°F)",
+                residual_models[station] = res_model
+                logger.info("Residual model fit for %s (mean_residual=%.2f°F)",
                             station, residuals.mean())
 
     # Compute blend weights from held-out CRPS (lower = better; negate since
     # compute_weights_from_log_scores treats higher = better)
-    if ngb_crps_oos and qrf_crps_oos:
+    blend_computed = bool(ngb_crps_oos and qrf_crps_oos)
+    if blend_computed:
         mean_ngb_crps = float(np.mean(list(ngb_crps_oos.values())))
         mean_qrf_crps = float(np.mean(list(qrf_crps_oos.values())))
         blender.compute_weights_from_log_scores(-mean_ngb_crps, -mean_qrf_crps)
         logger.info("Held-out mean CRPS: NGBoost=%.4f QRF=%.4f", mean_ngb_crps, mean_qrf_crps)
         logger.info("Final blend weights: %s", blender.weights)
-        blender_path = save_artifact(blender, "blender", "global")
+
+    return {
+        "ngboost": ngboost_models,
+        "qrf": qrf_models,
+        "calibrator": calibrators,
+        "residual": residual_models,
+        "blender": blender,
+        "blend_computed": blend_computed,
+        "ngb_scores": ngb_scores,
+        "qrf_scores": qrf_scores,
+    }
+
+
+def train_final_models(df: pd.DataFrame) -> None:
+    """Step 3: train final per-station models on ALL data and persist them to the
+    registry (NGBoost/QRF/residual/blender artifacts + calibrator pickles).
+
+    Split out from main() so it can be re-run on its own (e.g. to recompute
+    blend weights) without repeating the ~1.5hr walk-forward backtest.
+    """
+    from models.registry import save_artifact
+
+    logger.info("=== Training final models (residual reframing: target = actual_tmax - ecmwf_tmax) ===")
+    CALIBRATOR_DIR.mkdir(parents=True, exist_ok=True)
+
+    bundle = train_models(df)
+
+    for model_key, ngb in bundle["ngboost"].items():
+        save_artifact(ngb, "ngboost", model_key, crps_val=abs(bundle["ngb_scores"][model_key]))
+    for model_key, qrf in bundle["qrf"].items():
+        save_artifact(qrf, "qrf", model_key, crps_val=abs(bundle["qrf_scores"][model_key]))
+    for model_key, cal in bundle["calibrator"].items():
+        cal.save(str(CALIBRATOR_DIR / f"{model_key}.pkl"))
+    for station, res_model in bundle["residual"].items():
+        save_artifact(res_model, "residual", station)
+
+    if bundle["blend_computed"]:
+        blender_path = save_artifact(bundle["blender"], "blender", "global")
         logger.info("Blend weights saved to %s", blender_path)
 
     logger.info("=== Training complete ===")

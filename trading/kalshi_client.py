@@ -128,8 +128,10 @@ class KalshiClient:
         return data
 
     async def get_candlesticks(self, ticker: str, period_interval: int = 1440) -> list[dict]:
-        # Correct endpoint: /markets/{ticker}/candlesticks
-        data = await self._request("GET", f"/markets/{ticker}/candlesticks",
+        # Kalshi requires the series in the path: /series/{series}/markets/{ticker}/candlesticks.
+        # The bare /markets/{ticker}/candlesticks form 404s. Series is the ticker prefix.
+        series = ticker.split("-")[0]
+        data = await self._request("GET", f"/series/{series}/markets/{ticker}/candlesticks",
                                    params={"period_interval": period_interval})
         return data.get("candlesticks", [])
 

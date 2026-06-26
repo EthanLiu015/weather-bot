@@ -13,7 +13,7 @@ import logging
 import re
 import sys
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pathlib import Path
 
 import httpx
@@ -119,10 +119,12 @@ class ReadOnlyKalshiClient:
             params["cursor"] = cursor
         return await self._get("/markets", params=params)
 
-    async def get_candlesticks(self, ticker: str, start_ts: int, end_ts: int) -> list[dict]:
+    async def get_candlesticks(self, series: str, ticker: str, start_ts: int, end_ts: int) -> list[dict]:
+        # Kalshi requires the series in the path: /series/{series}/markets/{ticker}/candlesticks.
+        # The bare /markets/{ticker}/candlesticks form 404s.
         params = {"start_ts": start_ts, "end_ts": end_ts, "period_interval": 60}
         try:
-            data = await self._get(f"/markets/{ticker}/candlesticks", params=params)
+            data = await self._get(f"/series/{series}/markets/{ticker}/candlesticks", params=params)
             return data.get("candlesticks", [])
         except Exception as exc:
             logger.debug("Candlestick fetch failed for %s: %s", ticker, exc)
@@ -151,29 +153,64 @@ def _compute_d1_mid(prev_bid, prev_ask, last_price=None) -> float:
     return (bid + ask) / 2.0
 
 
-def _parse_ticker(ticker: str, series: str) -> dict | None:
+def _decision_price_from_candles(candles: list[dict], cutoff_ts: int) -> float | None:
+    """Return the last traded price (price.close) from the candle at or before
+    `cutoff_ts`, or None.
+
+    `cutoff_ts` is the model's decision time (end of D-1). Candles after the
+    cutoff are ignored so the backtest price carries no look-ahead toward the
+    known outcome. A close of exactly 0 or 1 is a settled/degenerate value and is
+    skipped — only genuine in-(0,1) trade prices count.
     """
-    Parse ticker like KXHIGHCHI-26MAY31-T81 or KXHIGHCHI-26MAY31-B80.5
-    Returns: {date, threshold, market_type ('above'/'below')}
-    """
-    # Extract date part: YYMMMDD e.g. 26MAY31
+    best_ts: int | None = None
+    best_price: float | None = None
+    for c in candles:
+        ts = c.get("end_period_ts")
+        if ts is None or ts > cutoff_ts:
+            continue
+        price = c.get("price") or {}
+        raw = price.get("close_dollars")
+        if raw in (None, ""):
+            raw = price.get("mean_dollars")
+        if raw in (None, ""):
+            continue
+        val = float(raw)
+        if val <= 0.0 or val >= 1.0:
+            continue
+        if best_ts is None or ts > best_ts:
+            best_ts, best_price = ts, val
+    return best_price
+
+
+def _parse_resolution_date(ticker: str) -> date | None:
+    """Extract the resolution date (YYMMMDD, e.g. 26MAY31) from a ticker."""
     date_match = re.search(r"-(\d{2}[A-Z]{3}\d{2})-", ticker)
     if not date_match:
         return None
     try:
-        resolution_date = datetime.strptime(date_match.group(1), "%y%b%d").date()
+        return datetime.strptime(date_match.group(1), "%y%b%d").date()
     except ValueError:
         return None
 
-    # Extract threshold: T75 or B80.5
-    thresh_match = re.search(r"-([TB])([\d.]+)$", ticker)
-    if not thresh_match:
-        return None
 
-    market_type = "above" if thresh_match.group(1) == "T" else "below"
-    threshold = float(thresh_match.group(2))
+def _strike_fields(m: dict) -> dict:
+    """Extract the true bracket structure from a Kalshi market object.
 
-    return {"date": resolution_date, "threshold": threshold, "market_type": market_type}
+    Kalshi temperature markets are mutually-exclusive brackets, NOT above/below
+    contracts. The API gives the exact structure:
+      * strike_type "greater": YES if high > floor_strike (e.g. ">84°")
+      * strike_type "less":    YES if high < cap_strike   (e.g. "76° or below")
+      * strike_type "between": YES if floor_strike ≤ high ≤ cap_strike
+    floor_strike / cap_strike are absent for the side that is unbounded.
+    """
+    def _f(v):
+        return None if v is None else float(v)
+
+    return {
+        "strike_type": m.get("strike_type"),
+        "floor_strike": _f(m.get("floor_strike")),
+        "cap_strike": _f(m.get("cap_strike")),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -196,8 +233,11 @@ async def fetch_series_markets(
 
         for m in markets:
             ticker = m.get("ticker", "")
-            parsed = _parse_ticker(ticker, series)
-            if not parsed:
+            resolution_date = _parse_resolution_date(ticker)
+            if resolution_date is None:
+                continue
+            strikes = _strike_fields(m)
+            if strikes["strike_type"] is None:
                 continue
 
             # Get D+1 mid from previous_yes_bid/ask (prices from prior trading
@@ -215,9 +255,11 @@ async def fetch_series_markets(
                 "ticker":       ticker,
                 "series":       series,
                 "station":      station,
-                "date":         parsed["date"],
-                "threshold":    parsed["threshold"],
-                "market_type":  parsed["market_type"],
+                "date":         resolution_date,
+                "strike_type":  strikes["strike_type"],
+                "floor_strike": strikes["floor_strike"],
+                "cap_strike":   strikes["cap_strike"],
+                "subtitle":     m.get("yes_sub_title") or m.get("subtitle"),
                 "d1_mid":       d1_mid,
                 "settlement":   settlement,
                 "yes_bid":      m.get("yes_bid_dollars"),
@@ -238,49 +280,57 @@ async def fetch_series_markets(
 # Enrich with candlestick D+1 prices (authenticated)
 # ---------------------------------------------------------------------------
 
+# Decision cutoff: 14:00 UTC on resolution day ≈ 7–10am US local, before the
+# afternoon max-temp high occurs. A price taken at/before this is one the bot
+# could actually have traded on without knowing the outcome (no look-ahead).
+DECISION_CUTOFF_HOUR_UTC = 14
+
+
 async def enrich_with_candlesticks(
     client: ReadOnlyKalshiClient,
     df: pd.DataFrame,
-    sample_size: int = 200,
+    sample_size: int = 20000,
 ) -> pd.DataFrame:
-    """
-    For a sample of markets, fetch hourly candlestick data to get a more
-    accurate D+1 price (market mid 24h before resolution).
-    Used to validate / improve the prev_bid/ask proxy.
+    """Replace the (unreliable) bid/ask proxy with the real last-traded price
+    from candlesticks, sampled at the model's decision time (no look-ahead).
+
+    For settled markets the order book collapses to 0/1, so the bid/ask proxy is
+    fabricated; the candle `price` (last trade) is the genuine price. We pull
+    candles over [res-2d, decision cutoff] and take the last trade at or before
+    the cutoff via _decision_price_from_candles.
     """
     df = df.copy()
     df["d1_candle_mid"] = float("nan")
 
-    # Sample markets where we have volume (actively traded)
-    # volume_fp comes back as a string from Kalshi — convert first
     df["_vol_num"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
     active = df[df["_vol_num"] > 0].head(sample_size)
-    logger.info("Fetching candlestick D+1 prices for %d markets...", len(active))
+    logger.info("Fetching candlestick decision-time prices for %d markets...", len(active))
 
-    for _, row in active.iterrows():
+    updated = 0
+    for n, (_, row) in enumerate(active.iterrows()):
         ticker = row["ticker"]
-        res_date = row["date"]
-        # D+1: 24h window starting 48h before resolution midnight
-        res_ts = int(datetime(res_date.year, res_date.month, res_date.day).timestamp())
-        start_ts = res_ts - 48 * 3600
-        end_ts = res_ts - 24 * 3600
+        series = row["series"]
+        rd = pd.Timestamp(row["date"]).date()
+        res_midnight = int(datetime(rd.year, rd.month, rd.day, tzinfo=timezone.utc).timestamp())
+        cutoff_ts = res_midnight + DECISION_CUTOFF_HOUR_UTC * 3600
+        start_ts = res_midnight - 2 * 86400
 
-        candles = await client.get_candlesticks(ticker, start_ts, end_ts)
-        if candles:
-            # Use the last candle's close price as D+1 mid
-            last = candles[-1]
-            close = last.get("close", {})
-            yes_price = close.get("yes_price")
-            if yes_price is not None:
-                df.loc[df["ticker"] == ticker, "d1_candle_mid"] = float(yes_price) / 100.0
+        candles = await client.get_candlesticks(series, ticker, start_ts, cutoff_ts)
+        price = _decision_price_from_candles(candles, cutoff_ts)
+        if price is not None:
+            df.loc[df["ticker"] == ticker, "d1_candle_mid"] = price
+            updated += 1
 
-        await asyncio.sleep(0.15)
+        if n and n % 250 == 0:
+            logger.info("  ...%d/%d processed, %d priced", n, len(active), updated)
+        await asyncio.sleep(0.1)
 
-    # Use candlestick price where available, fall back to prev_bid/ask proxy
-    has_candle = df["d1_candle_mid"].notna()
-    df.loc[has_candle, "d1_mid"] = df.loc[has_candle, "d1_candle_mid"]
+    # Candlesticks are the ONLY genuine price source for settled markets —
+    # overwrite d1_mid wholesale (the bid/ask proxy is NaN for empty books).
+    df["d1_mid"] = df["d1_candle_mid"]
     df = df.drop(columns=["d1_candle_mid", "_vol_num"], errors="ignore")
-    logger.info("Candlestick enrichment: %d markets updated", has_candle.sum())
+    logger.info("Candlestick enrichment: %d/%d markets priced from real candles",
+                int(df["d1_mid"].notna().sum()), len(active))
     return df
 
 
