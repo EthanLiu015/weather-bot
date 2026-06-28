@@ -159,6 +159,19 @@ def test_evaluate_less_bracket_direction_flows_into_pnl():
     assert result["simulated_pnl_usd"] > 0
 
 
+def test_evaluate_reports_breakdown_by_strike_type():
+    markets = _markets([
+        ("KORD", "2026-04-12", "greater", 80.0, None, 0.50, 1.0),
+        ("KORD", "2026-04-13", "between", 80.0, 81.0, 0.50, 0.0),
+    ])
+    pa = {("KORD", "2026-04-12"): 0.9, ("KORD", "2026-04-13"): 0.5}
+    result = evaluate_real_markets(markets, lambda s, d, x: pa[(s, d)], min_edge=0.04)
+    bt = result["by_strike_type"]
+    assert bt["greater"]["n"] == 1
+    assert bt["between"]["n"] == 1
+    assert "less" not in bt  # none present
+
+
 def test_evaluate_respects_min_edge():
     markets = _markets([
         ("KORD", "2026-04-12", "greater", 80.0, None, 0.50, 1.0),

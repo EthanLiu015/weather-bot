@@ -34,7 +34,49 @@ The full pipeline: ingest live weather forecasts → build feature matrix → ru
 
 ---
 
-## 🔜 NEXT SESSION — Build the real-markets evaluation harness
+## ✅ DONE (2026-06-27) — Real-markets evaluation harness BUILT + first trustworthy result
+
+**Result (definitive, n_est=500 production-matching): NO EDGE.** Model Brier **0.1448** vs market Brier **0.0963** on 3,340 real high-temp bracket markets (Apr 11–May 27). Flat-$1 P&L −$8.91 / 2,474 trades, win rate 31.7%, daily Sharpe −1.4. 500 trees barely moved the result vs an 80-tree run (0.146 → 0.1448) → this is a **genuine no-edge result, not undertraining**. The market beats the model in EVERY strike type:
+
+| strike_type | n | model Brier | market Brier | edge? |
+|---|---|---|---|---|
+| greater (tail) | 557 | 0.0641 | **0.0159** | no |
+| less (tail) | 557 | 0.1643 | **0.0736** | no |
+| between (2° bin) | 2226 | 0.1601 | **0.1222** | no |
+
+The model's calibrated forecasts, mapped to Kalshi's real brackets, are **less accurate than the market's own prices** — even in the tails where the station/source mismatch barely bites. Kalshi temperature markets are a strong forecaster; this strategy as-is has no demonstrable edge.
+
+### Two big discoveries this session
+1. **Kalshi temp markets are mutually-exclusive ~2°F BRACKETS, not above/below.** Proven: 1,206/1,207 (station,date,series) groups have exactly one settled winner. The old fetch mislabeled `B…` tickers as "below" (they're `between` bins) and `T…` as "above" (they're `greater`/`less` tails). The API exposes the truth via `strike_type ∈ {greater,less,between}` + `floor_strike`/`cap_strike` + `subtitle`. **FIXED** in `scripts/fetch_kalshi_history.py` (`_strike_fields`); re-fetched `kalshi_prices.parquet` (13,670 rows, now has `strike_type/floor_strike/cap_strike/subtitle`; old above/below `threshold`/`market_type` columns GONE).
+2. **PRODUCTION PRICING BUG (still open).** `strategies/ensemble_strategy.py` prices EVERY ticker as `P(tmax > threshold)` (`_ticker_to_threshold` + `_compute_fair_value`), ignoring T-vs-B. For bracket markets the correct YES is `P(floor ≤ tmax ≤ cap)`. **The deployed bot mis-prices every bracket market (most of them).** Needs a fix mirroring `bracket_yes_prob` (TDD + approval).
+
+### How the harness prices brackets (correct semantics, integer-°F continuity ±0.5)
+- `greater` (>F, "F+1° or above"): YES = `P(high > F+0.5)`
+- `less` (<C, "C−1° or below"): YES = `1 − P(high > C−0.5)`
+- `between [F,C]` ("F° to C°"): YES = `P(high > F−0.5) − P(high > C+0.5)`
+`prob_above(x)` = the production calibrated `P(high>x)` (reuses `_compute_fair_value`'s exact ngboost+residual+qrf-blend+isotonic path; a parity test pins it).
+
+### Caveat that caps achievable model Brier: station/source mismatch
+Kalshi settles on the official NWS station (e.g. Chicago **Midway**); our features use the ASOS station (e.g. KORD = **O'Hare**). `(our actual_tmax vs settlement)` agree only **87.6%** overall (greater 98%, less 93%, **between 84%** — a 1°F source gap flips ~16% of tight 2° brackets). The model is structurally handicapped on `between` brackets. See per-strike-type breakdown in the harness output — any genuine edge would surface in the tails (greater/less).
+
+### Files added/changed
+- **NEW** `backtest/real_market_eval.py` — the harness. Run: `PYTHONPATH=. python -m backtest.real_market_eval [--n-estimators 500] [--eval-start … --eval-end …]`. Trains look-ahead-free models on data **before** the eval window (single split — chosen because the window is only ~6.5wk and there's 5yr of prior weather data; daily walk-forward was rejected as overkill). Batched per station-bucket (~60 forest evals, not ~8k). Reports model vs market Brier overall + per strike_type, flat-$1 P&L, win rate, daily Sharpe.
+- **REFACTOR** `scripts/initial_train.py` — extracted pure in-memory `train_models(df) → bundle` (single training recipe, no registry writes); `train_final_models` now persists from it. Harness consumes the bundle directly so it never clobbers production models.
+- `scripts/fetch_kalshi_history.py` — `_strike_fields`; rows now carry real strike structure.
+- Tests: `tests/test_real_market_eval.py` (21), `tests/test_train_models_bundle.py` (2), `tests/test_fetch_kalshi_history.py` (+4 strike tests).
+- Backups: `data/historical/kalshi_prices.preBracket_backup_*.parquet` (the old above/below-labelled data).
+
+### ⚠️ PERF GOTCHA fixed
+`IsotonicCalibrator.calibrate()` runs `bootstrap_ci` (1000 isotonic refits) per call — fine for production (a few dozen tickers/cycle) but the harness prices ~8k bracket boundaries → it hung. The harness calls `calibrator._iso.predict()` directly for `cal_prob` (identical value, no CI), since the eval doesn't use ci_width.
+
+### Open / next
+- **Fix the production bracket-pricing bug** (ensemble_strategy) — the bot is live-mispricing every bracket. But note: even correctly priced, the eval shows NO edge, so fixing it makes the bot *correct*, not *profitable*.
+- The honest strategic question: with no edge vs Kalshi on this data, is the project worth continuing as-is? Possible angles: source-match to the exact NWS settlement station per series (lifts the `between` ceiling — see caveat); restrict to tails only; different markets/lead times; or accept the market is efficient here.
+- Definitive numbers are in `/tmp/harness_final.log`; re-run with `PYTHONPATH=. python -m backtest.real_market_eval --n-estimators 500`.
+
+---
+
+## (historical) NEXT SESSION plan — Build the real-markets evaluation harness  ✅ done above
 
 **Goal:** the first trustworthy real-price evaluation. Score the strategy against the ACTUAL Kalshi markets at their real thresholds/settlements, not synthetic median-threshold markets.
 

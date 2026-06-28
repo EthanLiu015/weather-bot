@@ -158,6 +158,7 @@ def evaluate_real_markets(
     mids: list[float] = []
     outcomes: list[float] = []
     dates: list[str] = []
+    strike_types: list[str] = []
 
     for row in markets.itertuples(index=False):
         date_str = str(pd.Timestamp(row.date).date())
@@ -173,6 +174,7 @@ def evaluate_real_markets(
         mids.append(float(row.d1_mid))
         outcomes.append(float(row.settlement))
         dates.append(date_str)
+        strike_types.append(row.strike_type)
 
     n = len(fair_yes)
     if n == 0:
@@ -212,8 +214,24 @@ def evaluate_real_markets(
     model_brier = brier_score(fair_arr, out_arr)
     market_brier = brier_score(mid_arr, out_arr)
 
+    # Breakdown by strike_type — the 2°-wide "between" brackets are far more
+    # sensitive to the station/source mismatch than the "greater"/"less" tails,
+    # so any genuine edge is most likely to surface in the tails.
+    st_arr = np.array(strike_types)
+    by_strike_type: dict[str, dict] = {}
+    for st in ("greater", "less", "between"):
+        mask = st_arr == st
+        if not mask.any():
+            continue
+        by_strike_type[st] = {
+            "n": int(mask.sum()),
+            "model_brier": brier_score(fair_arr[mask], out_arr[mask]),
+            "market_brier": brier_score(mid_arr[mask], out_arr[mask]),
+        }
+
     return {
         "num_scored_markets": n,
+        "by_strike_type": by_strike_type,
         "num_simulated_trades": num_trades,
         "simulated_pnl_usd": float(traded_pnl.sum()),
         "win_rate": float((traded_pnl > 0).sum() / num_trades) if num_trades else 0.0,
@@ -326,8 +344,13 @@ def build_fair_value_fn(bundle: dict, eval_features: pd.DataFrame) -> ProbAboveF
                 raw_prob = weights["ngboost"] * raw_prob + weights["qrf"] * qrf_prob
             except Exception:
                 pass
-        if c["calibrator"] is not None:
-            cal_prob, _, _ = c["calibrator"].calibrate(raw_prob)
+        cal = c["calibrator"]
+        if cal is not None and cal._iso is not None:
+            # Use the isotonic prediction directly. This is exactly the cal_prob
+            # production's calibrate() returns; we skip its bootstrap_ci (1000
+            # isotonic refits per call) because the eval never uses ci_width and
+            # the harness prices ~8k bracket boundaries.
+            cal_prob = float(cal._iso.predict([raw_prob])[0])
         else:
             cal_prob = raw_prob
         return min(FAIR_VALUE_CEIL, max(FAIR_VALUE_FLOOR, float(cal_prob)))
@@ -429,6 +452,11 @@ def main() -> None:
     print(f"  Market Brier:      {result['market_brier']:.4f}  (benchmark {result['market_brier_benchmark']})")
     verdict = "EDGE: model beats market" if result["has_edge"] else "NO EDGE: model does not beat market"
     print(f"  VERDICT:           {verdict}")
+    print("-" * 60)
+    print("  By strike_type     n     model Brier   market Brier   edge?")
+    for st, d in result.get("by_strike_type", {}).items():
+        edge = "YES" if d["model_brier"] < d["market_brier"] else "no"
+        print(f"    {st:<8}     {d['n']:>5}      {d['model_brier']:.4f}        {d['market_brier']:.4f}       {edge}")
     print("=" * 60)
 
 
