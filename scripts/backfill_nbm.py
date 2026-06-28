@@ -26,11 +26,15 @@ logger = logging.getLogger(__name__)
 
 NBM_S3_BASE = "https://noaa-nbm-grib2-pds.s3.amazonaws.com"
 
-# features.parquet's lead_hour values. init_utc is always the 00z cycle
-# (vdate is midnight and lead_hour is a multiple of 24), so only the 00z
-# cycle's forecast hours are needed: tmax_fhour == lead_hour,
-# tmin_fhour == lead_hour - 12.
+# features.parquet's lead_hour values. A row (date=D, lead_hour=L) is the
+# forecast for D's daily high from the 00z init L hours before D's midnight
+# (init = D - L), matching build_feature_matrix. NBM's daytime-max window is
+# 12-24Z of the verification DAY, which from a 00z init ends at forecast hour
+# L + 24 (TMAX); the overnight TMIN window ends at L + 12. (The earlier code
+# used fhour == L / L-12, which read the INIT day's high — one day too early.)
 LEAD_HOURS = [24, 48, 72, 96, 120, 168]
+_TMAX_FHOUR_OFFSET = 24
+_TMIN_FHOUR_OFFSET = 12
 
 # The 9 NBM fields produced by ingestion.nbm._parse_nbm_files_for_stations,
 # mapped onto features.parquet's nbm_<field> columns by _apply_nbm_backfill.
@@ -151,6 +155,14 @@ def _apply_nbm_backfill(features_df: pd.DataFrame, backfill_df: pd.DataFrame) ->
     for col in NBM_BACKFILL_COLS:
         nbm_col = f"nbm_{col}"
         bf_col = f"{nbm_col}_bf"
+        if nbm_col not in features_df.columns:
+            # The backfill provides a column features doesn't track (e.g.
+            # nbm_tmax, which is redundant with nbm_t50). With no name collision
+            # the merge leaves it un-suffixed; drop it rather than KeyError on
+            # the missing "_bf" column.
+            if nbm_col in merged.columns:
+                merged = merged.drop(columns=[nbm_col])
+            continue
         merged[nbm_col] = merged[bf_col].fillna(merged[nbm_col])
         merged = merged.drop(columns=[bf_col])
 
@@ -223,12 +235,14 @@ async def _backfill_init_date(
     vdate = pd.Timestamp(init_date)
     rows: list[dict] = []
     for lead_hour in LEAD_HOURS:
+        tmax_fhour = lead_hour + _TMAX_FHOUR_OFFSET
+        tmin_fhour = lead_hour + _TMIN_FHOUR_OFFSET
         tmax_bytes, tmin_bytes = await asyncio.gather(
-            _fetch_fhour_block(init_date, lead_hour, ["tmax", "pop12"], client),
-            _fetch_fhour_block(init_date, lead_hour - 12, ["tmin"], client),
+            _fetch_fhour_block(init_date, tmax_fhour, ["tmax", "pop12"], client),
+            _fetch_fhour_block(init_date, tmin_fhour, ["tmin"], client),
         )
         if tmax_bytes is None:
-            logger.warning("NBM run %s f%03d unavailable, skipping lead_hour=%d", init_date, lead_hour, lead_hour)
+            logger.warning("NBM run %s f%03d unavailable, skipping lead_hour=%d", init_date, tmax_fhour, lead_hour)
             continue
 
         with tempfile.TemporaryDirectory() as tmpdir:

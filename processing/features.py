@@ -381,19 +381,26 @@ def build_feature_matrix(
 
 
 def get_feature_columns() -> list[str]:
+    # NOTE: gefs_tmax_mean and every feature derived from it (ecmwf_gefs_tmax_delta,
+    # gefs_ecmwf_delta_signed, nbm_gefs_delta) are deliberately EXCLUDED. The GEFS
+    # "ensemble" is an ERA5 instantaneous-t2m proxy, so gefs_tmax_mean is ~15°F MAE
+    # dead weight (importance rank 30/46) and the deltas inherit that noise. The
+    # columns are still computed in build_feature_matrix (the bias-correction
+    # model_proxy and live forecast logging consume gefs_tmax_mean) but the models
+    # do not train on them. ecmwf_tmax carries the forecast as an additive offset.
     return [
-        # GEFS distribution
-        "gefs_tmax_mean", "gefs_tmax_std",
+        # GEFS distribution (spread features only; the mean proxy is excluded)
+        "gefs_tmax_std",
         "gefs_tmax_range", "gefs_tmax_iqr",
         "gefs_tmax_p10", "gefs_tmax_p25", "gefs_tmax_p75", "gefs_tmax_p90",
         "gefs_ensemble_skewness", "gefs_ensemble_kurtosis",
         "gefs_tmax_climo_anomaly",
         # ECMWF (ecmwf_tmax and ecmwf_tmin are inference-time offsets, not features;
         # diurnal_range captures the forecast temperature swing orthogonally)
-        "ecmwf_diurnal_range", "ecmwf_gefs_tmax_delta",
+        "ecmwf_diurnal_range",
         # NBM
         "nbm_t10", "nbm_t25", "nbm_t50", "nbm_t75", "nbm_t90",
-        "nbm_tmin", "nbm_pop12", "nbm_spread", "nbm_gefs_delta",
+        "nbm_tmin", "nbm_pop12", "nbm_spread",
         # Cloud
         "cloud_cover_total",
         # Wind
@@ -408,7 +415,7 @@ def get_feature_columns() -> list[str]:
         "obs_minus_model_lag1", "obs_minus_model_lag2", "obs_minus_model_lag3",
         "obs_minus_model_roll_mean", "obs_minus_model_roll_std",
         # Engineered: signed deltas, cross-model spread, normalized spread, accel
-        "gefs_ecmwf_delta_signed", "nbm_ecmwf_delta_signed", "multi_model_spread",
+        "nbm_ecmwf_delta_signed", "multi_model_spread",
         "ecmwf_climo_anomaly", "gefs_spread_per_lead", "nbm_spread_per_lead",
         "obs_minus_model_accel",
     ]

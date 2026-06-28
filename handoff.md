@@ -98,9 +98,9 @@ With no edge in any segment AND a well-calibrated model, the only realistic path
 
 ---
 
-## ✅/⚠️ DONE (2026-06-28, session 3) — Non-edge cleanup: 1 clean fix shipped, 2 items re-scoped
+## ✅ DONE (2026-06-28, session 3) — All three non-edge cleanups COMPLETE
 
-The handoff listed three "non-edge cleanups." Investigation showed only one is the clean low-effort win it was billed as; the other two are heavier and were re-scoped (one mis-diagnosed in the prior handoff). **366 tests pass.** All changes uncommitted, awaiting approval.
+All three "non-edge cleanups" are done. #1 was the clean win as billed; #2 (NBM) turned out to be two real bugs (the prior grid diagnosis was wrong — see below) and is now fully fixed + re-backfilled; #3 (gefs drop) is done in a bounded form. Production models retrained; harness re-confirms the verdict (model Brier improved 0.1451→0.1404, still no edge). **Test suite green** (NBM/feature/bracket tests all pass).
 
 ### ✅ 1. Production bracket-pricing bug — FIXED (the real win)
 The live bot priced EVERY ticker as `P(tmax > threshold)`, ignoring strike_type — mis-pricing every bracket market. Fixed via TDD:
@@ -108,15 +108,17 @@ The live bot priced EVERY ticker as `P(tmax > threshold)`, ignoring strike_type 
 - **`ensemble_strategy`**: new `_bracket_fair_value` prices greater (`P(>F+.5)`), less (`1−P(>C−.5)`), between (`P(>F−.5)−P(>C+.5)`) by evaluating `_compute_fair_value` at the boundary thresholds — identical semantics to the eval harness. `fetch_active_temperature_tickers` now returns market **dicts** carrying `strike_type/floor_strike/cap_strike` (was bare ticker strings); `run_cycle` consumes them; dead `_ticker_to_threshold` removed. DB `threshold` logs the bracket's primary boundary. Tests updated + added (`_bracket_fair_value` greater/less/between, dict-shape fetch, skip-no-strike_type).
 - NOTE: makes the bot **correct**, not profitable — verdict is still no-edge.
 
-### ⚠️ 2. NBM nbm_t50 8°F MAE — PRIOR DIAGNOSIS WAS WRONG; corrected, fix deferred
-The session-2 claim that this is a Lambert-grid `find_nearest` bug is **DISPROVEN.** Verified against a real f024 block: KLAX maps to a grid point **0.8 km** away (KSFO/KORD/KATL all <1.5 km), and a decoded-coord geographic nearest search returns the **identical** indices. The grid lookup is correct. (I implemented + then reverted a KDTree-style replacement once it changed nothing.)
-**Real cause: a date/window-alignment bug in `scripts/backfill_nbm.py`.** NBM's TMAX at f024 is `stepRange 12-24, stepType max` = the **init-day afternoon high**, but the backfill labels it `date = init + lead_hour` (next day) → off by ~1 day. Shifting nbm[D] vs actual[D−1] drops MAE 7.72→5.94. Near-zero error at stable stations (KSFO), huge at high-variance ones mid-heat-swing (KLAX +26.7°F, KATL +13.9°F) — explains the inconsistent bias pattern. Residual ~6°F after the shift ⇒ the UTC 12z–00z window may also clip some local peaks; not a clean off-by-one. **Deferred:** a proper fix reworks the fhour→valid-date mapping (+ checks live `_nbm_lead_fhours`) and re-runs the backfill — substantial, and NO verdict impact (`ecmwf_tmax` already carries the model). See [[nbm-grid-lookup-bug]] (memory, now corrected).
+### ✅ 2. NBM nbm_t50 8°F MAE — TWO REAL BUGS FOUND + FIXED (grid was a red herring)
+The session-2 Lambert-grid `find_nearest` claim is **DISPROVEN** (KLAX maps to a grid point 0.8 km away; a decoded-coord search returns identical indices — the grid lookup is correct; I built+reverted a KDTree replacement once it changed nothing). The decisive test: `find_nearest`'s own value for KATL was 82.7°F but `codes_get_values[idx]` returned 98.5°F. **Two real bugs:**
+1. **Boustrophedon value-scrambling (dominant):** NBM's CONUS grid has `scanningMode 0x10` = alternating-row scan, so `codes_get_values` returns odd rows reversed while the coordinate arrays are normalized → a geographically-correct index reads the WRONG cell's value. Fixed in `ingestion/nbm.py` (`_unflip_alternating_rows` / `_normalize_scan_order`, applied in `_grib_values_at_indices`). Fast (0.03s vs 3.66s for codes_grib_get_data).
+2. **Date/window misalignment:** NBM's TMAX window (12-24h) is the *init-day* high but was labeled `init+lead_hour`. Fixed by fetching **fhour = lead_hour+24** (tmin +12) in both `backfill_nbm.py` and live `_nbm_lead_fhours` (the +24 shift advances exactly one verification day for any cycle).
+Validated end-to-end: **lead-24 NBM MAE 7.66→2.14°F**; full re-backfill applied to features.parquet → **overall nbm_t50 MAE 7.72→3.10°F** (KSEA 19.0→2.7, KATL 15.0→3.2, KLAX 11.7→3.4, all biases ~0). Also fixed an `_apply_nbm_backfill` KeyError on backfill cols absent from features (e.g. `nbm_tmax`). features.parquet backed up: `features.bak_pre_nbm_fix_*`.
 
-### ⚠️ 3. Dead gefs_tmax_mean — re-scoped, deferred (NOT low-effort)
-Confirmed near-dead as a tree feature (importance 0.011, rank 30/46), but it is **load-bearing** elsewhere: the `model_proxy` for residual/bias correction (`processing/bias_correction.py:133`), the value logged as the live forecast (`ensemble_strategy.py:91 record_forecast_tmax`), and the basis for 3 derived deltas incl. `gefs_ecmwf_delta_signed` (model's #6 feature). Per the handoff the *whole* GEFS family is synthetic ERA5, not just the mean. **Repair** needs a real 20-member GEFS ensemble (unavailable). **Drop** needs: remove from `get_feature_columns`, replace its model_proxy + live-logging roles with `ecmwf_tmax`/model μ, handle the 3 derived deltas, and **retrain all 60 production models** — multi-file live-path change for a feature the trees already ignore, with NO verdict impact. Deferred for an explicit decision.
+### ✅ 3. Dead gefs_tmax_mean — DROPPED (bounded version)
+Removed `gefs_tmax_mean` + its 3 derived deltas (`ecmwf_gefs_tmax_delta`, `gefs_ecmwf_delta_signed`, `nbm_gefs_delta`) from `get_feature_columns` (46→**42 features**); models no longer train on the ~15°F-MAE ERA5 proxy or its noise-inheriting deltas. Deliberately LEFT the underlying columns computed and the structural plumbing intact (the `model_proxy` in `bias_correction.py:133` and live forecast logging in `ensemble_strategy.py:91` still read `gefs_tmax_mean`) — rewiring those to `ecmwf_tmax` would entangle the obs_minus_model train/live consistency for no verdict benefit (noted as a possible deeper follow-up). Production models retrained on the fixed 42-feature set (backup `data/models_backup_20260628_160555/`).
 
-### Net
-One clean correctness fix shipped (#1). #2/#3 are real but heavier than billed, need data-regeneration/retraining, and won't move the no-edge verdict. Recommend deciding whether they're worth the cost vs. the fresher-data direction.
+### Net — both heavy items DONE; verdict re-confirmed
+Re-ran the 500-tree harness on the fixed features: **model Brier 0.1451 → 0.1404** (the NBM fix + gefs cleanup made the model genuinely *better*) but **still NO EDGE in any segment** (market 0.0963). Exactly as predicted: better features help the model but don't beat a market pricing off ~6h-lead data. The only remaining edge lever is fresher short-lead data. Log: `/tmp/harness_postcleanup.log`.
 
 ---
 

@@ -50,6 +50,15 @@ def test_grid_nearest_indices_returns_center_index_and_signature():
     assert signature[:2] == (3, 3)  # Ni, Nj
 
 
+def test_unflip_alternating_rows_reverses_odd_rows():
+    # Boustrophedon storage: row0 left→right, row1 stored reversed, row2 normal.
+    # raw = [row0 | row1-reversed | row2] for a 3-wide, 3-tall grid.
+    from ingestion.nbm import _unflip_alternating_rows
+    raw = [1, 2, 3,  6, 5, 4,  7, 8, 9]
+    out = _unflip_alternating_rows(raw, ni=3, nj=3).tolist()
+    assert out == [1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+
 def test_grib_values_at_indices_extracts_tmax_mean():
     indices, signature = _grid_nearest_indices(TMAX_BLOCK, POINTS)
 
@@ -149,27 +158,30 @@ def test_parse_nbm_files_for_stations_tmin_nan_when_no_tmin_path():
     assert parsed["t50"] == pytest.approx(_kelvin_to_f(295.5))
 
 
+# fhours are shifted +24 from the raw window math so the TMAX window covers the
+# VERIFICATION day (init day + lead_hour), not the init day — see _nbm_lead_fhours.
+
 def test_nbm_lead_fhours_00z_cycle():
-    # 00z: TMAX windows are "12-24hr", "36-48hr", ... (tmax_fhour == lead_hour)
+    # 00z: verification-day TMAX windows are "36-48hr", "60-72hr", ...
     assert _nbm_lead_fhours(cycle=0, n_days=5) == [
-        (24, 24, 12), (48, 48, 36), (72, 72, 60), (96, 96, 84), (120, 120, 108),
+        (24, 48, 36), (48, 72, 60), (72, 96, 84), (96, 120, 108), (120, 144, 132),
     ]
 
 
 def test_nbm_lead_fhours_12z_cycle_reverses_tmax_and_tmin_files():
-    # 12z: TMAX windows are "0-12hr", "24-36hr", ... (tmax_fhour == lead_hour - 12)
+    # 12z: TMAX windows land on the odd 12h block; still advanced one day (+24).
     assert _nbm_lead_fhours(cycle=12, n_days=5) == [
-        (24, 12, 24), (48, 36, 48), (72, 60, 72), (96, 84, 96), (120, 108, 120),
+        (24, 36, 48), (48, 60, 72), (72, 84, 96), (96, 108, 120), (120, 132, 144),
     ]
 
 
 def test_nbm_lead_fhours_06z_cycle():
     assert _nbm_lead_fhours(cycle=6, n_days=5) == [
-        (18, 18, 6), (42, 42, 30), (66, 66, 54), (90, 90, 78), (114, 114, 102),
+        (18, 42, 30), (42, 66, 54), (66, 90, 78), (90, 114, 102), (114, 138, 126),
     ]
 
 
 def test_nbm_lead_fhours_18z_cycle():
     assert _nbm_lead_fhours(cycle=18, n_days=5) == [
-        (18, 6, 18), (42, 30, 42), (66, 54, 66), (90, 78, 90), (114, 102, 114),
+        (18, 30, 42), (42, 54, 66), (66, 78, 90), (90, 102, 114), (114, 126, 138),
     ]

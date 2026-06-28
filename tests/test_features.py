@@ -188,11 +188,18 @@ def test_feature_matrix_has_no_regime_cluster_columns():
 def test_get_feature_columns_returns_list():
     cols = get_feature_columns()
     assert isinstance(cols, list)
-    assert len(cols) == 46
+    assert len(cols) == 42
     assert "nbm_t50" in cols
     assert "gefs_tmax_iqr" in cols
     assert "gefs_ensemble_kurtosis" in cols
-    assert "nbm_gefs_delta" in cols
+    # gefs_tmax_mean (the ERA5 instantaneous-t2m proxy, ~15°F MAE — dead weight)
+    # and every feature derived from it are dropped from the model feature set.
+    # The columns are still computed (model_proxy/forecast-logging plumbing uses
+    # gefs_tmax_mean) but the models no longer train on them.
+    assert "gefs_tmax_mean" not in cols
+    assert "nbm_gefs_delta" not in cols
+    assert "gefs_ecmwf_delta_signed" not in cols
+    assert "ecmwf_gefs_tmax_delta" not in cols
     assert not any(c.startswith("regime_cluster") for c in cols)
     assert not any(c.startswith("station_k") for c in cols)
     assert "cloud_cover_total" in cols
@@ -213,7 +220,6 @@ def test_get_feature_columns_returns_list():
     assert "obs_minus_model_roll_mean" in cols
     assert "obs_minus_model_roll_std" in cols
     assert "nbm_ecmwf_delta_signed" in cols
-    assert "gefs_ecmwf_delta_signed" in cols
     assert "multi_model_spread" in cols
     assert "ecmwf_climo_anomaly" in cols
     assert "gefs_spread_per_lead" in cols

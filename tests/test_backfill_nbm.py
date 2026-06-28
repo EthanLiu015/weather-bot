@@ -151,6 +151,25 @@ def test_apply_nbm_backfill_overwrites_real_values_and_recomputes_delta():
     assert untouched["nbm_gefs_delta"] == 0.0
 
 
+def test_apply_nbm_backfill_skips_backfill_cols_absent_from_features():
+    # features.parquet has no `nbm_tmax` column (redundant with nbm_t50), but the
+    # backfill produces a `tmax` field. The merge must skip it, not KeyError.
+    feat_row = _features_row(date=pd.Timestamp("2024-01-01"), gefs_tmax_mean=30.0)
+    del feat_row["nbm_tmax"]
+    features_df = pd.DataFrame([feat_row])
+    backfill_df = pd.DataFrame([{
+        "date": pd.Timestamp("2024-01-01"), "station": "KORD", "lead_hour": 24,
+        "t10": 28.0, "t25": 29.0, "t50": 31.0, "t75": 33.0, "t90": 34.0,
+        "tmax": 31.0, "tmin": 20.0, "pop12": 10.0, "spread": 2.0,
+    }])
+
+    result = _apply_nbm_backfill(features_df, backfill_df)
+
+    assert "nbm_tmax" not in result.columns
+    assert result.iloc[0]["nbm_t50"] == pytest.approx(31.0)
+    assert result.iloc[0]["nbm_tmin"] == pytest.approx(20.0)
+
+
 def test_apply_nbm_backfill_handles_object_dtype_date_column():
     # features.parquet stores `date` as object dtype (datetime.date objects),
     # while the backfill CSV's `date` parses to datetime64 — merging must not

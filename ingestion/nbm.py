@@ -116,6 +116,35 @@ def _grid_nearest_indices(path: str, points: dict[str, tuple[float, float]]) -> 
         eccodes.codes_release(gid)
 
 
+def _unflip_alternating_rows(values, ni: int, nj: int):
+    """Un-flip a boustrophedon (alternating-row) scanned value array to plain
+    row-major order. Odd rows are stored reversed; reverse them back so the
+    array matches the grid's latitudes/longitudes arrays (and find_nearest
+    indices). Assumes i-consecutive rows of width `ni`."""
+    grid = np.asarray(values, dtype=float).reshape(nj, ni).copy()
+    grid[1::2] = grid[1::2, ::-1]
+    return grid.ravel()
+
+
+def _normalize_scan_order(values, gid):
+    """Reorder `values` to match the grid's latitudes/longitudes arrays.
+
+    NBM's CONUS grid uses alternating-row (boustrophedon) scanning
+    (scanningMode bit 0x10): codes_get_values returns odd rows reversed, while
+    codes_get_array('latitudes') and codes_grib_find_nearest use plain row-major
+    order — so a geographically-correct flat index reads the WRONG cell's value
+    (e.g. KATL read 98.5°F instead of 82.7°F). Un-flip the odd rows to fix this.
+    No-op for normally-scanned grids (e.g. the synthetic test fixtures)."""
+    scanning_mode = _grib_safe_get(gid, "scanningMode") or 0
+    alternating = bool(scanning_mode & 0x10)
+    i_consecutive = not (scanning_mode & 0x20)
+    if not (alternating and i_consecutive):
+        return values
+    ni = eccodes.codes_get(gid, "Ni")
+    nj = eccodes.codes_get(gid, "Nj")
+    return _unflip_alternating_rows(values, ni, nj)
+
+
 def _grib_values_at_indices(
     path: str,
     match_keys: dict,
@@ -144,7 +173,7 @@ def _grib_values_at_indices(
                     if _grid_signature(gid) != grid_signature:
                         logger.error("NBM grid signature mismatch for %s; skipping", path)
                         return nan_result
-                    values = eccodes.codes_get_values(gid)
+                    values = _normalize_scan_order(eccodes.codes_get_values(gid), gid)
                     return {name: float(values[idx]) for name, idx in indices.items()}
                 finally:
                     eccodes.codes_release(gid)
@@ -222,7 +251,12 @@ def _nbm_lead_fhours(cycle: int, n_days: int = 5) -> list[tuple[int, int, int]]:
             tmax_fhour, tmin_fhour = low, high
         else:
             tmax_fhour, tmin_fhour = high, low
-        result.append((high, tmax_fhour, tmin_fhour))
+        # The TMAX (daytime-max) window must cover the VERIFICATION day, not the
+        # init day. TMAX/TMIN windows recur every 24h, so advancing both forecast
+        # hours by 24 moves to the verification day's windows while keeping
+        # `lead_hour` (= hours from init to that day's 00z) as the key. Without
+        # this the result held the init day's high — one day too early.
+        result.append((high, tmax_fhour + 24, tmin_fhour + 24))
     return result
 
 
