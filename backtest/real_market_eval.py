@@ -135,6 +135,53 @@ def annualized_sharpe(daily_pnl, periods_per_year: int = 252) -> float:
     return float(arr.mean() / sd * np.sqrt(periods_per_year))
 
 
+def _segment_breakdown(
+    labels: np.ndarray,
+    fair: np.ndarray,
+    mids: np.ndarray,
+    outs: np.ndarray,
+    pnl: np.ndarray,
+    traded: np.ndarray,
+    order: Optional[list] = None,
+) -> dict:
+    """Per-segment model vs market Brier and P&L, keyed by `labels[i]`.
+
+    A genuine edge, if any, hides in a segment (a specific station, a thin
+    volume bucket, a particular month) rather than the aggregate — so each
+    segment reports the same model-vs-market comparison the top line does.
+    `order` fixes key iteration order; otherwise segments come out sorted.
+    """
+    out: dict[str, dict] = {}
+    keys = order if order is not None else sorted(set(labels.tolist()))
+    for key in keys:
+        mask = labels == key
+        if not mask.any():
+            continue
+        n_tr = int(traded[mask].sum())
+        tr_pnl = pnl[mask][traded[mask]]
+        out[str(key)] = {
+            "n": int(mask.sum()),
+            "model_brier": brier_score(fair[mask], outs[mask]),
+            "market_brier": brier_score(mids[mask], outs[mask]),
+            "n_trades": n_tr,
+            "pnl": float(tr_pnl.sum()),
+            "win_rate": float((tr_pnl > 0).sum() / n_tr) if n_tr else 0.0,
+        }
+    return out
+
+
+def _volume_decile_labels(volumes: np.ndarray) -> np.ndarray:
+    """Map each volume to a decile label D0 (thinnest) … D9 (most liquid).
+
+    Markets are likely priced sharpest where they're liquid; the thin tail is
+    where mispricings (our only realistic edge) would live, so bucketing by
+    liquidity is a direct test of that hypothesis.
+    """
+    ranks = pd.Series(volumes).rank(method="first")
+    deciles = np.clip(((ranks - 1) / len(volumes) * 10).astype(int), 0, 9)
+    return np.array([f"D{d}" for d in deciles])
+
+
 def evaluate_real_markets(
     markets: pd.DataFrame,
     prob_above_fn: ProbAboveFn,
@@ -159,9 +206,15 @@ def evaluate_real_markets(
     outcomes: list[float] = []
     dates: list[str] = []
     strike_types: list[str] = []
+    stations: list[str] = []
+    months: list[str] = []
+    volumes: list[float] = []
+
+    has_volume = "volume" in markets.columns
 
     for row in markets.itertuples(index=False):
-        date_str = str(pd.Timestamp(row.date).date())
+        ts = pd.Timestamp(row.date)
+        date_str = str(ts.date())
         yes = bracket_yes_prob(
             lambda x: prob_above_fn(row.station, date_str, x),
             row.strike_type,
@@ -175,6 +228,10 @@ def evaluate_real_markets(
         outcomes.append(float(row.settlement))
         dates.append(date_str)
         strike_types.append(row.strike_type)
+        stations.append(str(row.station))
+        months.append(ts.strftime("%Y-%m"))
+        if has_volume:
+            volumes.append(pd.to_numeric(row.volume, errors="coerce"))
 
     n = len(fair_yes)
     if n == 0:
@@ -214,24 +271,33 @@ def evaluate_real_markets(
     model_brier = brier_score(fair_arr, out_arr)
     market_brier = brier_score(mid_arr, out_arr)
 
-    # Breakdown by strike_type — the 2°-wide "between" brackets are far more
-    # sensitive to the station/source mismatch than the "greater"/"less" tails,
-    # so any genuine edge is most likely to surface in the tails.
-    st_arr = np.array(strike_types)
-    by_strike_type: dict[str, dict] = {}
-    for st in ("greater", "less", "between"):
-        mask = st_arr == st
-        if not mask.any():
-            continue
-        by_strike_type[st] = {
-            "n": int(mask.sum()),
-            "model_brier": brier_score(fair_arr[mask], out_arr[mask]),
-            "market_brier": brier_score(mid_arr[mask], out_arr[mask]),
-        }
+    # Segment breakdowns — any genuine edge hides in a segment, not the
+    # aggregate. by_strike_type: the 2°-wide "between" brackets are far more
+    # sensitive to the station/source mismatch than the "greater"/"less" tails;
+    # by_station/by_volume_decile/by_month hunt for thin-market, station-specific
+    # or seasonal mispricings.
+    seg_args = (fair_arr, mid_arr, out_arr, pnl, traded)
+    by_strike_type = _segment_breakdown(
+        np.array(strike_types), *seg_args, order=["greater", "less", "between"]
+    )
+    by_station = _segment_breakdown(np.array(stations), *seg_args)
+    by_month = _segment_breakdown(np.array(months), *seg_args)
+
+    by_volume_decile: dict[str, dict] = {}
+    if has_volume:
+        vol_arr = np.array(volumes, dtype=float)
+        if np.isfinite(vol_arr).any():
+            decile_labels = _volume_decile_labels(vol_arr)
+            by_volume_decile = _segment_breakdown(
+                decile_labels, *seg_args, order=[f"D{i}" for i in range(10)]
+            )
 
     return {
         "num_scored_markets": n,
         "by_strike_type": by_strike_type,
+        "by_station": by_station,
+        "by_month": by_month,
+        "by_volume_decile": by_volume_decile,
         "num_simulated_trades": num_trades,
         "simulated_pnl_usd": float(traded_pnl.sum()),
         "win_rate": float((traded_pnl > 0).sum() / num_trades) if num_trades else 0.0,
@@ -453,10 +519,22 @@ def main() -> None:
     verdict = "EDGE: model beats market" if result["has_edge"] else "NO EDGE: model does not beat market"
     print(f"  VERDICT:           {verdict}")
     print("-" * 60)
-    print("  By strike_type     n     model Brier   market Brier   edge?")
-    for st, d in result.get("by_strike_type", {}).items():
-        edge = "YES" if d["model_brier"] < d["market_brier"] else "no"
-        print(f"    {st:<8}     {d['n']:>5}      {d['model_brier']:.4f}        {d['market_brier']:.4f}       {edge}")
+    def _print_segments(title: str, seg: dict, width: int = 10) -> None:
+        if not seg:
+            return
+        print(f"  By {title:<14}  n   model B   market B  edge?    P&L   win%")
+        for key, d in seg.items():
+            edge = "YES" if d["model_brier"] < d["market_brier"] else "no"
+            print(
+                f"    {key:<{width}} {d['n']:>5}   {d['model_brier']:.4f}   {d['market_brier']:.4f}   "
+                f"{edge:<4}  {d.get('pnl', 0.0):>7.2f}  {d.get('win_rate', 0.0):>4.0%}"
+            )
+        print("-" * 60)
+
+    _print_segments("strike_type", result.get("by_strike_type", {}))
+    _print_segments("station", result.get("by_station", {}))
+    _print_segments("volume decile", result.get("by_volume_decile", {}))
+    _print_segments("month", result.get("by_month", {}))
     print("=" * 60)
 
 

@@ -181,6 +181,58 @@ def test_evaluate_respects_min_edge():
     assert result["num_simulated_trades"] == 0
 
 
+# ── Segment breakdowns (station / month / volume) ────────────────────────────
+# The handoff's highest-value diagnostic: any thin edge hides in segments
+# (specific stations, thin/illiquid markets, particular months), not in the
+# aggregate. Each segment reports n plus model vs market Brier and P&L.
+
+def test_evaluate_breaks_down_by_station():
+    markets = _markets([
+        ("KORD", "2026-04-12", "greater", 80.0, None, 0.50, 1.0),
+        ("KLAX", "2026-04-12", "greater", 80.0, None, 0.50, 0.0),
+    ])
+    pa = {"KORD": 0.9, "KLAX": 0.1}
+    result = evaluate_real_markets(markets, lambda s, d, x: pa[s], min_edge=0.04)
+    bs = result["by_station"]
+    assert bs["KORD"]["n"] == 1 and bs["KLAX"]["n"] == 1
+    assert bs["KORD"]["model_brier"] == pytest.approx(0.01)
+    assert "market_brier" in bs["KORD"] and "pnl" in bs["KORD"]
+
+
+def test_evaluate_breaks_down_by_month():
+    markets = _markets([
+        ("KORD", "2026-04-12", "greater", 80.0, None, 0.50, 1.0),
+        ("KORD", "2026-05-20", "greater", 80.0, None, 0.50, 0.0),
+    ])
+    result = evaluate_real_markets(markets, lambda s, d, x: 0.9, min_edge=0.04)
+    bm = result["by_month"]
+    assert bm["2026-04"]["n"] == 1 and bm["2026-05"]["n"] == 1
+
+
+def test_evaluate_breaks_down_by_volume_decile_when_volume_present():
+    rows = []
+    for i in range(20):
+        rows.append({
+            "station": "KORD", "date": "2026-04-12", "strike_type": "greater",
+            "floor_strike": 80.0, "cap_strike": None, "d1_mid": 0.50,
+            "settlement": float(i % 2), "volume": float(i + 1) * 100,
+        })
+    markets = pd.DataFrame(rows)
+    result = evaluate_real_markets(markets, lambda s, d, x: 0.9, min_edge=0.04)
+    bv = result["by_volume_decile"]
+    # Deciles ordered low→high volume; total n across deciles == scored markets.
+    assert sum(v["n"] for v in bv.values()) == result["num_scored_markets"]
+    assert all("model_brier" in v and "market_brier" in v for v in bv.values())
+
+
+def test_evaluate_omits_volume_decile_when_absent():
+    markets = _markets([
+        ("KORD", "2026-04-12", "greater", 80.0, None, 0.50, 1.0),
+    ])
+    result = evaluate_real_markets(markets, lambda s, d, x: 0.9, min_edge=0.04)
+    assert result.get("by_volume_decile") in (None, {})
+
+
 # ── build_fair_value_fn wiring (trains a tiny real bundle) ───────────────────
 
 def _synthetic_station_features(seed=0, nrows=150):

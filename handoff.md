@@ -59,6 +59,39 @@ Day-ahead daily-max temperature is a *very* well-forecast quantity and the marke
 
 ---
 
+## ✅ DONE (2026-06-28, session 2) — Definitive 500-tree numbers + diagnostics 1/2/4. Verdict holds: NO edge, in any segment.
+
+Ran the official 500-tree harness (now with segment breakdowns) and worked diagnostics #1, #2, #4. **The no-edge conclusion is now airtight.** Full suite **348 passing**.
+
+### 0+1. Definitive harness (500 trees) — model loses in EVERY segment
+Model Brier **0.1451** vs market **0.0963** (3,340 markets, Apr 11–May 27). Flat-$1 P&L −$19.77 / 2,506 trades, win 30.6%, daily Sharpe −3.22. Matches the 80-tree (0.146) and prior 500-tree (0.1448) runs → genuine, not undertraining. Log: `/tmp/harness_official500.log`.
+
+**Segment breakdown (diagnostic #1, the highest-value one) — there is NO segment where the model beats the market.** Every strike_type, all 18 stations, all 10 volume deciles, both months: `edge? = no`.
+- **By volume decile (kills the "thin markets" hypothesis):** model Brier rises monotonically with volume (D0 0.024 → D9 0.218); the *thin* markets (D0–D1) are the near-certain outcomes the market nails (market Brier 0.0007 at D0) and where the model is relatively *worst*. Illiquid markets are the EASY ones, not mispriced ones. The only realistic edge thesis (thin-market inefficiency) is dead.
+- **By station:** a few stations show positive flat-$1 P&L (KSAT +6.99, KLAX +3.90, KSFO +2.59, KDFW +2.82) but model Brier is still worse than market at all of them — that P&L is variance over 60–234 markets / 6 weeks, not edge. Brier is the honest signal.
+- **By month / strike_type:** unchanged from prior (between brackets worst; tails sharpest for the market).
+
+### 2. Feature importance / ablation
+- **`ecmwf_tmax` is the additive ANCHOR, not a tree feature** (`mu = ngboost(X) + residual + ecmwf_offset`). That's why it has no tree importance — the trees predict the *anomaly* on top of the ECMWF anchor. Confirms "the ML isn't the problem"; the architecture leans on ECMWF by design.
+- **`gefs_tmax_mean` confirmed near-dead:** mean QRF importance rank 30/46 (0.011). Safe to drop/repair (low-effort cleanup, won't change the verdict).
+- **`nbm_t50` barely used directly (0.005)** — the trees route around the buggy feature — **BUT `nbm_ecmwf_delta_signed` is the #3 feature (0.081)** and inherits the NBM grid bug below. So the NBM bug leaks into a top-3 feature.
+
+### 4. nbm_t50 8°F MAE — ROOT-CAUSED: backfill grid-mapping bug (not units, not a swap)
+Empirically (vs official actual_tmax): well-behaved stations sit at corr ~0.86–0.97 / bias ~0; offenders have large station-specific bias (KSEA −17.6°F, KATL +13.5°F, KPHL +8.8°F, KORD −7.2°F, KSFO −6.1°F) and the two worst by *correlation* are coastal (KLAX 0.34, KSFO 0.58 — reading the marine/wrong cell). No clean cross-station swap. **Cause:** `ingestion/nbm.py::_grid_nearest_indices` calls `eccodes.codes_grib_find_nearest` on NBM's **Lambert-conformal** CONUS grid, where eccodes' nearest search is unreliable → wrong cell for a subset of stations. Affects both `scripts/backfill_nbm.py` (historical) and live `fetch_latest_nbm`. Fix direction (needs TDD + approval): explicit lat/lon→grid-index via the projection, or a KDTree over the grid's decoded lat/lon arrays. **Strategic note: even fixed, NBM is a 24h-lead feature; won't create market edge — only a marginal model improvement.**
+
+### Files changed this session
+- `backtest/real_market_eval.py` — added `_segment_breakdown` + `_volume_decile_labels`; `evaluate_real_markets` now returns `by_station`/`by_month`/`by_volume_decile` (each with model/market Brier + P&L + win rate); `main()` prints them.
+- `tests/test_real_market_eval.py` — +4 tests (25 total, all pass).
+- Memory: `nbm-grid-lookup-bug` added.
+
+### Not done (cheap, remaining diagnostics)
+- **#3 σ-calibration check** (predicted σ vs realized error by lead/station) — not run; would confirm whether the 2.0°F sigma-floor + spread-inflation are mis-tuned for the bracket task. Lower priority given the verdict.
+- The strategic question stands: with no edge in any segment, the realistic paths are (a) **fresher data** (HRRR/RAP/same-day NBM to match the market's ~6h horizon — the only thing that attacks root cause #1), or (b) accept the market is efficient here. Beating a day-ahead daily-max market is genuinely hard.
+
+⚠️ **Nothing committed yet** — working tree was clean at session start (prior work already on `main`); these session-2 edits are uncommitted, awaiting approval.
+
+---
+
 ## ⚠️ READ FIRST — Critical correction (2026-06-23)
 
 **Every "real Kalshi price" performance number in the older sections below is FAKE. Do not cite the $95,983 P&L or any real-price Sharpe (3.05 / 4.0 / 5.6 / 41).** They were artifacts of three compounding bugs, found and (mostly) fixed this session:
@@ -123,7 +156,7 @@ Kalshi settles on the official NWS station (e.g. Chicago **Midway**); our featur
 ### Follow-up (2026-06-28) — aligned training target to the official NWS max; STILL no edge
 Closed the source/station mismatch: the training target `actual_tmax` was the max of **hourly** METAR temps, which underestimates the true daily peak by ~1°F and disagreed with Kalshi settlements ~12% of the time. Switched it to the **official NWS daily max** (IEM ASOS daily summary) at the exact station Kalshi settles on (incl. Chicago→Midway, NY→Central Park). Verified: official-max vs Kalshi settlement agreement = **100%** (was 87.6%). Migrated `features.parquet` (131,852 rows changed, +1°F mean; `data/historical/features.parquet.bak_pre_official_tmax_*` backup).
 
-**Result: model Brier ~0.146 → essentially UNCHANGED** (n_est=80; 500-tree confirm pending). So the measurement gap was NOT the cause — the model genuinely lacks edge. Even predicting exactly the settlement quantity, its day-ahead forecast (σ≈4°F spread over 2° brackets) is less sharp than the market's prices. This is the cleaner, confound-free "no edge" conclusion. Files: `ingestion/nws_daily.py` (+`SETTLEMENT_STATION`), `scripts/update_actual_tmax_official.py`, `build_feature_matrix.build_daily_tmax` (now defaults to official source w/ hourly fallback), `tests/test_nws_daily.py` (7). Plan: `plans/nws-settlement-source.md`. Known minor approximation: obs_minus_model lag features + climatology normals still on the old target (target-only migration; full rebuild would refresh them but risks wiping ECMWF/NBM backfills).
+**Result: model Brier ~0.146 → essentially UNCHANGED** (confirmed at n_est=500 on 2026-06-28: **0.1451** vs market 0.0963 — see the session-2 section at the top). So the measurement gap was NOT the cause — the model genuinely lacks edge. Even predicting exactly the settlement quantity, its day-ahead forecast (σ≈4°F spread over 2° brackets) is less sharp than the market's prices. This is the cleaner, confound-free "no edge" conclusion. Files: `ingestion/nws_daily.py` (+`SETTLEMENT_STATION`), `scripts/update_actual_tmax_official.py`, `build_feature_matrix.build_daily_tmax` (now defaults to official source w/ hourly fallback), `tests/test_nws_daily.py` (7). Plan: `plans/nws-settlement-source.md`. Known minor approximation: obs_minus_model lag features + climatology normals still on the old target (target-only migration; full rebuild would refresh them but risks wiping ECMWF/NBM backfills).
 
 ### Open / next
 - **Fix the production bracket-pricing bug** (ensemble_strategy) — the bot is live-mispricing every bracket. But note: even correctly priced + target-aligned, the eval shows NO edge, so fixing it makes the bot *correct*, not *profitable*.
