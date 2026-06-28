@@ -182,6 +182,56 @@ def _volume_decile_labels(volumes: np.ndarray) -> np.ndarray:
     return np.array([f"D{d}" for d in deciles])
 
 
+def _calib_stats(err: np.ndarray, sigma: np.ndarray) -> dict:
+    """Calibration stats for residuals `err` (= actual - μ) under predicted
+    std `sigma`. If σ is well-calibrated, z = err/σ ~ N(0,1): z_std ≈ 1,
+    coverage_1sigma ≈ 0.683, coverage_2sigma ≈ 0.954. z_std > 1 (or coverage
+    below those) means σ is too small (overconfident); < 1 underconfident."""
+    err = np.asarray(err, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    if err.size == 0:
+        nan = float("nan")
+        return {
+            "n": 0, "z_mean": nan, "z_std": nan, "coverage_1sigma": nan,
+            "coverage_2sigma": nan, "rmse": nan, "mae": nan, "mean_sigma": nan,
+        }
+    z = err / sigma
+    return {
+        "n": int(err.size),
+        "z_mean": float(z.mean()),
+        "z_std": float(z.std()),
+        "coverage_1sigma": float(np.mean(np.abs(z) <= 1.0)),
+        "coverage_2sigma": float(np.mean(np.abs(z) <= 2.0)),
+        "rmse": float(np.sqrt(np.mean(err ** 2))),
+        "mae": float(np.mean(np.abs(err))),
+        "mean_sigma": float(sigma.mean()),
+    }
+
+
+def sigma_calibration_report(
+    err, sigma, group_labels: Optional[dict] = None
+) -> dict:
+    """σ-calibration of the predictive distribution (diagnostic #3).
+
+    Compares the model's predicted σ to realized forecast error so we can tell
+    whether the sigma-floor + spread-inflation (tuned against climatology) make
+    the bracket probabilities over- or under-confident on real markets.
+
+    Returns {"overall": stats, "by_<group>": {label: stats, ...}, ...}; stats
+    are the ideal-1.0 z_std and ~0.683/0.954 coverages from `_calib_stats`.
+    """
+    err = np.asarray(err, dtype=float)
+    sigma = np.asarray(sigma, dtype=float)
+    out = {"overall": _calib_stats(err, sigma)}
+    for gname, labels in (group_labels or {}).items():
+        labels = np.asarray(labels)
+        out[f"by_{gname}"] = {
+            str(k): _calib_stats(err[labels == k], sigma[labels == k])
+            for k in sorted(set(labels.tolist()))
+        }
+    return out
+
+
 def evaluate_real_markets(
     markets: pd.DataFrame,
     prob_above_fn: ProbAboveFn,
@@ -314,45 +364,30 @@ def evaluate_real_markets(
 # Model fair-value closure (wires a trained bundle to real-market lookups)
 # ---------------------------------------------------------------------------
 
-def build_fair_value_fn(bundle: dict, eval_features: pd.DataFrame) -> ProbAboveFn:
-    """Return prob_above(station, date, x) = calibrated model P(high > x), using
-    the in-memory model bundle and the eval-window feature rows.
+def _build_distribution_cache(bundle: dict, eval_features: pd.DataFrame) -> dict:
+    """Per (station, date) cache of the threshold-INDEPENDENT predictive
+    distribution (μ, σ, ECMWF offset, QRF quantiles, calibrator), using the
+    SHORTEST available lead per (station, date) — the freshest forecast the bot
+    would use (~24h out). Computed ONCE per station-bucket (≈60 forest evals,
+    not ~8k), since μ/σ/quantiles don't depend on the bracket threshold.
 
-    For each (station, date) we use the SHORTEST available lead-hour feature row
-    (the bot's decision is closest to resolution, ~24h out, where forecasts are
-    sharpest).
-
-    Performance: the NGBoost μ/σ, residual correction, spread inflation and QRF
-    quantiles are all threshold-INDEPENDENT, so they are computed ONCE per
-    (station, date) — batched per station-bucket (≈60 forest evaluations total)
-    rather than once per market (~8k). Only the cheap threshold-dependent tail
-    (normal CDF + QRF interpolation + blend + calibration + clamp) runs per
-    market. A parity test pins this against EnsembleStrategy._compute_fair_value.
+    Each entry also carries the `lead_hour`/`lead_bucket` used, so the σ being
+    cached can be checked against realized error by lead (diagnostic #3).
     """
-    from scipy.interpolate import interp1d
     from processing.features import get_feature_columns
     from processing.bias_correction import get_lead_bucket
     from models.spread_inflation import apply_spread_inflation_from_stats
-    from models.qrf_model import DEFAULT_QUANTILES
-    from strategies.ensemble_strategy import (
-        RESIDUAL_SIGMA_FLOOR,
-        FAIR_VALUE_FLOOR,
-        FAIR_VALUE_CEIL,
-        _scipy_norm,
-    )
+    from strategies.ensemble_strategy import RESIDUAL_SIGMA_FLOOR
 
     avail_cols = [c for c in get_feature_columns() if c in eval_features.columns]
-    weights = bundle["blender"].weights
 
     ef = eval_features.copy()
     ef["date"] = pd.to_datetime(ef["date"])
-    # Shortest lead per (station, date) — the freshest forecast the bot would use.
     ef = ef.sort_values("lead_hour").drop_duplicates(["station", "date"], keep="first")
     ef["_date_str"] = ef["date"].dt.strftime("%Y-%m-%d")
     ef["_bucket"] = ef["lead_hour"].astype(int).map(get_lead_bucket)
     ef["_key"] = ef["station"].astype(str) + "_" + ef["_bucket"]
 
-    # Per (station, date) cache of the threshold-independent distribution.
     cache: dict[tuple[str, str], dict] = {}
 
     for (station, model_key), grp in ef.groupby(["station", "_key"]):
@@ -383,6 +418,8 @@ def build_fair_value_fn(bundle: dict, eval_features: pd.DataFrame) -> ProbAboveF
         sigma = np.maximum(sigma, RESIDUAL_SIGMA_FLOOR)
 
         q_vals = qrf.predict_quantiles(X).to_numpy() if qrf is not None else None
+        lead_hours = grp["lead_hour"].astype(int).tolist()
+        buckets = grp["_bucket"].tolist()
 
         for i, date_str in enumerate(grp["_date_str"].tolist()):
             cache[(station, date_str)] = {
@@ -391,7 +428,37 @@ def build_fair_value_fn(bundle: dict, eval_features: pd.DataFrame) -> ProbAboveF
                 "ecmwf_offset": float(ecmwf_offset[i]),
                 "q_vals": q_vals[i] if q_vals is not None else None,
                 "calibrator": calibrator,
+                "lead_hour": lead_hours[i],
+                "lead_bucket": buckets[i],
             }
+
+    return cache
+
+
+def build_fair_value_fn(
+    bundle: dict, eval_features: pd.DataFrame, cache: Optional[dict] = None
+) -> ProbAboveFn:
+    """Return prob_above(station, date, x) = calibrated model P(high > x), using
+    the in-memory model bundle and the eval-window feature rows.
+
+    Only the cheap threshold-dependent tail (normal CDF + QRF interpolation +
+    blend + calibration + clamp) runs per market; the threshold-independent
+    distribution is cached once per (station, date) by _build_distribution_cache.
+    Pass a precomputed `cache` to avoid rebuilding it (e.g. when the caller also
+    needs μ/σ for the σ-calibration check). A parity test pins this against
+    EnsembleStrategy._compute_fair_value.
+    """
+    from scipy.interpolate import interp1d
+    from models.qrf_model import DEFAULT_QUANTILES
+    from strategies.ensemble_strategy import (
+        FAIR_VALUE_FLOOR,
+        FAIR_VALUE_CEIL,
+        _scipy_norm,
+    )
+
+    weights = bundle["blender"].weights
+    if cache is None:
+        cache = _build_distribution_cache(bundle, eval_features)
 
     def prob_above(station: str, date_str: str, threshold: float):
         c = cache.get((station, date_str))
@@ -476,13 +543,49 @@ def run_evaluation(
     logger.info("Training look-ahead-free models (n_estimators=%d)...", n_estimators)
     bundle = train_models(train_df, n_estimators=n_estimators)
 
-    prob_above_fn = build_fair_value_fn(bundle, eval_feats)
+    cache = _build_distribution_cache(bundle, eval_feats)
+    prob_above_fn = build_fair_value_fn(bundle, eval_feats, cache=cache)
     result = evaluate_real_markets(markets, prob_above_fn, min_edge=min_edge)
+
+    result["sigma_calibration"] = compute_sigma_calibration(cache, eval_feats)
 
     result["eval_start"] = eval_start
     result["eval_end"] = eval_end
     result["min_edge"] = min_edge
     return result
+
+
+def compute_sigma_calibration(cache: dict, eval_features: pd.DataFrame) -> dict:
+    """σ-calibration on the eval window (diagnostic #3): for each cached
+    (station, date) predictive distribution, compare predicted σ to the realized
+    error (actual_tmax − μ), broken down by station and lead bucket.
+
+    Uses the SHORTEST lead per (station, date) — the same row the cache and the
+    bot's decision use — so predicted σ and realized error are aligned."""
+    ef = eval_features.copy()
+    ef["date"] = pd.to_datetime(ef["date"])
+    ef = ef.sort_values("lead_hour").drop_duplicates(["station", "date"], keep="first")
+    date_strs = ef["date"].dt.strftime("%Y-%m-%d")
+    actual_by_key = {
+        (str(st), ds): float(act)
+        for st, ds, act in zip(ef["station"], date_strs, ef["actual_tmax"])
+        if pd.notna(act)
+    }
+
+    errs, sigmas, stations, buckets = [], [], [], []
+    for (station, date_str), c in cache.items():
+        actual = actual_by_key.get((station, date_str))
+        if actual is None:
+            continue
+        errs.append(float(actual) - c["mu"])
+        sigmas.append(c["sigma"])
+        stations.append(station)
+        buckets.append(c["lead_bucket"])
+
+    return sigma_calibration_report(
+        np.array(errs), np.array(sigmas),
+        group_labels={"station": np.array(stations), "lead_bucket": np.array(buckets)},
+    )
 
 
 def main() -> None:
@@ -535,6 +638,26 @@ def main() -> None:
     _print_segments("station", result.get("by_station", {}))
     _print_segments("volume decile", result.get("by_volume_decile", {}))
     _print_segments("month", result.get("by_month", {}))
+
+    sig = result.get("sigma_calibration")
+    if sig:
+        o = sig["overall"]
+        print("  σ-CALIBRATION (ideal: z_std≈1.0, cov1σ≈0.683, cov2σ≈0.954)")
+        print(f"    overall    n={o['n']}  z_mean={o['z_mean']:+.2f}  z_std={o['z_std']:.2f}  "
+              f"cov1σ={o['coverage_1sigma']:.2f}  cov2σ={o['coverage_2sigma']:.2f}  "
+              f"mae={o['mae']:.2f}  mean_σ={o['mean_sigma']:.2f}")
+        verdict = (
+            "OVERCONFIDENT (σ too small)" if o["z_std"] > 1.1
+            else "UNDERCONFIDENT (σ too large)" if o["z_std"] < 0.9
+            else "well-calibrated"
+        )
+        print(f"    verdict:   {verdict}")
+        for grp in ("by_lead_bucket", "by_station"):
+            print(f"    {grp}:")
+            for key, s in sig.get(grp, {}).items():
+                print(f"      {key:<10} n={s['n']:>4}  z_std={s['z_std']:.2f}  "
+                      f"cov1σ={s['coverage_1sigma']:.2f}  mae={s['mae']:.2f}  mean_σ={s['mean_sigma']:.2f}")
+        print("-" * 60)
     print("=" * 60)
 
 

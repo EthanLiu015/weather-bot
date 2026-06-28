@@ -18,6 +18,7 @@ from backtest.real_market_eval import (
     per_trade_pnl,
     annualized_sharpe,
     evaluate_real_markets,
+    sigma_calibration_report,
 )
 from backtest.track_b import simulate_pnl
 
@@ -231,6 +232,80 @@ def test_evaluate_omits_volume_decile_when_absent():
     ])
     result = evaluate_real_markets(markets, lambda s, d, x: 0.9, min_edge=0.04)
     assert result.get("by_volume_decile") in (None, {})
+
+
+# ── σ-calibration report (diagnostic #3) ─────────────────────────────────────
+# err = actual - μ, sigma = predicted std. If σ is well-calibrated, the
+# standardized residual z = err/σ has std ≈ 1 and ~68% of |z| ≤ 1. z_std > 1
+# (or coverage < 0.68) ⇒ overconfident (σ too small); < 1 ⇒ underconfident.
+
+def test_sigma_calibration_perfectly_calibrated_unit_residuals():
+    # err = ±1 with σ = 1 → z = ±1, std exactly 1.0, all |z| ≤ 1.
+    err = np.array([1.0, -1.0, 1.0, -1.0])
+    sigma = np.ones(4)
+    rep = sigma_calibration_report(err, sigma)["overall"]
+    assert rep["n"] == 4
+    assert rep["z_std"] == pytest.approx(1.0)
+    assert rep["z_mean"] == pytest.approx(0.0)
+    assert rep["coverage_1sigma"] == pytest.approx(1.0)
+    assert rep["mean_sigma"] == pytest.approx(1.0)
+
+
+def test_sigma_calibration_detects_overconfidence():
+    # err twice as large as σ → z = ±2, std 2.0 (σ too small), no |z| ≤ 1.
+    err = np.array([2.0, -2.0, 2.0, -2.0])
+    sigma = np.ones(4)
+    rep = sigma_calibration_report(err, sigma)["overall"]
+    assert rep["z_std"] == pytest.approx(2.0)
+    assert rep["coverage_1sigma"] == pytest.approx(0.0)
+    assert rep["coverage_2sigma"] == pytest.approx(1.0)
+
+
+def test_sigma_calibration_groups_by_label():
+    err = np.array([1.0, -1.0, 3.0, -3.0])
+    sigma = np.ones(4)
+    labels = {"station": np.array(["KORD", "KORD", "KLAX", "KLAX"])}
+    rep = sigma_calibration_report(err, sigma, group_labels=labels)
+    assert rep["by_station"]["KORD"]["z_std"] == pytest.approx(1.0)
+    assert rep["by_station"]["KLAX"]["z_std"] == pytest.approx(3.0)
+    assert rep["by_station"]["KORD"]["n"] == 2
+
+
+def test_sigma_calibration_empty_is_nan():
+    rep = sigma_calibration_report(np.array([]), np.array([]))["overall"]
+    assert rep["n"] == 0
+    assert math.isnan(rep["z_std"])
+
+
+def test_build_distribution_cache_exposes_mu_sigma():
+    from scripts.initial_train import train_models
+    from backtest.real_market_eval import _build_distribution_cache
+
+    df = _synthetic_station_features()
+    bundle = train_models(df, n_estimators=20, learning_rate=0.05, min_rows=100)
+    cache = _build_distribution_cache(bundle, df)
+    d = str(df["date"].iloc[0].date())
+    entry = cache[("KORD", d)]
+    assert "mu" in entry and "sigma" in entry
+    assert entry["sigma"] > 0
+    assert "lead_bucket" in entry
+
+
+def test_compute_sigma_calibration_end_to_end_against_actuals():
+    from scripts.initial_train import train_models
+    from backtest.real_market_eval import (
+        _build_distribution_cache,
+        compute_sigma_calibration,
+    )
+
+    df = _synthetic_station_features()
+    bundle = train_models(df, n_estimators=20, learning_rate=0.05, min_rows=100)
+    cache = _build_distribution_cache(bundle, df)
+    rep = compute_sigma_calibration(cache, df)
+    assert rep["overall"]["n"] > 0
+    assert rep["overall"]["mean_sigma"] > 0
+    assert "by_station" in rep and "KORD" in rep["by_station"]
+    assert "by_lead_bucket" in rep
 
 
 # ── build_fair_value_fn wiring (trains a tiny real bundle) ───────────────────

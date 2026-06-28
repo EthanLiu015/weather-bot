@@ -59,9 +59,9 @@ Day-ahead daily-max temperature is a *very* well-forecast quantity and the marke
 
 ---
 
-## ✅ DONE (2026-06-28, session 2) — Definitive 500-tree numbers + diagnostics 1/2/4. Verdict holds: NO edge, in any segment.
+## ✅ DONE (2026-06-28, session 2) — Definitive 500-tree numbers + diagnostics 1/2/3/4. Verdict holds: NO edge, in any segment.
 
-Ran the official 500-tree harness (now with segment breakdowns) and worked diagnostics #1, #2, #4. **The no-edge conclusion is now airtight.** Full suite **348 passing**.
+Ran the official 500-tree harness (now with segment breakdowns + σ-calibration) and worked diagnostics #1, #2, #3, #4 — all cheap diagnostics are now done. **The no-edge conclusion is airtight: ML is fine (#2), σ is well-calibrated (#3), no segment has edge (#1).** Full suite **354 passing**.
 
 ### 0+1. Definitive harness (500 trees) — model loses in EVERY segment
 Model Brier **0.1451** vs market **0.0963** (3,340 markets, Apr 11–May 27). Flat-$1 P&L −$19.77 / 2,506 trades, win 30.6%, daily Sharpe −3.22. Matches the 80-tree (0.146) and prior 500-tree (0.1448) runs → genuine, not undertraining. Log: `/tmp/harness_official500.log`.
@@ -84,9 +84,15 @@ Empirically (vs official actual_tmax): well-behaved stations sit at corr ~0.86�
 - `tests/test_real_market_eval.py` — +4 tests (25 total, all pass).
 - Memory: `nbm-grid-lookup-bug` added.
 
-### Not done (cheap, remaining diagnostics)
-- **#3 σ-calibration check** (predicted σ vs realized error by lead/station) — not run; would confirm whether the 2.0°F sigma-floor + spread-inflation are mis-tuned for the bracket task. Lower priority given the verdict.
-- The strategic question stands: with no edge in any segment, the realistic paths are (a) **fresher data** (HRRR/RAP/same-day NBM to match the market's ~6h horizon — the only thing that attacks root cause #1), or (b) accept the market is efficient here. Beating a day-ahead daily-max market is genuinely hard.
+### 3. σ-calibration check — σ is well-calibrated; NOT the problem. (done 2026-06-28)
+Compared predicted σ to realized error (actual − μ) on the eval window via the look-ahead-free distribution cache. **Overall z_std = 1.01** (ideal 1.0), cov1σ = 0.72 (ideal 0.683), cov2σ = 0.94 (ideal 0.954), mae 2.91°F, mean σ 3.80°F. So the 2.0°F sigma-floor + spread-inflation do **not** make the model over/under-confident — the worry is disproven. Tiny warm bias (z_mean −0.21 ⇒ μ ~0.8°F high). Per-station mostly 0.85–1.06; outliers are small-n (KBOS z_std 1.56, n=18) or low-variance easy stations slightly underconfident (KLAS 0.64, KMIA 0.66 — σ a touch wide where it barely matters).
+
+**Key conclusion:** the deficit is NOT miscalibration. mean σ ≈ 3.8°F is *correctly sized* but simply too WIDE for 2°F brackets — a faithful 3.8°F distribution smears across ~2 brackets, so it can't price them as sharply as a market working off ~6h-lead data. Recalibrating σ can't fix this; only reducing actual forecast error (fresher data) can. This closes the loop: ML is fine (#2), σ is fine (#3), segments offer no edge (#1) → the gap is irreducible 24h-lead forecast width + the market's information freshness.
+
+Implemented as part of the harness: `_build_distribution_cache` (extracted, shared by fair-value + calibration), `sigma_calibration_report`/`compute_sigma_calibration`; `run_evaluation` now returns `sigma_calibration` and `main()` prints it. Log: `/tmp/harness_sigma.log`. 354 tests pass (+6). ⚠️ GOTCHA fixed: `itertuples` renames `_`-prefixed columns to positional (`_date_str`→`_1`); the calibration join uses `zip` over Series instead (end-to-end test added).
+
+### Strategic state — all cheap diagnostics done; verdict is final
+With no edge in any segment AND a well-calibrated model, the only realistic paths are (a) **fresher data** (HRRR/RAP/same-day NBM to match the market's ~6h horizon — the only thing that attacks root cause #1), or (b) accept the market is efficient here. Beating a day-ahead daily-max market is genuinely hard. Remaining non-edge cleanup (won't change the verdict): fix the NBM Lambert-grid bug (#4), drop/repair dead `gefs_tmax_mean` (#2), fix the production bracket-pricing bug so the live bot is at least *correct*.
 
 ⚠️ **Nothing committed yet** — working tree was clean at session start (prior work already on `main`); these session-2 edits are uncommitted, awaiting approval.
 
