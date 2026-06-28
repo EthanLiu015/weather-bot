@@ -8,6 +8,57 @@ The full pipeline: ingest live weather forecasts → build feature matrix → ru
 
 ---
 
+## 🧭 START HERE (2026-06-28) — Why the model has no edge, and where to look next
+
+We now have a **trustworthy, confound-free verdict: the model does NOT beat the Kalshi market** (model Brier ~0.146 vs market ~0.096 on real bracket markets; market wins every strike type). Two confounds have been eliminated this session — markets are now priced as the real 2°F brackets they are ([[kalshi-bracket-markets]]), and the training target is now the exact official NWS max Kalshi settles on (100% agreement). Aligning the target did NOT change the result, so the gap is **genuine forecast skill**, not a data artifact.
+
+The next agent's job is to **diagnose the skill gap and look for any exploitable edge.** Below is the grounded "why" + a prioritised investigation plan. Detailed history is in the dated sections further down.
+
+### Why the model underperforms the market (evidence)
+Measured on the eval window (Apr 11–May 27, lead 24h, vs official max):
+
+| input / model | corr w/ actual | MAE °F | note |
+|---|---|---|---|
+| `gefs_tmax_mean` | 0.56 | **15.0** | **BROKEN** — it's ERA5 *instantaneous* t2m at init time, NOT a daily-max forecast |
+| `nbm_t50` | 0.68 | **8.1** | suspiciously weak (NBM MaxT should be ~2–3°F) — likely a backfill/units bug |
+| `ecmwf_tmax` | 0.93 | 3.74 | the real workhorse feature (backfilled; differs from gefs proxy by ~14°F) |
+| **blended model μ** | 0.94 | **3.1** | the model DOES add value over raw ECMWF — the ML isn't the problem |
+
+Root causes, in rough priority:
+1. **Information-horizon gap (biggest).** The market price we score against is the last trade by ~14:00 UTC on resolution day (≈9am local, ~6–9h before the afternoon high). Our shortest feature is a **24h-lead** forecast (issued ~30h before the high). The market simply has fresher data (same-morning NBM/HRRR + early obs). A 24h forecast (MAE ~3°F) cannot beat a market pricing off ~6h-lead guidance.
+2. **Forecast precision vs bracket width.** Brackets are **2°F** wide; model error is ~3°F (σ≈4.3°F), so the predictive distribution smears across 2–3 brackets → best-case per-bracket Brier ~0.15. To win you need sub-1°F sharpness or an inefficiency.
+3. **Fake ensemble uncertainty.** Historical GEFS spread features (`gefs_tmax_std/range/iqr/p10..p90`) are faked from ERA5 temporal windows, not a real 20-member ensemble → the model's σ (hence bracket probabilities) is miscalibrated by construction. Real GEFS ensemble spread would directly improve bracket pricing.
+4. **A core feature is dead weight.** `gefs_tmax_mean` (15°F MAE) carries no daily-max signal; the trees lean on `ecmwf_tmax`. Fixing/removing it is low-effort.
+
+### Next steps — diagnose issues & gaps
+
+**0. FIRST: run the definitive 500-tree harness and record the numbers.** (The 80-tree run gave model Brier 0.146; a 500-tree run was attempted but killed before finishing — finish it for the official record.) ~20–25 min train + fast eval:
+```bash
+PYTHONPATH=. python -m backtest.real_market_eval --n-estimators 500 | tee /tmp/harness_official500.log
+```
+Expected ≈ the 80-tree result (NO edge); replace the "n_est=80; 500-tree confirm pending" note in the Follow-up section with the actual figures (overall + per strike_type). If it differs materially from 0.146, STOP and investigate — that would be surprising.
+
+Then the diagnostics below (cheap, no new data):
+
+1. **Per-segment edge breakdown in the harness.** Extend `evaluate_real_markets` (already does `by_strike_type`) to also break model−market Brier and P&L down **by station, by lead bucket, by volume decile, by month**. Edge, if any, hides in segments (thin/illiquid markets, specific stations, longer-dated D3–7 where forecasts diverge and the market may be less efficient). This is the single highest-value diagnostic.
+2. **Feature-importance + ablation audit.** Which features the production models actually use; confirm `gefs_tmax_mean` is noise; quantify how much `ecmwf_tmax` alone explains. Drop/repair dead features.
+3. **σ-calibration check.** Compare predicted σ to realized error by lead/station; the spread-inflation + sigma-floor (2.0°F) were tuned against climatology, not real brackets — verify they're not over/under-confident on the bracket task.
+4. **Investigate `nbm_t50` MAE 8°F.** NBM is purpose-built MaxT guidance; 8°F error implies a backfill bug (wrong field/units/time-agg). Fixing it could add a strong feature.
+5. **Liquidity/volume study.** Compute market Brier vs `volume` — the market is likely sharpest on liquid markets; thin markets are where mispricings (our only realistic edge) would live.
+
+### Possible edges to explore (where more data / different angles could win)
+- **Fresher data (highest leverage).** Ingest short-lead guidance to match the market's horizon: **HRRR (0–18h), RAP, the latest same-day NBM MaxT grid**, and live METAR nowcasts. Score at the market's actual decision time, not 24h out. This directly attacks root cause #1.
+- **Real GEFS ensemble (not ERA5 proxy)** for genuine forecast uncertainty → calibrated bracket probabilities (root cause #3). Same for a real ECMWF ensemble (ENS) if obtainable.
+- **Use NWS/NBM official MaxT forecast as a direct feature/anchor** — the market essentially prices off this; matching it is table stakes, beating it needs a bias model on top.
+- **Microclimate / station-bias models.** Persistent local biases (marine layer at SFO/LAX, lake effect at KORD/Midway, UHI) where NBM has known systematic errors — a learned per-station correction on the official MaxT could create thin edge.
+- **Inefficiency hunting, not forecast-beating.** Tails (`greater`/`less`) are where the market is most confident (Brier 0.016) — unlikely. Better: thin/early/long-dated markets, opening-auction mispricings, or stale prices right after a forecast update.
+- **Longer-dated markets (D3–7).** At longer lead the market's information advantage shrinks and forecasts diverge; if any model edge exists it's more likely here than at D1. Check the per-lead breakdown (step 1).
+
+### Reality check for the next agent
+Day-ahead daily-max temperature is a *very* well-forecast quantity and the market aggregates excellent NWS/NBM guidance — beating it is genuinely hard. The model already matches/edges raw ECMWF; the deficit is **information freshness + ensemble calibration + bracket precision**, not a broken ML pipeline. Set expectations accordingly: the realistic win is a *thin* edge in a *segment* (thin markets, longer leads, specific stations), not a broad alpha. Decide early whether that's worth the data-engineering cost of short-lead ingestion.
+
+---
+
 ## ⚠️ READ FIRST — Critical correction (2026-06-23)
 
 **Every "real Kalshi price" performance number in the older sections below is FAKE. Do not cite the $95,983 P&L or any real-price Sharpe (3.05 / 4.0 / 5.6 / 41).** They were artifacts of three compounding bugs, found and (mostly) fixed this session:
@@ -69,8 +120,13 @@ Kalshi settles on the official NWS station (e.g. Chicago **Midway**); our featur
 ### ⚠️ PERF GOTCHA fixed
 `IsotonicCalibrator.calibrate()` runs `bootstrap_ci` (1000 isotonic refits) per call — fine for production (a few dozen tickers/cycle) but the harness prices ~8k bracket boundaries → it hung. The harness calls `calibrator._iso.predict()` directly for `cal_prob` (identical value, no CI), since the eval doesn't use ci_width.
 
+### Follow-up (2026-06-28) — aligned training target to the official NWS max; STILL no edge
+Closed the source/station mismatch: the training target `actual_tmax` was the max of **hourly** METAR temps, which underestimates the true daily peak by ~1°F and disagreed with Kalshi settlements ~12% of the time. Switched it to the **official NWS daily max** (IEM ASOS daily summary) at the exact station Kalshi settles on (incl. Chicago→Midway, NY→Central Park). Verified: official-max vs Kalshi settlement agreement = **100%** (was 87.6%). Migrated `features.parquet` (131,852 rows changed, +1°F mean; `data/historical/features.parquet.bak_pre_official_tmax_*` backup).
+
+**Result: model Brier ~0.146 → essentially UNCHANGED** (n_est=80; 500-tree confirm pending). So the measurement gap was NOT the cause — the model genuinely lacks edge. Even predicting exactly the settlement quantity, its day-ahead forecast (σ≈4°F spread over 2° brackets) is less sharp than the market's prices. This is the cleaner, confound-free "no edge" conclusion. Files: `ingestion/nws_daily.py` (+`SETTLEMENT_STATION`), `scripts/update_actual_tmax_official.py`, `build_feature_matrix.build_daily_tmax` (now defaults to official source w/ hourly fallback), `tests/test_nws_daily.py` (7). Plan: `plans/nws-settlement-source.md`. Known minor approximation: obs_minus_model lag features + climatology normals still on the old target (target-only migration; full rebuild would refresh them but risks wiping ECMWF/NBM backfills).
+
 ### Open / next
-- **Fix the production bracket-pricing bug** (ensemble_strategy) — the bot is live-mispricing every bracket. But note: even correctly priced, the eval shows NO edge, so fixing it makes the bot *correct*, not *profitable*.
+- **Fix the production bracket-pricing bug** (ensemble_strategy) — the bot is live-mispricing every bracket. But note: even correctly priced + target-aligned, the eval shows NO edge, so fixing it makes the bot *correct*, not *profitable*.
 - The honest strategic question: with no edge vs Kalshi on this data, is the project worth continuing as-is? Possible angles: source-match to the exact NWS settlement station per series (lifts the `between` ceiling — see caveat); restrict to tails only; different markets/lead times; or accept the market is efficient here.
 - Definitive numbers are in `/tmp/harness_final.log`; re-run with `PYTHONPATH=. python -m backtest.real_market_eval --n-estimators 500`.
 

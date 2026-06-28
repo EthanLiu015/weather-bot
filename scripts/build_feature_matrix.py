@@ -131,6 +131,33 @@ def build_era5_station_ts(stations: list[str]) -> dict[str, pd.DataFrame]:
 # ASOS actual Tmax
 # ---------------------------------------------------------------------------
 
+# IEM ASOS daily history is deep; this start safely precedes the ERA5 span
+# (2021-05-27 →). End is open (today) so re-runs pick up new days.
+_OFFICIAL_TMAX_START = date(2021, 1, 1)
+
+
+def build_daily_tmax(station: str) -> pd.Series:
+    """Daily Tmax (°F) target for `station`, sourced from the OFFICIAL NWS daily
+    max at the station Kalshi settles on (IEM ASOS daily summary). Falls back to
+    the hourly-METAR max if IEM is unavailable.
+
+    This is the temperature Kalshi resolves on — using it as the training target
+    closes the source mismatch that handicapped the model (see
+    plans/nws-settlement-source.md).
+    """
+    from ingestion.nws_daily import official_daily_tmax_series, SETTLEMENT_STATION
+
+    if station in SETTLEMENT_STATION:
+        try:
+            s = official_daily_tmax_series(station, _OFFICIAL_TMAX_START, date.today())
+            if not s.empty:
+                return s
+            logger.warning("IEM returned no data for %s — falling back to hourly METAR max", station)
+        except Exception as exc:
+            logger.warning("IEM fetch failed for %s (%s) — falling back to hourly METAR max", station, exc)
+    return build_asos_daily_tmax(station, STATION_REGISTRY[station].timezone)
+
+
 def build_asos_daily_tmax(station: str, tz: str) -> pd.Series:
     """Return daily Tmax (°F) in local station time, indexed by date."""
     path = HIST_DIR / f"{station}_hourly.parquet"
@@ -372,7 +399,7 @@ def main() -> None:
     # Pre-compute daily Tmax history per station (used for both climatology
     # normals below and the per-station feature rows in the main loop)
     daily_tmax_by_station = {
-        station: build_asos_daily_tmax(station, STATION_REGISTRY[station].timezone)
+        station: build_daily_tmax(station)
         for station in ALL_ICAO
     }
 
