@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from backtest.track_b import FEE_RATE
+from strategies.bracket_pricing import bracket_yes_prob
 
 logger = logging.getLogger(__name__)
 
@@ -37,42 +38,6 @@ MARKET_BRIER_BENCHMARK = 0.068
 # (station, date, threshold) -> calibrated P(temp > threshold), or None when the
 # model cannot price that (station,date) (no feature row / untrained bucket).
 ProbAboveFn = Callable[[str, str, float], Optional[float]]
-
-# NWS daily highs are reported in whole °F, so a market boundary "high > 84"
-# means "high ≥ 85"; the decision boundary on the continuous forecast sits at
-# 84.5. These ±0.5 continuity corrections convert integer strike rules into
-# thresholds for the continuous predictive distribution.
-_HALF = 0.5
-
-
-def bracket_yes_prob(
-    prob_above: Callable[[float], Optional[float]],
-    strike_type: str,
-    floor_strike: Optional[float],
-    cap_strike: Optional[float],
-) -> Optional[float]:
-    """Model's YES probability for a real Kalshi temperature bracket.
-
-    Kalshi temperature markets are mutually-exclusive brackets:
-      * greater (>F):       YES = P(high > F)        = prob_above(F + 0.5)
-      * less   (<C):        YES = P(high < C)        = 1 - prob_above(C - 0.5)
-      * between [F, C]:      YES = P(F ≤ high ≤ C)    = prob_above(F-0.5) - prob_above(C+0.5)
-
-    `prob_above(x)` is the model's calibrated P(high > x); returns None when
-    unpriceable (propagated as None so the market is skipped).
-    """
-    if strike_type == "greater":
-        return prob_above(float(floor_strike) + _HALF)
-    if strike_type == "less":
-        p = prob_above(float(cap_strike) - _HALF)
-        return None if p is None else 1.0 - p
-    if strike_type == "between":
-        lo = prob_above(float(floor_strike) - _HALF)
-        hi = prob_above(float(cap_strike) + _HALF)
-        if lo is None or hi is None:
-            return None
-        return max(0.0, lo - hi)
-    raise ValueError(f"Unknown strike_type: {strike_type!r}")
 
 
 def brier_score(probs, outcomes) -> float:
@@ -524,7 +489,7 @@ def run_evaluation(
     prices = pd.read_parquet(prices_path)
     prices["date"] = pd.to_datetime(prices["date"])
     # The bot trades HIGH-temp (tmax) markets only — production skips low-temp
-    # (overnight-minimum) series entirely (EnsembleStrategy._get_active_tickers),
+    # (overnight-minimum) series entirely (EnsembleStrategy.fetch_active_temperature_tickers),
     # and our models predict actual_tmax. Scoring low-temp markets with a tmax
     # model is meaningless, so exclude them to match the live trading scope.
     not_low = ~prices["series"].map(is_low_temp_series)

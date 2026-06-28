@@ -54,16 +54,40 @@ async def test_fetch_active_tickers_never_queries_low_temp_series():
 
 
 @pytest.mark.asyncio
-async def test_fetch_active_tickers_excludes_low_temp_tickers_from_results():
+async def test_fetch_active_tickers_returns_market_dicts_with_strike_fields():
+    # fetch must surface the bracket structure (strike_type/floor/cap) so the
+    # bot can price each ticker as the real Kalshi bracket it is.
     async def fake_request(method, path, params=None, **kwargs):
         if params["series_ticker"] == "KXHIGHCHI":
-            return {"markets": [{"ticker": "KXHIGHCHI-26JUN11-T81"}]}
+            return {"markets": [{
+                "ticker": "KXHIGHCHI-26JUN11-T81", "strike_type": "greater",
+                "floor_strike": 81, "cap_strike": None,
+            }]}
         return {"markets": []}
 
     client = AsyncMock()
     client._request = AsyncMock(side_effect=fake_request)
     strategy = _make_strategy(client)
 
-    tickers = await strategy.fetch_active_temperature_tickers()
+    markets = await strategy.fetch_active_temperature_tickers()
 
-    assert tickers == ["KXHIGHCHI-26JUN11-T81"]
+    assert len(markets) == 1
+    assert markets[0]["ticker"] == "KXHIGHCHI-26JUN11-T81"
+    assert markets[0]["strike_type"] == "greater"
+    assert markets[0]["floor_strike"] == 81.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_active_tickers_skips_markets_without_strike_type():
+    async def fake_request(method, path, params=None, **kwargs):
+        if params["series_ticker"] == "KXHIGHCHI":
+            return {"markets": [{"ticker": "KXHIGHCHI-26JUN11-T81"}]}  # no strike_type
+        return {"markets": []}
+
+    client = AsyncMock()
+    client._request = AsyncMock(side_effect=fake_request)
+    strategy = _make_strategy(client)
+
+    markets = await strategy.fetch_active_temperature_tickers()
+
+    assert markets == []

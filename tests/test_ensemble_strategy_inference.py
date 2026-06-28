@@ -37,6 +37,64 @@ def _make_residual(correction: float = 2.0):
     return m
 
 
+# ── Bracket fair value: prices greater/less/between, not P(tmax>threshold) ────
+# The live bot must price each ticker as the real Kalshi bracket it is, using
+# strike_type + floor_strike/cap_strike, not a single P(high > threshold).
+
+def _bracket_strategy():
+    return EnsembleStrategy(
+        shared_state=None, model_registry={}, kalshi_client=MagicMock(), settings=None
+    )
+
+
+def _patch_prob_above(strategy, by_threshold):
+    """Patch _compute_fair_value so cal_prob = by_threshold[threshold]."""
+    from unittest.mock import patch
+
+    def fake(*, threshold, **kwargs):
+        p = by_threshold(threshold) if callable(by_threshold) else by_threshold[threshold]
+        return {"cal_prob": p, "ci_width": 0.1, "raw_prob": p}
+
+    return patch.object(strategy, "_compute_fair_value", side_effect=fake)
+
+
+def test_bracket_fair_value_greater_uses_floor_plus_half():
+    strategy = _bracket_strategy()
+    seen = []
+    with _patch_prob_above(strategy, lambda t: (seen.append(t) or 0.7)):
+        out = strategy._bracket_fair_value(
+            X=_make_X(), ngboost_model=_make_ngboost(), qrf_model=None,
+            residual_model=None, blender=None, calibrator=None,
+            strike_type="greater", floor_strike=84.0, cap_strike=None,
+        )
+    assert out["cal_prob"] == pytest.approx(0.7)
+    assert 84.5 in seen
+
+
+def test_bracket_fair_value_less_is_complement():
+    strategy = _bracket_strategy()
+    with _patch_prob_above(strategy, lambda t: 0.7):  # P(high > 76.5) = 0.7
+        out = strategy._bracket_fair_value(
+            X=_make_X(), ngboost_model=_make_ngboost(), qrf_model=None,
+            residual_model=None, blender=None, calibrator=None,
+            strike_type="less", floor_strike=None, cap_strike=77.0,
+        )
+    assert out["cal_prob"] == pytest.approx(0.3)
+
+
+def test_bracket_fair_value_between_is_cdf_difference():
+    strategy = _bracket_strategy()
+    probs = {82.5: 0.8, 84.5: 0.3}
+    with _patch_prob_above(strategy, probs):
+        out = strategy._bracket_fair_value(
+            X=_make_X(), ngboost_model=_make_ngboost(), qrf_model=None,
+            residual_model=None, blender=None, calibrator=None,
+            strike_type="between", floor_strike=83.0, cap_strike=84.0,
+        )
+    assert out["cal_prob"] == pytest.approx(0.5)
+    assert "ci_width" in out
+
+
 # ── Residual correction applied to mu ────────────────────────────────────────
 
 def test_compute_fair_value_applies_residual_correction_to_mu():
@@ -337,9 +395,10 @@ def test_run_cycle_selects_d1_model_for_short_horizon(monkeypatch):
     full_coverage = {"D1-2": 1.0, "D3-4": 1.0, "D5-7": 1.0}
 
     with patch.object(strategy, "fetch_active_temperature_tickers",
-                      new_callable=AsyncMock, return_value=["KXXX-D1-T72-B1"]), \
+                      new_callable=AsyncMock, return_value=[
+                          {"ticker": "KXXX-D1-T72", "strike_type": "greater",
+                           "floor_strike": 72.0, "cap_strike": None}]), \
          patch.object(strategy, "_ticker_to_station", return_value="KNYC"), \
-         patch.object(strategy, "_ticker_to_threshold", return_value=72.0), \
          patch.object(strategy, "_ticker_to_horizon", return_value=1), \
          patch.object(strategy, "_compute_coverage_by_bucket", return_value=full_coverage), \
          patch("strategies.ensemble_strategy.fetch_latest_gefs_run",
@@ -402,9 +461,10 @@ def test_run_cycle_selects_d3_model_for_medium_horizon(monkeypatch):
     full_coverage = {"D1-2": 1.0, "D3-4": 1.0, "D5-7": 1.0}
 
     with patch.object(strategy, "fetch_active_temperature_tickers",
-                      new_callable=AsyncMock, return_value=["KXXX-D3-T72-B1"]), \
+                      new_callable=AsyncMock, return_value=[
+                          {"ticker": "KXXX-D3-T72", "strike_type": "greater",
+                           "floor_strike": 72.0, "cap_strike": None}]), \
          patch.object(strategy, "_ticker_to_station", return_value="KNYC"), \
-         patch.object(strategy, "_ticker_to_threshold", return_value=72.0), \
          patch.object(strategy, "_ticker_to_horizon", return_value=3), \
          patch.object(strategy, "_compute_coverage_by_bucket", return_value=full_coverage), \
          patch("strategies.ensemble_strategy.fetch_latest_gefs_run",

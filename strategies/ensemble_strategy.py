@@ -28,6 +28,7 @@ from processing.asos_history import compute_daily_residuals, build_asos_history_
 from processing.bias_correction import BiasCorrectionRegistry, get_lead_bucket, get_season
 from processing.features import build_feature_matrix, get_feature_columns
 from models.spread_inflation import apply_spread_inflation_from_stats
+from strategies.bracket_pricing import bracket_yes_prob, bracket_primary_threshold
 from config.stations import ALL_ICAO
 from db.forecast_log import record_forecast_tmax, get_forecast_tmax
 from db.models import ForecastRun
@@ -161,6 +162,54 @@ class EnsembleStrategy:
 
         return {"raw_prob": raw_prob, "cal_prob": float(cal_prob), "ci_width": float(ci_width)}
 
+    def _bracket_fair_value(
+        self,
+        *,
+        X: "pd.DataFrame",
+        ngboost_model,
+        qrf_model,
+        residual_model,
+        blender,
+        calibrator,
+        strike_type: str,
+        floor_strike: float | None,
+        cap_strike: float | None,
+        ecmwf_offset: float = 0.0,
+    ) -> dict:
+        """Fair YES probability for a real Kalshi temperature BRACKET.
+
+        Kalshi temperature markets are mutually-exclusive brackets (greater/less/
+        between), NOT P(high > threshold). This evaluates the calibrated
+        P(high > x) at the bracket's boundary threshold(s) via _compute_fair_value
+        and combines them with bracket_yes_prob — identical semantics to the
+        eval harness. ci_width comes from the bracket's primary boundary.
+        """
+        cache: dict[float, dict] = {}
+
+        def fv(threshold: float) -> dict:
+            if threshold not in cache:
+                cache[threshold] = self._compute_fair_value(
+                    X=X,
+                    ngboost_model=ngboost_model,
+                    qrf_model=qrf_model,
+                    residual_model=residual_model,
+                    blender=blender,
+                    calibrator=calibrator,
+                    threshold=threshold,
+                    ecmwf_offset=ecmwf_offset,
+                )
+            return cache[threshold]
+
+        yes = bracket_yes_prob(
+            lambda x: fv(x)["cal_prob"], strike_type, floor_strike, cap_strike
+        )
+        base = fv(bracket_primary_threshold(strike_type, floor_strike, cap_strike))
+        return {
+            "cal_prob": float(yes),
+            "ci_width": base["ci_width"],
+            "raw_prob": base["raw_prob"],
+        }
+
     async def run_cycle(self) -> None:
         logger.info("EnsembleStrategy: starting cycle")
         try:
@@ -241,14 +290,17 @@ class EnsembleStrategy:
             logger.warning("No trained NGBoost models in registry — skipping cycle")
             return
 
-        active_tickers = await self.fetch_active_temperature_tickers()
+        active_markets = await self.fetch_active_temperature_tickers()
 
-        for ticker in active_tickers:
+        for market in active_markets:
             try:
+                ticker = market["ticker"]
+                strike_type = market["strike_type"]
+                floor_strike = market["floor_strike"]
+                cap_strike = market["cap_strike"]
                 station = self._ticker_to_station(ticker)
-                threshold = self._ticker_to_threshold(ticker)
                 horizon = self._ticker_to_horizon(ticker)
-                if station is None or threshold is None:
+                if station is None or strike_type is None:
                     continue
 
                 station_rows = feature_df[feature_df["station"] == station]
@@ -290,14 +342,16 @@ class EnsembleStrategy:
                 calibrator = calibrators.get(cal_key)
 
                 try:
-                    fv = self._compute_fair_value(
+                    fv = self._bracket_fair_value(
                         X=X,
                         ngboost_model=ngboost_model,
                         qrf_model=qrf_model,
                         residual_model=residual_model,
                         blender=blender,
                         calibrator=calibrator,
-                        threshold=threshold,
+                        strike_type=strike_type,
+                        floor_strike=floor_strike,
+                        cap_strike=cap_strike,
                         ecmwf_offset=ecmwf_offset,
                     )
                 except Exception as exc:
@@ -320,7 +374,9 @@ class EnsembleStrategy:
                         calibrated_prob=cal_prob,
                         ci_lower=cal_prob - ci_width / 2,
                         ci_upper=cal_prob + ci_width / 2,
-                        threshold=threshold,
+                        threshold=bracket_primary_threshold(
+                            strike_type, floor_strike, cap_strike
+                        ),
                     ))
 
                 logger.info("Updated %s: fair_a=%.3f ci=%.3f", ticker, cal_prob, ci_width)
@@ -329,15 +385,20 @@ class EnsembleStrategy:
                 logger.error("Failed processing ticker %s: %s", ticker, exc)
 
         self._last_run_time = datetime.utcnow()
-        logger.info("EnsembleStrategy cycle complete; updated %d tickers", len(active_tickers))
+        logger.info("EnsembleStrategy cycle complete; updated %d markets", len(active_markets))
 
-    async def fetch_active_temperature_tickers(self) -> list[str]:
+    async def fetch_active_temperature_tickers(self) -> list[dict]:
         """
         Fetch open temperature markets by querying each known series directly.
         The live Kalshi API does not reliably tag temperature markets with a
         category, so category-based filtering returns 0 results.
+
+        Returns one dict per market carrying its real bracket structure
+        (ticker, strike_type, floor_strike, cap_strike) — Kalshi temperature
+        markets are mutually-exclusive °F brackets, so the bot needs these to
+        price each ticker correctly. Markets without a strike_type are skipped.
         """
-        tickers: list[str] = []
+        markets: list[dict] = []
         try:
             for series in self._SERIES_TO_STATION:
                 if is_low_temp_series(series):
@@ -349,15 +410,26 @@ class EnsembleStrategy:
                     )
                     for market in data.get("markets", []):
                         ticker = market.get("ticker", "")
-                        if self._ticker_to_station(ticker) is not None:
-                            tickers.append(ticker)
+                        strike_type = market.get("strike_type")
+                        if strike_type is None or self._ticker_to_station(ticker) is None:
+                            continue
+
+                        def _f(v):
+                            return None if v is None else float(v)
+
+                        markets.append({
+                            "ticker": ticker,
+                            "strike_type": strike_type,
+                            "floor_strike": _f(market.get("floor_strike")),
+                            "cap_strike": _f(market.get("cap_strike")),
+                        })
                 except Exception:
                     pass  # series may not exist on this environment
-            logger.info("Found %d active temperature tickers across %d series",
-                        len(tickers), len(self._SERIES_TO_STATION))
+            logger.info("Found %d active temperature markets across %d series",
+                        len(markets), len(self._SERIES_TO_STATION))
         except Exception as exc:
             logger.error("Failed to fetch active tickers: %s", exc)
-        return tickers
+        return markets
 
     def detect_new_model_run(self, last_run_ts: datetime) -> bool:
         import asyncio
@@ -403,15 +475,6 @@ class EnsembleStrategy:
         # Ticker format: KXHIGHCHI-26MAY31-T81 → series=KXHIGHCHI
         series = ticker.split("-")[0]
         return cls._SERIES_TO_STATION.get(series)
-
-    @staticmethod
-    def _ticker_to_threshold(ticker: str) -> float | None:
-        import re
-        # Format: ...-T81 or ...-B80.5 (T=above, B=below)
-        m = re.search(r"-[TB]([\d.]+)$", ticker)
-        if m:
-            return float(m.group(1))
-        return None
 
     @staticmethod
     def _ticker_to_horizon(ticker: str) -> int:

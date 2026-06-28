@@ -98,6 +98,28 @@ With no edge in any segment AND a well-calibrated model, the only realistic path
 
 ---
 
+## ✅/⚠️ DONE (2026-06-28, session 3) — Non-edge cleanup: 1 clean fix shipped, 2 items re-scoped
+
+The handoff listed three "non-edge cleanups." Investigation showed only one is the clean low-effort win it was billed as; the other two are heavier and were re-scoped (one mis-diagnosed in the prior handoff). **366 tests pass.** All changes uncommitted, awaiting approval.
+
+### ✅ 1. Production bracket-pricing bug — FIXED (the real win)
+The live bot priced EVERY ticker as `P(tmax > threshold)`, ignoring strike_type — mis-pricing every bracket market. Fixed via TDD:
+- **NEW `strategies/bracket_pricing.py`** — shared pure `bracket_yes_prob` + `bracket_primary_threshold` (extracted from the harness to avoid a strategies↔backtest import cycle; `real_market_eval` now imports from here). 8 tests.
+- **`ensemble_strategy`**: new `_bracket_fair_value` prices greater (`P(>F+.5)`), less (`1−P(>C−.5)`), between (`P(>F−.5)−P(>C+.5)`) by evaluating `_compute_fair_value` at the boundary thresholds — identical semantics to the eval harness. `fetch_active_temperature_tickers` now returns market **dicts** carrying `strike_type/floor_strike/cap_strike` (was bare ticker strings); `run_cycle` consumes them; dead `_ticker_to_threshold` removed. DB `threshold` logs the bracket's primary boundary. Tests updated + added (`_bracket_fair_value` greater/less/between, dict-shape fetch, skip-no-strike_type).
+- NOTE: makes the bot **correct**, not profitable — verdict is still no-edge.
+
+### ⚠️ 2. NBM nbm_t50 8°F MAE — PRIOR DIAGNOSIS WAS WRONG; corrected, fix deferred
+The session-2 claim that this is a Lambert-grid `find_nearest` bug is **DISPROVEN.** Verified against a real f024 block: KLAX maps to a grid point **0.8 km** away (KSFO/KORD/KATL all <1.5 km), and a decoded-coord geographic nearest search returns the **identical** indices. The grid lookup is correct. (I implemented + then reverted a KDTree-style replacement once it changed nothing.)
+**Real cause: a date/window-alignment bug in `scripts/backfill_nbm.py`.** NBM's TMAX at f024 is `stepRange 12-24, stepType max` = the **init-day afternoon high**, but the backfill labels it `date = init + lead_hour` (next day) → off by ~1 day. Shifting nbm[D] vs actual[D−1] drops MAE 7.72→5.94. Near-zero error at stable stations (KSFO), huge at high-variance ones mid-heat-swing (KLAX +26.7°F, KATL +13.9°F) — explains the inconsistent bias pattern. Residual ~6°F after the shift ⇒ the UTC 12z–00z window may also clip some local peaks; not a clean off-by-one. **Deferred:** a proper fix reworks the fhour→valid-date mapping (+ checks live `_nbm_lead_fhours`) and re-runs the backfill — substantial, and NO verdict impact (`ecmwf_tmax` already carries the model). See [[nbm-grid-lookup-bug]] (memory, now corrected).
+
+### ⚠️ 3. Dead gefs_tmax_mean — re-scoped, deferred (NOT low-effort)
+Confirmed near-dead as a tree feature (importance 0.011, rank 30/46), but it is **load-bearing** elsewhere: the `model_proxy` for residual/bias correction (`processing/bias_correction.py:133`), the value logged as the live forecast (`ensemble_strategy.py:91 record_forecast_tmax`), and the basis for 3 derived deltas incl. `gefs_ecmwf_delta_signed` (model's #6 feature). Per the handoff the *whole* GEFS family is synthetic ERA5, not just the mean. **Repair** needs a real 20-member GEFS ensemble (unavailable). **Drop** needs: remove from `get_feature_columns`, replace its model_proxy + live-logging roles with `ecmwf_tmax`/model μ, handle the 3 derived deltas, and **retrain all 60 production models** — multi-file live-path change for a feature the trees already ignore, with NO verdict impact. Deferred for an explicit decision.
+
+### Net
+One clean correctness fix shipped (#1). #2/#3 are real but heavier than billed, need data-regeneration/retraining, and won't move the no-edge verdict. Recommend deciding whether they're worth the cost vs. the fresher-data direction.
+
+---
+
 ## ⚠️ READ FIRST — Critical correction (2026-06-23)
 
 **Every "real Kalshi price" performance number in the older sections below is FAKE. Do not cite the $95,983 P&L or any real-price Sharpe (3.05 / 4.0 / 5.6 / 41).** They were artifacts of three compounding bugs, found and (mostly) fixed this session:
