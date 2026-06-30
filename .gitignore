@@ -48,3 +48,6 @@ htmlcov/
 # Backtest outputs
 data/backtest_results.csv
 data/backtest_report.html
+
+# Live market-data logger output (grows large; collect locally)
+data/marketdata/

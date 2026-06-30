@@ -39,6 +39,7 @@ bot/
   trading/     kalshi_client (REST, signed), position_tracker
   db/          SQLAlchemy models + session (orders, positions, daily PnL)
   risk/        risk controls (drawdown, exposure, cooldowns, kill switch)
+  marketdata/  live WS order-book + trade depth logger (OrderBook replica)
   research/    market-data + viability research tools (below)
 tests/         test suite
 data/          market data (trades, intraday prices, market snapshots)
@@ -59,14 +60,28 @@ PYTHONPATH=. python -m bot.research.trade_tape_mm --limit 600
 PYTHONPATH=. python -m bot.research.trade_tape_mm --no-fetch   # reuse saved tape
 ```
 
-## Next: the depth logger
+## Depth logger (`bot/marketdata/`)
 
-The trade tape cleared the gating risk; the remaining unknown (capturable spread,
-fill rates, queue dynamics) needs live quote/depth data, which Kalshi only exposes
-live (REST snapshot + `orderbook_delta` websocket). The next build is a
-websocket order-book + trade logger to accumulate that dataset, then a realized-
-spread / fill-rate analysis, then an Avellaneda-Stoikov-style quoting strategy
-paper-traded against the live API.
+The trade tape cleared the gating risk; the remaining unknowns (capturable spread,
+fill rates, queue dynamics) need live quote/depth data, which Kalshi only exposes
+live. The websocket logger connects (RSA-PSS handshake), subscribes to
+`orderbook_delta` + `trade` for all active temperature markets, maintains a local
+`OrderBook` per market, and logs top-of-book changes + trades to parquet shards
+under `data/marketdata/`.
+
+```bash
+PYTHONPATH=. python -m bot.marketdata.depth_logger --smoke      # verify feed/schema
+PYTHONPATH=. python -m bot.marketdata.depth_logger --hours 12   # collect a session
+```
+
+First read (45s, 216 markets): **median quoted spread ≈ 2¢** (many 1¢). Combined
+with the benign markout (+0.07¢) and the ~0.16¢ tail maker fee, the per-round-trip
+economics look plausibly positive — but need a multi-day collection to measure
+real **fill rates** (queue priority on 1–2¢ spreads is the crux).
+
+**Next:** run a multi-day collection, then a realized-spread / fill-rate / markout
+analysis joining `data/marketdata/` book + trades, then an Avellaneda-Stoikov-style
+quoting strategy paper-traded against the live API.
 
 ## Setup
 
