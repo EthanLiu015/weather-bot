@@ -44,18 +44,13 @@ def test_delta_removes_level_when_quantity_hits_zero():
     assert 40 not in ob.yes
 
 
-def test_sequence_gap_marks_book_stale():
+def test_delta_tracks_last_seq():
+    # seq is global-per-channel (gap detection is the logger's job, not the
+    # book's) — the book just records the last seq it applied.
     ob = OrderBook("X")
     ob.apply_snapshot([("0.40", "100")], [("0.55", "20")], seq=5)
-    ob.apply_delta("0.41", "10", "yes", seq=7)  # skipped seq 6
-    assert ob.stale is True
-
-
-def test_contiguous_sequence_stays_fresh():
-    ob = OrderBook("X")
-    ob.apply_snapshot([("0.40", "100")], [("0.55", "20")], seq=5)
-    ob.apply_delta("0.41", "10", "yes", seq=6)
-    assert ob.stale is False
+    ob.apply_delta("0.41", "10", "yes", seq=9)
+    assert ob.seq == 9
 
 
 def test_empty_book_has_no_quotes():
@@ -63,10 +58,8 @@ def test_empty_book_has_no_quotes():
     assert ob.yes_bid is None and ob.yes_ask is None and ob.spread is None
 
 
-def test_resnapshot_clears_stale():
+def test_resnapshot_rebuilds_book():
     ob = OrderBook("X")
     ob.apply_snapshot([("0.40", "100")], [("0.55", "20")], seq=5)
-    ob.apply_delta("0.41", "10", "yes", seq=9)
-    assert ob.stale is True
     ob.apply_snapshot([("0.42", "100")], [("0.55", "20")], seq=20)
-    assert ob.stale is False and ob.yes_bid == 42
+    assert ob.yes_bid == 42 and ob.seq == 20

@@ -8,8 +8,10 @@ Kalshi posts two resting-bid sides for each market: `yes` (bids to BUY yes) and
     best YES ask  = 100 - max(no prices)
 
 The book is seeded by an `orderbook_snapshot` and maintained by incremental
-`orderbook_delta` messages. Each delta carries a monotonically increasing `seq`;
-a gap means we missed a message and the local book is stale until re-snapshotted.
+`orderbook_delta` messages. Each message carries a `seq`, but that counter is
+GLOBAL per channel (it increments across all markets on the connection, not per
+market) — so gap detection lives at the connection level (see depth_logger), not
+here. This class just maintains one market's book.
 
 Prices are tracked in integer cents; quantities in contracts.
 """
@@ -29,7 +31,6 @@ class OrderBook:
         self.yes: dict[int, float] = {}
         self.no: dict[int, float] = {}
         self.seq: Optional[int] = None
-        self.stale: bool = False
 
     def apply_snapshot(
         self, yes_levels: Iterable, no_levels: Iterable, seq: Optional[int] = None
@@ -37,15 +38,10 @@ class OrderBook:
         self.yes = {to_cents(p): float(q) for p, q in yes_levels if float(q) > 0}
         self.no = {to_cents(p): float(q) for p, q in no_levels if float(q) > 0}
         self.seq = seq
-        self.stale = False
 
     def apply_delta(
         self, price, delta, side: str, seq: Optional[int] = None
     ) -> None:
-        if seq is not None and self.seq is not None and seq != self.seq + 1:
-            # Missed a message — the local book can no longer be trusted until a
-            # fresh snapshot is requested.
-            self.stale = True
         book = self.yes if side == "yes" else self.no
         c = to_cents(price)
         new_q = book.get(c, 0.0) + float(delta)
@@ -78,5 +74,4 @@ class OrderBook:
             "yes_bid_sz": self.yes.get(b) if b is not None else None,
             "yes_ask_sz": self.no.get(100 - a) if a is not None else None,
             "spread": (a - b) if (b is not None and a is not None) else None,
-            "stale": self.stale,
         }

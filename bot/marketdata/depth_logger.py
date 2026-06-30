@@ -89,6 +89,27 @@ class _Buffers:
         self.book: list[dict] = []
         self.trades: list[dict] = []
         self.last_top: dict[str, tuple] = {}
+        self.last_seq: Optional[int] = None  # global per-channel sequence
+        self.gaps: int = 0                   # missed-message events
+        self.resync_needed: bool = False
+
+    def reset(self) -> None:
+        """Called on every (re)subscribe — the server restarts seq at 1 and
+        resends snapshots, so drop all local state to rebuild cleanly."""
+        self.last_top.clear()
+        self.last_seq = None
+        self.resync_needed = False
+
+    def note_seq(self, seq: Optional[int]) -> None:
+        """Connection-level gap detection. Kalshi's orderbook seq is GLOBAL across
+        markets on the channel, so a break in the single sequence means we missed
+        a message and the local books may be wrong -> trigger a full resync."""
+        if seq is None:
+            return
+        if self.last_seq is not None and seq != self.last_seq + 1:
+            self.gaps += 1
+            self.resync_needed = True
+        self.last_seq = seq
 
     def record_top(self, ticker: str, ob: OrderBook, ts: float) -> None:
         top = ob.top()
@@ -120,12 +141,14 @@ def _dispatch(raw: str, books: dict[str, OrderBook], buf: _Buffers) -> None:
     d = m.get("msg", {})
     seq = m.get("seq", d.get("seq"))
     if typ == "orderbook_snapshot":
+        buf.note_seq(seq)
         tk = d["market_ticker"]
         ob = books.setdefault(tk, OrderBook(tk))
         ob.apply_snapshot(d.get("yes_dollars_fp") or d.get("yes") or [],
                           d.get("no_dollars_fp") or d.get("no") or [], seq=seq)
         buf.record_top(tk, ob, _event_ts(d))
     elif typ == "orderbook_delta":
+        buf.note_seq(seq)
         tk = d["market_ticker"]
         ob = books.get(tk)
         if ob is None:
@@ -187,6 +210,8 @@ async def run(hours: float, smoke: bool = False) -> None:
         try:
             async with websockets.connect(WS_URL, additional_headers=headers, max_size=2**22) as ws:
                 await _subscribe(ws, tickers)
+                books.clear()
+                buf.reset()  # fresh snapshots + seq restart at 1 on (re)subscribe
                 printed = 0
                 while time.time() < end_time:
                     raw = await asyncio.wait_for(ws.recv(), timeout=60.0)
@@ -197,7 +222,13 @@ async def run(hours: float, smoke: bool = False) -> None:
                             return
                         continue
                     _dispatch(raw, books, buf)
+                    if buf.resync_needed:
+                        # A global seq gap means a message was dropped; reconnect to
+                        # get fresh snapshots rather than log a possibly-wrong book.
+                        logger.warning("seq gap (#%d) — reconnecting to resync", buf.gaps)
+                        break
                     if time.time() - last_flush >= FLUSH_SECONDS:
+                        logger.info("flush; cumulative seq-gaps=%d", buf.gaps)
                         _flush(buf)
                         last_flush = time.time()
         except asyncio.TimeoutError:
@@ -213,13 +244,117 @@ async def run(hours: float, smoke: bool = False) -> None:
         tickers = await fetch_open_temp_tickers(client) or tickers
 
 
+def _book_crossed(ob: OrderBook) -> bool:
+    b, a = ob.yes_bid, ob.yes_ask
+    return b is not None and a is not None and a < b
+
+
+def _book_out_of_range(ob: OrderBook) -> bool:
+    return any(not (1 <= c <= 99) for c in list(ob.yes) + list(ob.no))
+
+
+async def validate(warmup_secs: int = 12, compare_n: int = 60) -> None:
+    """Correctness gate before any long collection. Keeps the WS feed LIVE while
+    cross-checking, so the comparison is near-simultaneous (no time-skew artifact).
+
+    Checks: (1) book invariants — no crossed books (ask<bid impossible), prices in
+    [1,99]; (2) each WS-maintained book's best bid/ask vs an INDEPENDENT REST
+    orderbook fetch at the same instant. A small fraction may differ by 1c on
+    fast-moving markets (genuine sub-second moves); crossed books or large
+    mismatches would indicate a real ingestion bug."""
+    settings = get_settings()
+    client = ReadOnlyKalshiClient(
+        api_key=LIVE_API_KEY, private_key_path=settings.KALSHI_PRIVATE_KEY_PATH, base_url=LIVE_BASE_URL,
+    )
+    tickers = await fetch_open_temp_tickers(client)
+    headers = _ws_auth_headers(client._private_key, LIVE_API_KEY, WS_SIGN_PATH)
+    books: dict[str, OrderBook] = {}
+    buf = _Buffers()
+    stop = asyncio.Event()
+
+    async def ws_task() -> None:
+        async with websockets.connect(WS_URL, additional_headers=headers, max_size=2**22) as ws:
+            await _subscribe(ws, tickers)
+            buf.reset()
+            while not stop.is_set():
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    continue
+                _dispatch(raw, books, buf)
+
+    logger.info("Validating ingest: live books from %d markets...", len(tickers))
+    task = asyncio.create_task(ws_task())
+    await asyncio.sleep(warmup_secs)
+
+    crossed = sum(_book_crossed(ob) for ob in books.values())
+    oor = sum(_book_out_of_range(ob) for ob in books.values())
+
+    sample = [tk for tk, ob in books.items()
+              if ob.yes_bid is not None and ob.yes_ask is not None][:compare_n]
+    exact = within1 = mismatch = rest_err = 0
+    examples = []
+    for tk in sample:
+        try:
+            r = await client._get(f"/markets/{tk}/orderbook")  # independent source, NOW
+            fp = r.get("orderbook_fp", {})
+            rest = OrderBook(tk)
+            rest.apply_snapshot(fp.get("yes_dollars") or [], fp.get("no_dollars") or [])
+        except Exception:
+            rest_err += 1
+            continue
+        ws_q = (books[tk].yes_bid, books[tk].yes_ask)  # live WS book, read instantly
+        rest_q = (rest.yes_bid, rest.yes_ask)
+        if ws_q == rest_q:
+            exact += 1
+        elif rest.yes_bid is not None and rest.yes_ask is not None and \
+                abs(ws_q[0] - rest_q[0]) <= 1 and abs(ws_q[1] - rest_q[1]) <= 1:
+            within1 += 1
+        else:
+            mismatch += 1
+            if len(examples) < 5:
+                examples.append((tk, ws_q, rest_q))
+
+    stop.set()
+    try:
+        await asyncio.wait_for(task, timeout=5)
+    except Exception:
+        pass
+
+    compared = exact + within1 + mismatch
+    mismatch_rate = mismatch / compared if compared else 1.0
+    print("\n" + "=" * 64)
+    print("INGEST VALIDATION  (WS book vs independent REST, near-simultaneous)")
+    print("=" * 64)
+    print(f"  books built:        {len(books)} / {len(tickers)} markets")
+    print(f"  seq-gaps (global):  {buf.gaps}   (each triggers a reconnect+resync)")
+    print(f"  CROSSED books:      {crossed}   (must be 0 — ask < bid is impossible)")
+    print(f"  out-of-range price: {oor}   (must be 0 — prices must be 1..99c)")
+    print("-" * 64)
+    print(f"  best bid/ask cross-check on {compared} markets:")
+    print(f"    exact match:      {exact}")
+    print(f"    within 1c:        {within1}   (genuine sub-second moves)")
+    print(f"    mismatch (>1c):   {mismatch}   ({mismatch_rate:.0%})")
+    print(f"    REST errors:      {rest_err}")
+    for tk, w, r in examples:
+        print(f"      mismatch {tk}: ws={w} rest={r}")
+    ok = crossed == 0 and oor == 0 and mismatch_rate <= 0.05
+    print("-" * 64)
+    print(f"  VERDICT: {'PASS — ingest is correct, safe to collect' if ok else 'INVESTIGATE before collecting'}")
+    print("=" * 64)
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--hours", type=float, default=12.0)
     ap.add_argument("--smoke", action="store_true", help="print raw frames and exit")
+    ap.add_argument("--validate", action="store_true", help="cross-check ingest vs REST, then exit")
     args = ap.parse_args()
-    asyncio.run(run(args.hours, smoke=args.smoke))
+    if args.validate:
+        asyncio.run(validate())
+    else:
+        asyncio.run(run(args.hours, smoke=args.smoke))
 
 
 if __name__ == "__main__":
