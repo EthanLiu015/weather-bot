@@ -44,6 +44,17 @@ def test_delta_removes_level_when_quantity_hits_zero():
     assert 40 not in ob.yes
 
 
+def test_floating_point_dust_quantity_removes_level_not_phantom():
+    # Real-world bug: summing deltas lands on ~1e-17 instead of 0, leaving a
+    # phantom best level that crosses the book. The dusted level must be removed.
+    ob = OrderBook("X")
+    ob.apply_snapshot([("0.40", "0.1")], [("0.55", "20")], seq=1)
+    ob.apply_delta("0.40", "0.2", "yes", seq=2)   # 0.1 + 0.2 = 0.30000000000000004
+    ob.apply_delta("0.40", "-0.3", "yes", seq=3)  # -> 5.55e-17 dust, not exactly 0
+    assert 40 not in ob.yes          # dust removed
+    assert ob.yes_bid is None        # not a phantom best bid
+
+
 def test_delta_tracks_last_seq():
     # seq is global-per-channel (gap detection is the logger's job, not the
     # book's) — the book just records the last seq it applied.

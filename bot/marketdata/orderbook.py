@@ -19,6 +19,12 @@ from __future__ import annotations
 
 from typing import Iterable, Optional
 
+# Quantities below this are floating-point dust, not real resting size. Summing
+# deltas (e.g. 25.0 - 25.0) can land on ~1e-15 instead of exactly 0; without this
+# the "emptied" level survives as a phantom that corrupts the best bid/ask (and
+# can cross the book). Real Kalshi sizes are >= ~0.01 contracts, far above this.
+_QTY_EPS = 1e-6
+
 
 def to_cents(price) -> int:
     """Kalshi sends dollar strings ("0.0800"); normalise to integer cents."""
@@ -35,8 +41,8 @@ class OrderBook:
     def apply_snapshot(
         self, yes_levels: Iterable, no_levels: Iterable, seq: Optional[int] = None
     ) -> None:
-        self.yes = {to_cents(p): float(q) for p, q in yes_levels if float(q) > 0}
-        self.no = {to_cents(p): float(q) for p, q in no_levels if float(q) > 0}
+        self.yes = {to_cents(p): float(q) for p, q in yes_levels if float(q) > _QTY_EPS}
+        self.no = {to_cents(p): float(q) for p, q in no_levels if float(q) > _QTY_EPS}
         self.seq = seq
 
     def apply_delta(
@@ -45,8 +51,8 @@ class OrderBook:
         book = self.yes if side == "yes" else self.no
         c = to_cents(price)
         new_q = book.get(c, 0.0) + float(delta)
-        if new_q <= 0:
-            book.pop(c, None)
+        if new_q <= _QTY_EPS:
+            book.pop(c, None)  # treat dust as empty so it can't become a phantom level
         else:
             book[c] = new_q
         if seq is not None:
