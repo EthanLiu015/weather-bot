@@ -208,7 +208,7 @@ async def run(hours: float, smoke: bool = False) -> None:
 
     while time.time() < end_time:
         try:
-            async with websockets.connect(WS_URL, additional_headers=headers, max_size=2**22) as ws:
+            async with websockets.connect(WS_URL, additional_headers=headers, max_size=2**22, ping_interval=20, ping_timeout=60, close_timeout=5) as ws:
                 await _subscribe(ws, tickers)
                 books.clear()
                 buf.reset()  # fresh snapshots + seq restart at 1 on (re)subscribe
@@ -273,7 +273,7 @@ async def validate(warmup_secs: int = 12, compare_n: int = 60) -> None:
     stop = asyncio.Event()
 
     async def ws_task() -> None:
-        async with websockets.connect(WS_URL, additional_headers=headers, max_size=2**22) as ws:
+        async with websockets.connect(WS_URL, additional_headers=headers, max_size=2**22, ping_interval=20, ping_timeout=60, close_timeout=5) as ws:
             await _subscribe(ws, tickers)
             buf.reset()
             while not stop.is_set():
