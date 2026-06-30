@@ -18,6 +18,8 @@ decremented by trades; other makers' cancels ignored = conservative). First-orde
 """
 from __future__ import annotations
 
+import random
+
 import numpy as np
 import pandas as pd
 
@@ -25,13 +27,23 @@ from bot.research.mm_edge import BOOK_DIR, TRADE_DIR, _load, enrich
 
 HORIZONS = [0, 1, 5]
 MAKER_SIZES = [1, 10, 50]
+PHIS = [0.0, 0.25, 0.5, 0.75, 0.9, 1.0]  # front-of-queue (win-the-race) probabilities
 
 
-def simulate_side(events, q: float, horizons=HORIZONS):
+def simulate_side(events, q: float, horizons=HORIZONS, phi: float = 0.0, rng=None):
     """FIFO queue sim for one side. `events` is time-ordered:
       ('q', price, depth)            best price on this side is `price`, size `depth`
       ('x', price, size, net_dict)   a trade of `size` hit this side at `price`
+
+    `phi` is the probability that on (re)joining a level we win the race to the
+    FRONT (no queue ahead); otherwise we join the back (behind `depth`). phi=0 is
+    a pure passive maker; phi=1 captures everything (the optimistic bound).
     Returns (filled_contracts, {h: net_credited}, total_touch_volume)."""
+    rng = rng or random.Random(0)
+
+    def join_qa(depth):
+        return 0.0 if (phi > 0 and rng.random() < phi) else depth
+
     filled = 0.0
     net = {h: 0.0 for h in horizons}
     touch = 0.0
@@ -45,8 +57,8 @@ def simulate_side(events, q: float, horizons=HORIZONS):
             _, price, depth = ev
             seen = True
             last_depth = depth
-            if price != level:           # price moved -> re-join back of new queue
-                level, qa, rem = price, depth, q
+            if price != level:           # price moved -> join the new level
+                level, qa, rem = price, join_qa(depth), q
         else:
             if not seen:
                 continue
@@ -62,11 +74,31 @@ def simulate_side(events, q: float, horizons=HORIZONS):
                     f = min(rem, s); rem -= f; s -= f; filled += f
                     for h in horizons:
                         net[h] += f * net_d[h]
-                    if rem <= 0:         # filled -> re-join behind the current queue
-                        rem, qa = q, last_depth
+                    if rem <= 0:         # filled -> re-join
+                        rem, qa = q, join_qa(last_depth)
                 else:
                     break
     return filled, net, touch
+
+
+def _simulate_all(book_by, yes_by, no_by, q, phi):
+    filled = touch = 0.0
+    net = {h: 0.0 for h in HORIZONS}
+    rng = random.Random(0)
+    for tk, b in book_by.items():
+        for side_trades, pcol, scol in ((yes_by.get(tk), "yes_ask", "yes_ask_sz"),
+                                        (no_by.get(tk), "yes_bid", "yes_bid_sz")):
+            if side_trades is None or side_trades.empty:
+                continue
+            evs = _side_events(b, side_trades, pcol, scol)
+            f, n, tch = simulate_side(evs, q, phi=phi, rng=rng)
+            filled += f
+            touch += tch
+            for h in HORIZONS:
+                net[h] += n[h]
+    cap = filled / touch if touch else 0.0
+    realized = {h: (net[h] / filled if filled else float("nan")) for h in HORIZONS}
+    return cap, realized
 
 
 def _side_events(book_t: pd.DataFrame, trades_t: pd.DataFrame, price_col, size_col):
@@ -102,36 +134,42 @@ def run() -> None:
           "  ".join(f"{h}s {opt[h]:+.2f}" for h in HORIZONS))
     print("-" * 70)
 
-    book_by = {tk: g for tk, g in book.groupby("ticker")}
-    yes = t[t["taker_side"] == "yes"]
-    no = t[t["taker_side"] == "no"]
-    yes_by = {tk: g for tk, g in yes.groupby("ticker")}
-    no_by = {tk: g for tk, g in no.groupby("ticker")}
+    book_by = {tk: g.sort_values("ts") for tk, g in book.groupby("ticker")}
+    yes_by = {tk: g for tk, g in t[t["taker_side"] == "yes"].groupby("ticker")}
+    no_by = {tk: g for tk, g in t[t["taker_side"] == "no"].groupby("ticker")}
 
-    print("  size  capture%   realized net/contract (filled only)   vs optimistic")
+    print("  PASSIVE (back-of-queue, phi=0): capacity + fill selection")
+    print("  size  capture%   realized net/contract (filled only)")
     for q in MAKER_SIZES:
-        filled = touch = 0.0
-        net = {h: 0.0 for h in HORIZONS}
-        for tk, b in book_by.items():
-            b = b.sort_values("ts")
-            for side_trades, pcol, scol in ((yes_by.get(tk), "yes_ask", "yes_ask_sz"),
-                                            (no_by.get(tk), "yes_bid", "yes_bid_sz")):
-                if side_trades is None or side_trades.empty:
-                    continue
-                evs = _side_events(b, side_trades, pcol, scol)
-                f, n, tch = simulate_side(evs, q)
-                filled += f
-                touch += tch
-                for h in HORIZONS:
-                    net[h] += n[h]
-        cap = filled / touch if touch else 0.0
-        realized = {h: (net[h] / filled if filled else float("nan")) for h in HORIZONS}
+        cap, realized = _simulate_all(book_by, yes_by, no_by, q, phi=0.0)
         rstr = "  ".join(f"{h}s {realized[h]:+.2f}" for h in HORIZONS)
         print(f"  {q:>4}  {cap:>6.1%}   {rstr}")
     print("-" * 70)
-    print("  capture% = share of touch volume filled (capacity).")
-    print("  realized net < optimistic => back-of-queue fills are more toxic (selection).")
-    print("  Realistic P&L ~ capture% * volume * realized-net-per-contract.")
+
+    # Break-even: how much queue priority (front-of-queue fraction phi) is needed?
+    q = 10
+    print(f"  QUEUE-PRIORITY SWEEP (size {q}): realized net vs front-of-queue prob phi")
+    print("   phi    capture%   net@1s   net@5s")
+    curve = []
+    for phi in PHIS:
+        cap, realized = _simulate_all(book_by, yes_by, no_by, q, phi=phi)
+        curve.append((phi, realized[5]))
+        print(f"   {phi:>4.0%}   {cap:>6.1%}   {realized[1]:>+6.2f}   {realized[5]:>+6.2f}")
+    # interpolate the phi where net@5s crosses 0
+    be = None
+    for (p0, n0), (p1, n1) in zip(curve, curve[1:]):
+        if (n0 < 0) != (n1 < 0) and n1 != n0:
+            be = p0 + (0 - n0) * (p1 - p0) / (n1 - n0)
+            break
+    print("-" * 70)
+    if be is None:
+        sign = "always positive" if curve[0][1] >= 0 else "never positive"
+        print(f"  break-even front-of-queue phi: {sign} across the sweep")
+    else:
+        print(f"  break-even front-of-queue phi (net@5s = 0):  ~{be:.0%}")
+        print(f"  => you must win the race to the front ~{be:.0%} of the time just to break even.")
+    print("  phi achievable WITHOUT speed only where the queue is thin / uncontested")
+    print("  (quiet markets/hours) — otherwise it is a latency race.")
     print("=" * 70)
 
 
