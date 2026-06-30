@@ -1,146 +1,78 @@
-# Kalshi Temperature Trading Bot
+# Kalshi Market Maker
 
-Algorithmic trading bot for Kalshi daily temperature markets. Runs two parallel strategies:
+A market-making bot and research toolkit for Kalshi temperature markets.
 
-- **Strategy A (Ensemble)**: ECMWF + GEFS ensemble → NGBoost + QRF → calibrated probability → limit orders
-- **Strategy B (D-0)**: Intraday ASOS/METAR polling → conditional probability as uncertainty collapses
+## Why market-making
 
-Targets: **ORD** (Chicago O'Hare), **JFK** (New York), **LAX** (Los Angeles)
+This project began as a forecasting bot (ensemble weather models → calibrated
+probabilities → directional bets). Extensive evaluation showed **no trustworthy
+edge**: the model's Brier (~0.14) was worse than the Kalshi market's (~0.10) in
+*every* segment — station, volume decile, month, strike type — and at every point
+in the trading window. The market aggregates excellent NWS/NBM guidance and is a
+better forecaster than the model, end to end. Beating it on forecast skill is not
+viable here.
 
----
+So the project pivoted to **market-making**, which doesn't require out-forecasting
+the market: quote a spread around the market's own mid, earn the spread from
+flow, and manage inventory. The forecasting pipeline was removed (recoverable in
+git history) and the repo slimmed to the execution + research core below.
 
-## Architecture
+## What we know so far (research findings)
+
+| factor | finding | source |
+|---|---|---|
+| Maker fees | 25% of taker: ~0.16¢/contract in the tails, ~0.44¢ at mid | Kalshi fee schedule |
+| Flow | median 8,534 contracts/market; 90% ≥ 2,000 | `kalshi_prices.parquet` |
+| Adverse selection | **maker markout ≈ +0.07¢ at 1–5min** (benign, not toxic) | `trade_tape_mm.py` |
+| Structural premium | ~4% overround, concentrated in longshot brackets | bracket-sum analysis |
+
+The gating risk — toxic/informed flow that runs makers over — is **not present**
+(markout is benign to slightly favorable at MM horizons). What's still unknown is
+how much *spread* we can actually capture, which requires live order-book/depth
+data (the next step).
+
+## Structure
 
 ```
-ingestion/ → processing/ → models/ → strategies/ → trading/ → risk/
-                                          ↓
-                                    scheduler/
-                                          ↓
-                                      api/ + frontend/
+bot/
+  config/      settings, station + series registries
+  trading/     kalshi_client (REST, signed), position_tracker
+  db/          SQLAlchemy models + session (orders, positions, daily PnL)
+  risk/        risk controls (drawdown, exposure, cooldowns, kill switch)
+  research/    market-data + viability research tools (below)
+tests/         test suite
+data/          market data (trades, intraday prices, market snapshots)
+keys/          Kalshi RSA private key (gitignored)
 ```
 
-**Data flow:**
-1. GEFS (31 members) + ECMWF → QC → downscale/bias-correct → features (~40)
-2. NGBoost (Normal distribution) + QRF (quantile grid) → weighted blend → isotonic calibration
-3. Strategy A: slow path on each new model run (~4×/day)
-4. Strategy B: fast path every 20 min on resolution day (METAR-driven conditional prob)
-5. Kelly sizing → limit orders → risk gating → Kalshi REST API
-6. FastAPI + WebSocket → React dashboard
+## Research tools (`bot/research/`)
 
----
+```bash
+# Pull historical market data (settled markets + candlestick decision prices)
+PYTHONPATH=. python -m bot.research.fetch_kalshi_history
+
+# Market efficiency vs time-to-resolution (intraday)
+PYTHONPATH=. python -m bot.research.intraday_efficiency --limit 2500
+
+# Trades-only market-making viability probe (markout / adverse selection)
+PYTHONPATH=. python -m bot.research.trade_tape_mm --limit 600
+PYTHONPATH=. python -m bot.research.trade_tape_mm --no-fetch   # reuse saved tape
+```
+
+## Next: the depth logger
+
+The trade tape cleared the gating risk; the remaining unknown (capturable spread,
+fill rates, queue dynamics) needs live quote/depth data, which Kalshi only exposes
+live (REST snapshot + `orderbook_delta` websocket). The next build is a
+websocket order-book + trade logger to accumulate that dataset, then a realized-
+spread / fill-rate analysis, then an Avellaneda-Stoikov-style quoting strategy
+paper-traded against the live API.
 
 ## Setup
 
-### 1. Install dependencies
-
 ```bash
 pip install -e ".[dev]"
+cp .env.example .env          # set KALSHI_API_KEY, KALSHI_PRIVATE_KEY_PATH
+mkdir -p keys                 # place RSA private key at ./keys/kalshi_private.pem
+PYTHONPATH=. pytest tests/ -q
 ```
-
-### 2. Configure environment
-
-```bash
-cp .env.example .env
-# Fill in:
-# KALSHI_API_KEY, KALSHI_PRIVATE_KEY_PATH, ECMWF_API_KEY, NOAA_CDO_TOKEN
-mkdir -p keys
-# Place your RSA private key at ./keys/kalshi_private.pem
-```
-
-### 3. Bootstrap historical data (~2 hours first run)
-
-```bash
-export NOAA_CDO_TOKEN=your_token_here
-python scripts/bootstrap_history.py
-```
-
-This downloads 5 years of hourly ASOS observations for KORD/KJFK/KLAX, builds diurnal climatology per station×month, and generates 12-cluster synoptic regime labels.
-
-### 4. Train initial models
-
-```bash
-python scripts/initial_train.py
-```
-
-Runs walk-forward backtesting, then trains final NGBoost + QRF + residual LightGBM + isotonic calibrators on all available data.
-
-### 5. Backtest (optional, standalone)
-
-```bash
-python scripts/run_backtest.py --start 2022-01-01 --end 2024-12-31
-# Output: data/backtest_results.csv, data/backtest_report.html
-```
-
-### 6. Run the bot
-
-```bash
-uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
-```
-
-### 7. Run the dashboard
-
-```bash
-cd frontend
-npm install
-npm run dev
-# Open http://localhost:5173
-```
-
----
-
-## Kill Switch
-
-Three ways to halt all trading and cancel resting orders:
-
-1. **Dashboard**: Click the red "KILL SWITCH" button, type `KILL` to confirm
-2. **API**: `curl -X POST http://localhost:8000/api/controls/kill`
-3. **env**: Set `BOT_ACTIVE=false` in `.env` and restart
-
-To resume: `curl -X POST http://localhost:8000/api/controls/resume` or Dashboard button.
-
----
-
-## Risk Controls
-
-| Parameter | Default | Description |
-|---|---|---|
-| `MAX_DAILY_LOSS_USD` | $500 | Halt trading if daily realized PnL drops below |
-| `MAX_EXPOSURE_PER_TICKER_USD` | $200 | Max dollar exposure per single ticker |
-| `KELLY_FRACTION` | 0.25 | Fractional Kelly multiplier |
-| `MIN_EDGE_CENTS` | 4¢ | Minimum model-vs-market edge to trade |
-| `MAX_CI_WIDTH` | 0.12 | Skip trade if calibration CI too wide |
-
----
-
-## API Reference
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/markets` | GET | All active markets with fair values |
-| `/api/markets/{ticker}` | GET | Single market detail + price history |
-| `/api/positions` | GET | Open positions |
-| `/api/positions/pnl` | GET | Cumulative PnL series |
-| `/api/model/fairvalues` | GET | Current fair values per ticker |
-| `/api/model/status` | GET | Model status, calibration health |
-| `/api/controls/kill` | POST | Trigger kill switch |
-| `/api/controls/resume` | POST | Resume trading |
-| `/api/controls/retrain` | POST | Trigger manual model retrain |
-| `/ws/live` | WebSocket | Live state push every 10s |
-
----
-
-## Running Tests
-
-```bash
-pytest tests/ -v
-```
-
-Key test coverage:
-- `test_ingestion.py` — METAR parsing, QC validation
-- `test_features.py` — feature matrix shape, cyclical encodings in [-1,1]
-- `test_models.py` — NGBoost sigma > 0, calibration CI covers true rate
-- `test_kelly.py` — zero size when no edge, max exposure cap, lock halving
-- `test_risk_controls.py` — kill switch, daily loss limit
-- `test_order_manager.py` — maker-only enforcement, stale cancel logic
-- `test_d0_strategy.py` — near-certain probabilities at extremes
-- `test_strategies.py` — shared state thread safety, blending, locking

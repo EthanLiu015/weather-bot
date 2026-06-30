@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, patch
-from risk.risk_controls import RiskControls
+from bot.risk.risk_controls import RiskControls
 
 
 def _make_settings(active: bool = True, max_loss: float = 500.0, max_exposure: float = 200.0):

@@ -8,7 +8,7 @@ import math
 
 import pytest
 
-from scripts.fetch_kalshi_history import (
+from bot.research.fetch_kalshi_history import (
     _compute_d1_mid,
     _decision_price_from_candles,
     _strike_fields,
