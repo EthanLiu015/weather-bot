@@ -49,6 +49,10 @@ WS_SIGN_PATH = "/trade-api/ws/v2"
 CHANNELS = ["orderbook_delta", "trade"]
 OUT_DIR = Path("data/marketdata")
 FLUSH_SECONDS = 30
+# Re-fetch the open-market universe and resubscribe this often, so a multi-day run
+# picks up each new day's markets (and drops settled ones) without relying on a
+# disconnect to refresh the ticker list.
+REFRESH_SECONDS = 1800
 
 
 def _ws_auth_headers(private_key, api_key: str, sign_path: str) -> dict[str, str]:
@@ -92,6 +96,7 @@ class _Buffers:
         self.last_seq: Optional[int] = None  # global per-channel sequence
         self.gaps: int = 0                   # missed-message events
         self.resync_needed: bool = False
+        self.flush_n: int = 0                # monotonic flush counter (unique filenames)
 
     def reset(self) -> None:
         """Called on every (re)subscribe — the server restarts seq at 1 and
@@ -120,11 +125,13 @@ class _Buffers:
         self.book.append({"ts": ts, "ticker": ticker, **top})
 
     def record_trade(self, d: dict, ts: float) -> None:
+        price = d.get("yes_price_dollars") or d.get("yes_price")
+        count = d.get("count_fp") or d.get("count")
         self.trades.append({
             "ts": ts,
             "ticker": d.get("market_ticker"),
-            "yes_price": d.get("yes_price_dollars") or d.get("yes_price"),
-            "count": d.get("count_fp") or d.get("count"),
+            "yes_price": float(price) if price is not None else float("nan"),
+            "count": float(count) if count is not None else 0.0,
             "taker_side": d.get("taker_side"),
         })
 
@@ -165,7 +172,11 @@ def _dispatch(raw: str, books: dict[str, OrderBook], buf: _Buffers) -> None:
 
 
 def _flush(buf: _Buffers) -> None:
-    stamp = time.strftime("%Y%m%d_%H%M%S")
+    buf.flush_n += 1
+    # Second-resolution timestamps can collide (a reconnect's finally-flush in the
+    # same second as a periodic flush) and overwrite a shard — include a monotonic
+    # counter so every shard filename is unique.
+    stamp = f"{time.strftime('%Y%m%d_%H%M%S')}_{buf.flush_n:06d}"
     for name, rows in (("book", buf.book), ("trades", buf.trades)):
         if not rows:
             continue
@@ -212,6 +223,7 @@ async def run(hours: float, smoke: bool = False) -> None:
                 await _subscribe(ws, tickers)
                 books.clear()
                 buf.reset()  # fresh snapshots + seq restart at 1 on (re)subscribe
+                last_refresh = time.time()
                 printed = 0
                 while time.time() < end_time:
                     raw = await asyncio.wait_for(ws.recv(), timeout=60.0)
@@ -221,12 +233,19 @@ async def run(hours: float, smoke: bool = False) -> None:
                         if printed >= 20:
                             return
                         continue
-                    _dispatch(raw, books, buf)
+                    try:
+                        _dispatch(raw, books, buf)
+                    except Exception as exc:  # one malformed frame shouldn't drop the feed
+                        logger.debug("skipping unparseable message: %s", exc)
+                        continue
                     if buf.resync_needed:
                         # A global seq gap means a message was dropped; reconnect to
                         # get fresh snapshots rather than log a possibly-wrong book.
                         logger.warning("seq gap (#%d) — reconnecting to resync", buf.gaps)
                         break
+                    if time.time() - last_refresh >= REFRESH_SECONDS:
+                        logger.info("refreshing market universe (resubscribe)")
+                        break  # reconnect path re-fetches the open-market list
                     if time.time() - last_flush >= FLUSH_SECONDS:
                         logger.info("flush; cumulative seq-gaps=%d", buf.gaps)
                         _flush(buf)
