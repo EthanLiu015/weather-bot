@@ -59,7 +59,9 @@ def enrich(book: pd.DataFrame, trades: pd.DataFrame, horizons=HORIZONS_S) -> pd.
     b = book.dropna(subset=["yes_bid", "yes_ask"]).copy()
     b["mid"] = (b["yes_bid"] + b["yes_ask"]) / 2.0
     b["spr"] = b["yes_ask"] - b["yes_bid"]
-    b = b[["ts", "ticker", "mid", "spr"]].sort_values("ts")
+    b["bid"] = b["yes_bid"]
+    b["ask"] = b["yes_ask"]
+    b = b[["ts", "ticker", "mid", "spr", "bid", "ask"]].sort_values("ts")
 
     t = trades.dropna(subset=["yes_price", "count", "taker_side"]).copy()
     t = t[t["count"] > 0].copy()
@@ -79,11 +81,12 @@ def enrich(book: pd.DataFrame, trades: pd.DataFrame, horizons=HORIZONS_S) -> pd.
         look = t[["tid", "ticker", "ts", "price_c", "sign", "fee_c"]].copy()
         look["look"] = look["ts"] + h
         look = look.sort_values("look")
-        m = pd.merge_asof(look, b.rename(columns={"ts": "bts"})[["bts", "ticker", "mid"]],
+        m = pd.merge_asof(look, b.rename(columns={"ts": "bts"})[["bts", "ticker", "mid", "bid", "ask"]],
                           left_on="look", right_on="bts", by="ticker", direction="backward")
         m[f"net_{h}"] = net_maker_cents(m["price_c"].to_numpy(), m["sign"].to_numpy(),
                                         m["mid"].to_numpy(), m["fee_c"].to_numpy())
-        t = t.merge(m[["tid", f"net_{h}"]], on="tid", how="left")
+        cols = {"mid": f"mid_{h}", "bid": f"bid_{h}", "ask": f"ask_{h}"}
+        t = t.merge(m[["tid", f"net_{h}"] + list(cols)].rename(columns=cols), on="tid", how="left")
 
     t["market"] = t["ticker"].str.split("-").str[0]
     t["hour_utc"] = pd.to_datetime(t["ts"], unit="s").dt.hour
