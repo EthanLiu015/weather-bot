@@ -114,13 +114,12 @@ def test_zero_contracts_on_adverse_edge():
 # ── Fee-adjusted Kelly ────────────────────────────────────────────────────────
 
 def test_kelly_size_is_smaller_with_fee_than_without():
-    """Kalshi 5% fee reduces net payoff; Kelly formula must account for it,
-    so the sized position should be strictly smaller than the no-fee case."""
-    from backtest.track_b import FEE_RATE
-
-    size_no_fee_approx = compute_size(
-        fair_value=0.65,
-        market_price=0.50,
+    """The Kalshi fee reduces net win payoff, so the fee-adjusted Kelly size must
+    be strictly smaller than the naive no-fee Kelly size for the same edge."""
+    p, price = 0.65, 0.50
+    fee_adjusted = compute_size(
+        fair_value=p,
+        market_price=price,
         ci_width=0.0,
         horizon_days=1,
         kelly_fraction=1.0,
@@ -128,10 +127,13 @@ def test_kelly_size_is_smaller_with_fee_than_without():
         horizon_multipliers={1: 1.0},
         strategy_lock=False,
     )
-    # The fee-adjusted size must be <= the naive (no-fee) size.
-    # After adding fee to kelly.py this test verifies the fee shrinks sizing.
-    assert FEE_RATE > 0, "FEE_RATE must be positive for this test to be meaningful"
-    assert size_no_fee_approx > 0, "Should have positive contracts before fee check"
+    # Naive no-fee Kelly contracts for the same inputs: b = (1-price)/price.
+    b = (1.0 - price) / price
+    kelly_pct = (b * p - (1.0 - p)) / b
+    no_fee = int((kelly_pct * 200.0) / price)
+
+    assert fee_adjusted > 0
+    assert fee_adjusted < no_fee
 
 
 # ── Kelly-sized simulate_pnl ──────────────────────────────────────────────────
@@ -191,11 +193,11 @@ def test_simulate_pnl_unit_contract_sizes_matches_default():
 
 
 def test_kelly_returns_zero_when_fee_makes_bet_unprofitable():
-    """At market_price=0.95, the fee (5% of notional) wipes out all profit for any fair value.
-    Fee-adjusted b becomes negative → compute_size must return 0."""
+    """A thin edge (fair 0.905 vs price 0.90) is smaller than the Kalshi fee eats,
+    so fee-adjusted Kelly is non-positive → compute_size must return 0."""
     contracts = compute_size(
-        fair_value=0.99,
-        market_price=0.95,
+        fair_value=0.905,
+        market_price=0.90,
         ci_width=0.0,
         horizon_days=1,
         kelly_fraction=1.0,
@@ -204,5 +206,5 @@ def test_kelly_returns_zero_when_fee_makes_bet_unprofitable():
         strategy_lock=False,
     )
     assert contracts == 0, (
-        "At market_price=0.95, Kalshi 5% fee eliminates profit margin — expect 0 contracts"
+        "A sub-fee edge should net zero contracts after the fee-adjusted Kelly"
     )

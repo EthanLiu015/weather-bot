@@ -26,7 +26,7 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 
-from backtest.track_b import FEE_RATE
+from backtest.track_b import kalshi_fee, TAKER_FEE_COEF, MAKER_FEE_COEF
 from strategies.bracket_pricing import bracket_yes_prob
 
 logger = logging.getLogger(__name__)
@@ -56,14 +56,19 @@ def per_trade_pnl(
     min_edge: float = 0.04,
     contract_usd: float = 1.0,
     contract_sizes: Optional[np.ndarray] = None,
+    fee_coef: float = TAKER_FEE_COEF,
+    min_price: float = 0.0,
 ):
     """Per-market P&L, mirroring backtest.track_b.simulate_pnl row-by-row.
 
     Returns (pnl, traded): pnl[i] is the dollar P&L for market i (0 when the edge
-    is below min_edge and no trade is taken); traded[i] flags whether a trade was
-    taken. Summing pnl over traded rows reproduces simulate_pnl's aggregate — a
-    parity test pins this. Exposed separately so daily P&L (hence Sharpe) can be
-    grouped by resolution date.
+    is below min_edge, or the entry price is below min_price, and no trade is
+    taken); traded[i] flags whether a trade was taken. Summing pnl over traded
+    rows reproduces simulate_pnl's aggregate — a parity test pins this. Exposed
+    separately so daily P&L (hence Sharpe) can be grouped by resolution date.
+
+    `fee_coef` (taker/maker) and `min_price` (entry-price floor) mirror
+    simulate_pnl so both apply the corrected Kalshi fee model.
     """
     probs = np.asarray(model_probs, dtype=float)
     mids = np.asarray(market_mids, dtype=float)
@@ -76,13 +81,16 @@ def per_trade_pnl(
         prob, mid, outcome = probs[i], mids[i], outs[i]
         if abs(prob - mid) < min_edge:
             continue
+        entry_price = mid if prob > mid else (1.0 - mid)
+        if entry_price < min_price:
+            continue
         size = float(contract_sizes[i]) if contract_sizes is not None else contract_usd
         if prob > mid:
             p = size * (outcome - mid)
         else:
             no_mid = 1.0 - mid
             p = size * ((1.0 - outcome) - no_mid)
-        p -= FEE_RATE * size * mid
+        p -= kalshi_fee(size, mid, fee_coef=fee_coef)
         pnl[i] = p
         traded[i] = True
 
@@ -203,6 +211,8 @@ def evaluate_real_markets(
     min_edge: float = 0.04,
     contract_usd: float = 1.0,
     contract_sizes: Optional[np.ndarray] = None,
+    fee_coef: float = TAKER_FEE_COEF,
+    min_price: float = 0.0,
 ) -> dict:
     """Score the model's fair values against real Kalshi bracket markets.
 
@@ -270,6 +280,7 @@ def evaluate_real_markets(
     pnl, traded = per_trade_pnl(
         fair_arr, mid_arr, out_arr,
         min_edge=min_edge, contract_usd=contract_usd, contract_sizes=contract_sizes,
+        fee_coef=fee_coef, min_price=min_price,
     )
 
     num_trades = int(traded.sum())
@@ -510,6 +521,8 @@ def run_evaluation(
     eval_end: str = EVAL_END,
     min_edge: float = 0.04,
     n_estimators: int = 500,
+    fee_coef: float = TAKER_FEE_COEF,
+    min_price: float = 0.0,
 ) -> dict:
     """Train look-ahead-free models on data before `eval_start`, then score them
     against the real Kalshi markets settling in [eval_start, eval_end]."""
@@ -530,7 +543,9 @@ def run_evaluation(
 
     cache = _build_distribution_cache(bundle, eval_feats)
     prob_above_fn = build_fair_value_fn(bundle, eval_feats, cache=cache)
-    result = evaluate_real_markets(markets, prob_above_fn, min_edge=min_edge)
+    result = evaluate_real_markets(
+        markets, prob_above_fn, min_edge=min_edge, fee_coef=fee_coef, min_price=min_price
+    )
 
     result["sigma_calibration"] = compute_sigma_calibration(cache, eval_feats)
 
@@ -548,6 +563,8 @@ def run_multilead_evaluation(
     min_edge: float = 0.04,
     n_estimators: int = 500,
     leads: Optional[list[int]] = None,
+    fee_coef: float = TAKER_FEE_COEF,
+    min_price: float = 0.0,
 ) -> dict:
     """Multi-lead edge map (v2 step 1). Train look-ahead-free models ONCE, then
     score them against the SAME real Kalshi markets at each forecast lead in
@@ -579,7 +596,9 @@ def run_multilead_evaluation(
             logger.warning("Lead %dh: no eval-window feature rows, skipping", lead)
             continue
         fn = build_fair_value_fn(bundle, eval_feats, cache=cache)
-        res = evaluate_real_markets(markets, fn, min_edge=min_edge)
+        res = evaluate_real_markets(
+            markets, fn, min_edge=min_edge, fee_coef=fee_coef, min_price=min_price
+        )
         by_lead[lead] = {
             "n": res["num_scored_markets"],
             "model_brier": res["model_brier"],
@@ -643,11 +662,15 @@ def _run_multilead_cli(args) -> None:
         eval_end=args.eval_end,
         min_edge=args.min_edge,
         n_estimators=args.n_estimators,
+        fee_coef=args.fee_coef,
+        min_price=args.min_price,
     )
+    fee_label = "maker" if args.fee_coef == MAKER_FEE_COEF else "taker"
     print("\n" + "=" * 72)
     print("MULTI-LEAD EDGE MAP  (same markets, model forecast at each lead, no look-ahead)")
     print("=" * 72)
-    print(f"  Window: {result['eval_start']} → {result['eval_end']}   min_edge: {result['min_edge']}")
+    print(f"  Window: {result['eval_start']} → {result['eval_end']}   min_edge: {result['min_edge']}"
+          f"   fee: {fee_label}   min_price: {args.min_price}")
     print(f"  {'lead':>5} {'n':>5} {'modelB':>8} {'mktB':>8} {'edge?':>6} "
           f"{'trades':>7} {'P&L$':>9} {'win%':>6} {'sharpe':>7}")
     for lead, d in sorted(result["by_lead"].items()):
@@ -671,7 +694,12 @@ def main() -> None:
     parser.add_argument("--n-estimators", type=int, default=500)
     parser.add_argument("--multilead", action="store_true",
                         help="Run the multi-lead edge map instead of the D+1 eval")
+    parser.add_argument("--maker", action="store_true",
+                        help="Use the maker fee (resting limit orders) instead of taker")
+    parser.add_argument("--min-price", type=float, default=0.0,
+                        help="Skip trades whose entry price is below this floor (e.g. 0.15)")
     args = parser.parse_args()
+    args.fee_coef = MAKER_FEE_COEF if args.maker else TAKER_FEE_COEF
 
     if args.multilead:
         _run_multilead_cli(args)
@@ -682,6 +710,8 @@ def main() -> None:
         eval_end=args.eval_end,
         min_edge=args.min_edge,
         n_estimators=args.n_estimators,
+        fee_coef=args.fee_coef,
+        min_price=args.min_price,
     )
 
     print("\n" + "=" * 60)

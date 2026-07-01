@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm as _norm
 
-from backtest.track_b import simulate_pnl, FEE_RATE
+from backtest.track_b import simulate_pnl
 from trading.kelly import compute_size
 
 TRADES_PATH = Path("data/backtest_trades.parquet")

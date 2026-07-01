@@ -1,4 +1,4 @@
-from backtest.track_b import FEE_RATE
+from backtest.track_b import kalshi_fee
 
 
 def compute_size(
@@ -14,10 +14,11 @@ def compute_size(
     if market_price <= 0.0 or market_price >= 1.0:
         return 0
 
-    # Fee-adjusted Kelly: Kalshi charges FEE_RATE * notional per contract.
+    # Fee-adjusted Kelly: Kalshi charges kalshi_fee(1, price) per contract.
     # A Yes bought at `market_price` nets (1 - market_price - fee) on win,
     # so net odds b are reduced by the fee relative to the naive formula.
-    b = (1.0 - (1.0 + FEE_RATE) * market_price) / market_price
+    fee = kalshi_fee(1.0, market_price)
+    b = (1.0 - market_price - fee) / market_price
     p = fair_value
     q = 1.0 - p
     if b <= 0:
