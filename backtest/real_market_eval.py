@@ -329,12 +329,19 @@ def evaluate_real_markets(
 # Model fair-value closure (wires a trained bundle to real-market lookups)
 # ---------------------------------------------------------------------------
 
-def _build_distribution_cache(bundle: dict, eval_features: pd.DataFrame) -> dict:
+def _build_distribution_cache(
+    bundle: dict, eval_features: pd.DataFrame, lead_hour: Optional[int] = None
+) -> dict:
     """Per (station, date) cache of the threshold-INDEPENDENT predictive
-    distribution (μ, σ, ECMWF offset, QRF quantiles, calibrator), using the
-    SHORTEST available lead per (station, date) — the freshest forecast the bot
-    would use (~24h out). Computed ONCE per station-bucket (≈60 forest evals,
-    not ~8k), since μ/σ/quantiles don't depend on the bracket threshold.
+    distribution (μ, σ, ECMWF offset, QRF quantiles, calibrator). Computed ONCE
+    per station-bucket (≈60 forest evals, not ~8k), since μ/σ/quantiles don't
+    depend on the bracket threshold.
+
+    `lead_hour=None` (default) uses the SHORTEST available lead per (station,
+    date) — the freshest forecast the bot would use (~24h out). Pass a specific
+    lead (24/48/72/96/120/168) to pin every (station, date) to that lead's
+    forecast row, so the multi-lead edge map can price the SAME market at each
+    lead. When a (station, date) lacks that exact lead it is simply absent.
 
     Each entry also carries the `lead_hour`/`lead_bucket` used, so the σ being
     cached can be checked against realized error by lead (diagnostic #3).
@@ -348,7 +355,12 @@ def _build_distribution_cache(bundle: dict, eval_features: pd.DataFrame) -> dict
 
     ef = eval_features.copy()
     ef["date"] = pd.to_datetime(ef["date"])
-    ef = ef.sort_values("lead_hour").drop_duplicates(["station", "date"], keep="first")
+    if lead_hour is None:
+        ef = ef.sort_values("lead_hour").drop_duplicates(["station", "date"], keep="first")
+    else:
+        ef = ef[ef["lead_hour"].astype(int) == int(lead_hour)].drop_duplicates(
+            ["station", "date"], keep="first"
+        )
     ef["_date_str"] = ef["date"].dt.strftime("%Y-%m-%d")
     ef["_bucket"] = ef["lead_hour"].astype(int).map(get_lead_bucket)
     ef["_key"] = ef["station"].astype(str) + "_" + ef["_bucket"]
@@ -464,6 +476,32 @@ HIST_DIR = "data/historical"
 EVAL_START = "2026-04-11"
 EVAL_END = "2026-05-27"
 
+# Forecast leads (hours before target date) present in features.parquet. The
+# multi-lead edge map scores the model at each one against the same markets.
+MULTILEAD_HOURS = [24, 48, 72, 96, 120, 168]
+
+
+def _load_eval_markets(prices_path: str, eval_start: str, eval_end: str) -> pd.DataFrame:
+    """Real HIGH-temp bracket markets settling in [eval_start, eval_end] with a
+    usable settlement + decision-time price. Low-temp (overnight-min) series are
+    excluded — the bot trades tmax only, so scoring them with a tmax model is
+    meaningless (matches EnsembleStrategy's live scope)."""
+    from config.series import is_low_temp_series
+
+    prices = pd.read_parquet(prices_path)
+    prices["date"] = pd.to_datetime(prices["date"])
+    not_low = ~prices["series"].map(is_low_temp_series)
+    return prices[
+        not_low
+        & (prices["date"] >= eval_start)
+        & (prices["date"] <= eval_end)
+        & prices["strike_type"].notna()
+        & prices["settlement"].notna()
+        & prices["d1_mid"].notna()
+        & (prices["d1_mid"] > 0.0)
+        & (prices["d1_mid"] < 1.0)
+    ].copy()
+
 
 def run_evaluation(
     features_path: str = f"{HIST_DIR}/features.parquet",
@@ -484,25 +522,7 @@ def run_evaluation(
     logger.info("Train rows (< %s): %d | eval-window feature rows: %d",
                 eval_start, len(train_df), len(eval_feats))
 
-    from config.series import is_low_temp_series
-
-    prices = pd.read_parquet(prices_path)
-    prices["date"] = pd.to_datetime(prices["date"])
-    # The bot trades HIGH-temp (tmax) markets only — production skips low-temp
-    # (overnight-minimum) series entirely (EnsembleStrategy.fetch_active_temperature_tickers),
-    # and our models predict actual_tmax. Scoring low-temp markets with a tmax
-    # model is meaningless, so exclude them to match the live trading scope.
-    not_low = ~prices["series"].map(is_low_temp_series)
-    markets = prices[
-        not_low
-        & (prices["date"] >= eval_start)
-        & (prices["date"] <= eval_end)
-        & prices["strike_type"].notna()
-        & prices["settlement"].notna()
-        & prices["d1_mid"].notna()
-        & (prices["d1_mid"] > 0.0)
-        & (prices["d1_mid"] < 1.0)
-    ].copy()
+    markets = _load_eval_markets(prices_path, eval_start, eval_end)
     logger.info("Real HIGH-temp bracket markets in window with settlement+price: %d", len(markets))
 
     logger.info("Training look-ahead-free models (n_estimators=%d)...", n_estimators)
@@ -518,6 +538,70 @@ def run_evaluation(
     result["eval_end"] = eval_end
     result["min_edge"] = min_edge
     return result
+
+
+def run_multilead_evaluation(
+    features_path: str = f"{HIST_DIR}/features.parquet",
+    prices_path: str = f"{HIST_DIR}/kalshi_prices.parquet",
+    eval_start: str = EVAL_START,
+    eval_end: str = EVAL_END,
+    min_edge: float = 0.04,
+    n_estimators: int = 500,
+    leads: Optional[list[int]] = None,
+) -> dict:
+    """Multi-lead edge map (v2 step 1). Train look-ahead-free models ONCE, then
+    score them against the SAME real Kalshi markets at each forecast lead in
+    `leads` (default {24…168}h). The market side (d1_mid, settlement) is fixed
+    across leads — only the model's forecast row changes — so market_brier is a
+    constant benchmark and model_brier should degrade as the lead grows. Reports
+    model-vs-market Brier and gated P&L per lead: does ANY lead beat the book?"""
+    from scripts.initial_train import train_models
+
+    leads = leads or MULTILEAD_HOURS
+
+    feats = pd.read_parquet(features_path)
+    feats["date"] = pd.to_datetime(feats["date"])
+    train_df = feats[feats["date"] < eval_start].copy()
+    eval_feats = feats[(feats["date"] >= eval_start) & (feats["date"] <= eval_end)].copy()
+    logger.info("Train rows (< %s): %d | eval-window feature rows: %d",
+                eval_start, len(train_df), len(eval_feats))
+
+    markets = _load_eval_markets(prices_path, eval_start, eval_end)
+    logger.info("Real HIGH-temp bracket markets in window: %d", len(markets))
+
+    logger.info("Training look-ahead-free models ONCE (n_estimators=%d)...", n_estimators)
+    bundle = train_models(train_df, n_estimators=n_estimators)
+
+    by_lead: dict[int, dict] = {}
+    for lead in leads:
+        cache = _build_distribution_cache(bundle, eval_feats, lead_hour=lead)
+        if not cache:
+            logger.warning("Lead %dh: no eval-window feature rows, skipping", lead)
+            continue
+        fn = build_fair_value_fn(bundle, eval_feats, cache=cache)
+        res = evaluate_real_markets(markets, fn, min_edge=min_edge)
+        by_lead[lead] = {
+            "n": res["num_scored_markets"],
+            "model_brier": res["model_brier"],
+            "market_brier": res["market_brier"],
+            "n_trades": res["num_simulated_trades"],
+            "pnl": res["simulated_pnl_usd"],
+            "win_rate": res["win_rate"],
+            "mean_edge": res["mean_edge"],
+            "daily_sharpe": res["daily_sharpe"],
+            "has_edge": res["has_edge"],
+        }
+        logger.info("Lead %dh: n=%d modelB=%.4f mktB=%.4f trades=%d pnl=$%.2f",
+                    lead, res["num_scored_markets"], res["model_brier"],
+                    res["market_brier"], res["num_simulated_trades"],
+                    res["simulated_pnl_usd"])
+
+    return {
+        "by_lead": by_lead,
+        "eval_start": eval_start,
+        "eval_end": eval_end,
+        "min_edge": min_edge,
+    }
 
 
 def compute_sigma_calibration(cache: dict, eval_features: pd.DataFrame) -> dict:
@@ -553,6 +637,29 @@ def compute_sigma_calibration(cache: dict, eval_features: pd.DataFrame) -> dict:
     )
 
 
+def _run_multilead_cli(args) -> None:
+    result = run_multilead_evaluation(
+        eval_start=args.eval_start,
+        eval_end=args.eval_end,
+        min_edge=args.min_edge,
+        n_estimators=args.n_estimators,
+    )
+    print("\n" + "=" * 72)
+    print("MULTI-LEAD EDGE MAP  (same markets, model forecast at each lead, no look-ahead)")
+    print("=" * 72)
+    print(f"  Window: {result['eval_start']} → {result['eval_end']}   min_edge: {result['min_edge']}")
+    print(f"  {'lead':>5} {'n':>5} {'modelB':>8} {'mktB':>8} {'edge?':>6} "
+          f"{'trades':>7} {'P&L$':>9} {'win%':>6} {'sharpe':>7}")
+    for lead, d in sorted(result["by_lead"].items()):
+        edge = "YES" if d["has_edge"] else "no"
+        print(f"  {lead:>4}h {d['n']:>5} {d['model_brier']:>8.4f} {d['market_brier']:>8.4f} "
+              f"{edge:>6} {d['n_trades']:>7} {d['pnl']:>9.2f} {d['win_rate']:>6.0%} "
+              f"{d['daily_sharpe']:>7.2f}")
+    print("-" * 72)
+    print("  modelB<mktB and P&L>0 = edge at that lead. mktB is constant (fixed markets).")
+    print("=" * 72)
+
+
 def main() -> None:
     import argparse
 
@@ -562,7 +669,13 @@ def main() -> None:
     parser.add_argument("--eval-end", default=EVAL_END)
     parser.add_argument("--min-edge", type=float, default=0.04)
     parser.add_argument("--n-estimators", type=int, default=500)
+    parser.add_argument("--multilead", action="store_true",
+                        help="Run the multi-lead edge map instead of the D+1 eval")
     args = parser.parse_args()
+
+    if args.multilead:
+        _run_multilead_cli(args)
+        return
 
     result = run_evaluation(
         eval_start=args.eval_start,

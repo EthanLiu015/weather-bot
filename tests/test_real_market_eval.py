@@ -367,3 +367,57 @@ def test_prob_above_fn_matches_compute_fair_value_for_parity():
             ecmwf_offset=float(row["ecmwf_tmax"]),
         )["cal_prob"]
         assert fn("KORD", d, threshold) == pytest.approx(ref, abs=1e-9)
+
+
+# ── multi-lead cache selection (task 1: multi-lead edge map) ──────────────────
+# The default cache takes the shortest lead per (station, date); the multi-lead
+# map must instead pin a chosen lead so a fair value can be produced at each lead
+# {24,48,72,96,120,168} for the SAME target market.
+
+def _synthetic_multilead_features(seed=1, ndates=150):
+    from processing.features import get_feature_columns
+    rng = np.random.default_rng(seed)
+    cols = get_feature_columns()
+    dates = pd.to_datetime("2026-01-01") + pd.to_timedelta(np.arange(ndates), unit="D")
+    frames = []
+    for lead, offset in ((24, 0.0), (120, 10.0)):
+        d = pd.DataFrame({c: rng.normal(0, 1, ndates) for c in cols})
+        d["station"] = "KORD"
+        d["lead_hour"] = lead
+        d["date"] = dates
+        d["ecmwf_tmax"] = rng.normal(75, 5, ndates) + offset
+        d["actual_tmax"] = d["ecmwf_tmax"] - offset + rng.normal(0, 3, ndates)
+        frames.append(d)
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_build_distribution_cache_pins_requested_lead():
+    from scripts.initial_train import train_models
+    from backtest.real_market_eval import _build_distribution_cache
+
+    df = _synthetic_multilead_features()
+    bundle = train_models(df, n_estimators=20, learning_rate=0.05, min_rows=100)
+
+    c24 = _build_distribution_cache(bundle, df, lead_hour=24)
+    c120 = _build_distribution_cache(bundle, df, lead_hour=120)
+    d = str(df["date"].iloc[0].date())
+
+    assert c24[("KORD", d)]["lead_hour"] == 24
+    assert c24[("KORD", d)]["lead_bucket"] == "D1-2"
+    assert c120[("KORD", d)]["lead_hour"] == 120
+    assert c120[("KORD", d)]["lead_bucket"] == "D5-7"
+    # Different lead ⇒ different feature row + different bucket model ⇒ a
+    # distinct forecast (the whole point of pinning the lead).
+    assert abs(c120[("KORD", d)]["mu"] - c24[("KORD", d)]["mu"]) > 1.0
+
+
+def test_build_distribution_cache_default_takes_shortest_lead():
+    from scripts.initial_train import train_models
+    from backtest.real_market_eval import _build_distribution_cache
+
+    df = _synthetic_multilead_features()
+    bundle = train_models(df, n_estimators=20, learning_rate=0.05, min_rows=100)
+
+    cache = _build_distribution_cache(bundle, df)  # no lead_hour ⇒ shortest
+    d = str(df["date"].iloc[0].date())
+    assert cache[("KORD", d)]["lead_hour"] == 24

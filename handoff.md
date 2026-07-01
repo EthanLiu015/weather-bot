@@ -52,7 +52,14 @@ work is to run that gate across **many leads and intraday snapshots**, not just 
   in `research/intraday_edge.py`. Re-ran: **negative holds** — mktB < modelB at every
   afternoon hour; 18/20h got *slightly worse* (more trades → more negative P&L). No obs
   edge; market efficient intraday. Second table below.
-- ⏭️ Not started: step 1 (multi-lead D+1..D+7 edge map). **This is now the next task.**
+- ✅ **Step 1 (multi-lead edge map) RAN — verdict NEGATIVE.** Extended
+  `real_market_eval` to score the SAME markets at each lead {24,48,72,96,120,168}h
+  (train once, re-cache per lead). No lead beats the book; model Brier ~0.18 vs constant
+  market Brier 0.095, all leads negative P&L + Sharpe. Table below. Confirms + extends v1:
+  no edge at 24h AND no edge at any longer lead.
+- ⏭️ Next: step 3/4 territory — only pursue model refinement (`plans/model-gaps.md`) if a
+  specific gap plausibly flips a *segment*; otherwise both cheap edge tests (multi-lead +
+  intraday) are exhausted and negative.
 
 ---
 
@@ -154,13 +161,31 @@ PYTHONPATH=. python research/intraday_edge.py        # run the obs-conditioned e
 
 ## The v2 plan (prioritized)
 
-### 1. Multi-lead edge map (extends the existing harness)
-Generalize `real_market_eval` beyond `lead_hour == 24`: for each lead in
-`{24,48,72,96,120,168}` compute model fair prob at each real market's exact threshold,
-run the edge gate vs the market price available at that lead, and report model-vs-market
-Brier **and gated P&L per lead**. Deliverable: a lead × segment table showing whether
-any lead has positive gated P&L. (This is the cheap, first test — reuses trained models
-+ `features.parquet`, no new data.)
+### 1. Multi-lead edge map (extends the existing harness) — ✅ RAN, ❌ NEGATIVE
+Generalized `real_market_eval` beyond `lead_hour == 24`. New:
+`_build_distribution_cache(..., lead_hour=L)` pins the forecast to lead `L` (default
+still = shortest lead), and `run_multilead_evaluation` trains ONCE then scores the SAME
+markets at each lead. Run it with:
+```bash
+PYTHONPATH=. python -m backtest.real_market_eval --multilead
+```
+The market price is the fixed decision-time `d1_mid` (only price we stored), so market
+Brier is constant across leads and only the model's forecast row varies. **Result (train
+< 2026-04-11, eval 2026-04-11→05-27, min_edge=0.04, n_estimators=500):**
+```
+ lead     n   modelB     mktB  edge?  trades      P&L$   win%  sharpe
+  24h  4108   0.1825   0.0945     no    3120    -38.98    34%   -6.58
+  48h  4216   0.1786   0.0953     no    3193    -31.80    34%   -4.80
+  72h  4216   0.1810   0.0953     no    3223    -21.83    34%   -3.33
+  96h  4216   0.1821   0.0953     no    3230    -20.74    34%   -3.13
+ 120h  4216   0.1845   0.0953     no    3246    -34.33    34%   -5.64
+ 168h  4216   0.1832   0.0953     no    3197    -29.35    34%   -4.66
+```
+**Read:** no lead beats the book — model Brier ~0.18 vs constant market Brier ~0.095 at
+EVERY lead, all gated P&L negative, all Sharpe < 0. The model degrades slightly with lead
+(as expected) but was never competitive to begin with. This confirms and extends v1: no
+edge at 24h, and none at any longer lead. Cheap edge tests (this + intraday) both
+exhausted and negative.
 
 ### 2. Intraday / short-lead edge (the main event) — ✅ RAN, ❌ NEGATIVE, ✅ CLOSED
 Built the full obs pipeline (1-min ASOS → 5-min-avg settlement-aligned run_max →
@@ -203,10 +228,11 @@ audit (`backtest/leakage_audit.py`) and a no-look-ahead check.
 
 ## Commands
 ```bash
-PYTHONPATH=. pytest tests/ -q                              # 368 passing
+PYTHONPATH=. pytest tests/ -q                              # 393 passing
 PYTHONPATH=. python scripts/build_feature_matrix.py        # rebuild features.parquet
 PYTHONPATH=. python scripts/initial_train.py               # (re)train models
 PYTHONPATH=. python -m backtest.real_market_eval           # D+1 real-price eval (v1 verdict)
+PYTHONPATH=. python -m backtest.real_market_eval --multilead  # step 1 multi-lead edge map
 ```
 
 ## How we got here (lineage)
