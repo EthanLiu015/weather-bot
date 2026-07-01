@@ -48,3 +48,7 @@ htmlcov/
 # Backtest outputs
 data/backtest_results.csv
 data/backtest_report.html
+
+# Market-making orderbook collector output (not needed on the forecasting branch)
+data/marketdata/
+.DS_Store
