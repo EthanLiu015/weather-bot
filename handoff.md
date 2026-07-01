@@ -68,11 +68,36 @@ work is to run that gate across **many leads and intraday snapshots**, not just 
   (fee, floor) in <1s. Results + reading below.
 - ✅ **Between-NO signal AUDITED — verdict ARTIFACT, killed** (`research/audit_between.py`).
   Four attacks, all fatal (table below). The candidate is dead; do not build on it.
-- ⏭️ **Next:** the model has NO tradeable edge on KXHIGH — forecast (any lead, intraday)
-  OR microstructure — under realistic execution. Re-scoring the SAME model is exhausted.
-  Only genuinely NEW information can move the forecast side: roadmap 3 (multi-model NWP
-  disagreement via Open-Meteo — new data) and roadmap 4 (fat-tail per-station calibration).
-  Sober prior from v1/v2: market Brier ~0.095 is very hard to beat. Not pivoting markets.
+- ✅ **Roadmap 3 (multi-model NWP) BUILT + RAN.** New leakage-free data from Open-Meteo
+  Previous Runs API — AIFS/ECMWF/ICON/GFS/GraphCast daily-high at 24/48/72h
+  (`ingestion/openmeteo.py`, `scripts/backfill_openmeteo.py` →
+  `data/historical/openmeteo_multimodel.parquet`, 15,578 rows). Study in
+  `research/multimodel_edge.py`. **Verdict: big forecast gain, still no edge.**
+  - Ensemble mean (bias-corrected) @24h: **MAE 2.3°F, Brier 0.130** — vs our ERA5 model's
+    0.18. The multi-model forecast is FAR better than what we had.
+  - **But market Brier 0.095 still wins** at every cross-model-spread tercile. Disagreement
+    filter fails: when models agree both we and the market are sharp; when they disagree we
+    degrade, market stays sharp. Gated P&L ~flat (+$8.84/725 trades, win 54%).
+  - The residual gap (0.130 vs 0.095) is **calibration**, not point accuracy (σ is a crude
+    global 2.4°F). → roadmap 4.
+- ⏭️ **Next: roadmap 4 (calibration), sober.** Per-station-month σ + isotonic/conformal on
+  the multi-model ensemble mean is the one remaining lever that could approach (not likely
+  beat) the book. If a per-(station,month) σ + calibrated bracket probs don't cross 0.095,
+  the forecast side is definitively exhausted and the market is efficient at the 24h decision.
+  Everything points that way; keep expectations at "match, maybe," not "beat." Not pivoting.
+
+### Roadmap 3 result — multi-model ensemble @24h (bias-corrected mean ± fitted σ)
+```
+A. SKILL:  model Brier 0.1298   market Brier 0.0951   → no edge (but 0.18→0.13 vs our model)
+   gated P&L $8.84 on 725 trades (win 54%, maker + $0.15 floor)
+B. DISAGREEMENT FILTER — by cross-model spread tercile:
+   spread            n   modelB    mktB   edge?  trades   P&L$
+   low(agree)      720   0.1130   0.0828    no     223   -3.97
+   mid             720   0.1278   0.1083    no     236   +9.62
+   high(disagree)  720   0.1487   0.0943    no     266   +3.19
+```
+Reproduce: `PYTHONPATH=. python -m research.multimodel_edge`
+(re-backfill: `PYTHONPATH=. python scripts/backfill_openmeteo.py`)
 
 ### Roadmap 1 result — fee/floor turns blanket-negative into ~flat-to-small-positive
 Same markets/model as multi-lead step 1; only the fee & price-floor vary (per-lead P&L $):
