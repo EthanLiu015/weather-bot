@@ -57,9 +57,47 @@ work is to run that gate across **many leads and intraday snapshots**, not just 
   (train once, re-cache per lead). No lead beats the book; model Brier ~0.18 vs constant
   market Brier 0.095, all leads negative P&L + Sharpe. Table below. Confirms + extends v1:
   no edge at 24h AND no edge at any longer lead.
-- ⏭️ Next: step 3/4 territory — only pursue model refinement (`plans/model-gaps.md`) if a
-  specific gap plausibly flips a *segment*; otherwise both cheap edge tests (multi-lead +
-  intraday) are exhausted and negative.
+- ✅ **Fee model FIXED (roadmap 1)** — commit `8915aea`. Backtest booked a flat
+  `0.05*size*mid`; real Kalshi is `kalshi_fee = size*min(coef*p*(1-p), 0.035)`, symmetric
+  in p, coef 0.07 taker / 0.0175 maker. Wired through `simulate_pnl`, `per_trade_pnl`, the
+  eval harness (+ `--maker`/`--min-price` flags) and fee-adjusted Kelly. **Re-reads every
+  prior P&L number.**
+- ✅ **Single-train fee + segment scan (roadmap 1 & 2)** — `research/fee_segment_scan.py`.
+  Trains ONCE (~35 min), scores every market at every lead, dumps
+  `data/historical/multilead_scored.parquet`; then `--from-cache` re-scores any
+  (fee, floor) in <1s. Results + reading below.
+- ⏭️ **Next (honesty gate, NOT scaling):** the scan surfaced a candidate microstructure
+  signal (fade the modal 2°F "between" bracket via NO). It must survive `leakage_audit.py`
+  + a **station-day-clustered / block-bootstrap variance** check + a maker-fill-realism
+  check before ANY belief. The apparent Sharpe is inflated by correlated sampling.
+
+### Roadmap 1 result — fee/floor turns blanket-negative into ~flat-to-small-positive
+Same markets/model as multi-lead step 1; only the fee & price-floor vary (per-lead P&L $):
+```
+config                         24h    48h    72h    96h   120h   168h
+old flat-5% (pre-fix)         -39    -32    -22    -21    -34    -29
+corrected taker               -34    -25    -12    -13    -26    -25
+maker                         -15     -5     +8     +7     -6     -5
+maker + $0.15 price floor      -1     +5    +18    +16     +4     +2
+taker + $0.15 price floor     -18    -13     +0     -1    -14    -16
+```
+Floor lifts win% 34%→62%. **But `edge?` = no at every lead** — model Brier ~0.18 still ≫
+market ~0.095. Positive P&L is NOT forecast edge (see roadmap 2).
+
+### Roadmap 2 result — segment mining (maker + $0.15 floor); NO forecast-edge cell
+- **No station / lead / strike cell has model Brier < market Brier.** Confirms v1/v2.
+- All positive P&L lives in **`between` (2°F) brackets: +$97.9** (`greater` -$29, `less`
+  -$25). Diagnostic on the scored parquet: **97% of between trades are NO bets** (8763/8988),
+  buy NO at mean price ~0.65, win 66%. This is **mechanically fading the modal bracket** — a
+  single 2°F bracket rarely contains the settlement, so NO is structurally favored. It is a
+  **price/anchoring fade, not weather skill** (calibration is worse than the book), it is
+  **short-vol** (sells the favorite → fat-tail risk), and its **Sharpe 3.82 is a mirage**:
+  8988 "trades" collapse to **683 unique station-days** (6 leads × several brackets, all
+  correlated), so the effective independent sample is tiny.
+- Winners lean Texas/coastal (KSAT +41, KDFW +16, KLAX +14, KSEA/KAUS +12); losers desert/NE
+  (KPHX -19, KLAS -18, KLGA -12) — plausibly a regime/fat-tail miscalibration.
+
+Reproduce: `PYTHONPATH=. python -m research.fee_segment_scan --from-cache`
 
 ---
 
