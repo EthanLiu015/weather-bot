@@ -37,13 +37,98 @@ work is to run that gate across **many leads and intraday snapshots**, not just 
 
 ---
 
-## Current state (this session)
+## Current state (updated 2026-07-01 afternoon — ASOS + intraday edge test)
 
 - ✅ Branch `forecasting-v2` cut from `95ca4e9`; leftover empty MM `bot/` dir removed.
-- ✅ Full model stack imports; **test suite green (368 passed)**.
-- ✅ **`features.parquet` rebuilt** from surviving ERA5 (see "Data" below). This was the
-  one missing artifact — the raw ERA5/GEFS/NBM backfill itself survived on disk.
-- ⏭️ Not yet done: the multi-lead / intraday edge evaluation (the core v2 work).
+- ✅ Full model stack imports; **test suite green** (now includes ASOS/intraday tests).
+- ✅ **`features.parquet` rebuilt** from surviving ERA5 (see "Data" below).
+- ✅ **Intraday obs pipeline built** (commits `78a73f2`, `f7e28e4`, `c0883f3`) — see the
+  ASOS / data-fetching section below.
+- ✅ **Step 2 (intraday / short-lead edge) RAN — verdict is NEGATIVE.** The
+  obs-conditioned afternoon model does **not** beat the retail book at any afternoon
+  hour. Table below.
+- ✅ **Refinement DONE — step 2 CLOSED.** Replaced the pooled residual model with a
+  per-(station, offset) residual model (pooled fallback when a station has <8 train rows)
+  in `research/intraday_edge.py`. Re-ran: **negative holds** — mktB < modelB at every
+  afternoon hour; 18/20h got *slightly worse* (more trades → more negative P&L). No obs
+  edge; market efficient intraday. Second table below.
+- ⏭️ Not started: step 1 (multi-lead D+1..D+7 edge map). **This is now the next task.**
+
+---
+
+## ASOS & data fetching — exactly what's being done (READ THIS)
+
+This is the freshest work and where the session died. Goal of the pipeline: get the
+**live observed running max** of the day's temperature at afternoon moments, so the model
+can price `P(final daily max > threshold | max-so-far)` and edge-gate it against the
+Kalshi afternoon traded price. Three pieces:
+
+### 1. 1-minute ASOS fetcher — `ingestion/asos_1min.py` (commit `78a73f2`)
+- Pulls **1-minute temperature** from the **IEM ASOS 1-minute service** — the only
+  sub-hourly obs source we have (existing ingestion topped out at hourly METAR / daily
+  max). `parse_1min_csv` + `running_max` are pure + unit-tested; the network call is a
+  thin wrapper.
+- **Critical settlement-alignment finding:** the RAW 1-min running max sits a consistent
+  **+1 °F above the official daily max** (MSP 81/80, DEN 80/79, PHX 104/103) because
+  **Kalshi settlement uses the ASOS 5-minute AVERAGE temperature, not the 1-min peak.** A
+  **5-min-avg reconstruction** (`settlement_running_max` / `settlement_max_at`, no
+  look-ahead) removes most of the bias but leaves ±1 °F residual → the intraday model must
+  **learn an obs→settlement mapping**, not treat obs as truth. Matters hugely for 2 °F
+  brackets.
+
+### 2. Afternoon price + settlement-aligned backfill — `research/intraday_afternoon.py` (commit `f7e28e4`)
+- The old `intraday_prices.parquet` only reached **+14h UTC (~9am, pre-high)** — useless
+  for an obs-conditioned test. This pulls the **Kalshi traded price at afternoon LOCAL
+  hours (4/6/8/10pm)** from **hourly candlesticks**
+  (`trading/kalshi_client.get_candlesticks_range`) and pairs each with the
+  **settlement-aligned running max known at that moment**.
+- **Validated:** run_max at **10pm local matches settlement EXACTLY (8/8 station-days).**
+  Fixed a **UTC-vs-local-day bug** that grabbed the prior day's peak for west-coast
+  stations (Seattle 91→77 °F).
+- **Output: `data/historical/intraday_afternoon.parquet`** (gitignored) — **5,277 markets
+  × offsets {16,18,20,22} local**, 49 dates, 18 stations, **~92% with run_max** (rows with
+  run_max: 4834/4840/4864/4876). Usable window = candlestick history (~10wk) ∩ IEM 1-min
+  archive lag (~2wk).
+
+### 3. Obs-conditioned edge test — `research/intraday_edge.py` (commit `c0883f3`)
+- Models final daily max = `run_max + R`, `R ≥ 0` (residual rise). Estimates `R`'s
+  distribution **empirically from TRAIN days** (currently **pooled** — the crude part),
+  turns it into `P(final > x)`, prices each bracket via existing `bracket_yes_prob`, and
+  **edge-gates** fair value vs the afternoon traded price. Temporal train/test split, real
+  settlement outcomes, no look-ahead. `prob_final_above` unit-tested.
+
+### Result (reproduced 2026-07-01, `min_edge=0.04`, train 24d / test 25d)
+```
+offset     n   modelB     mktB  edge?  trades      P&L$   win%
+  16h  2531   0.0721   0.0349     no     799     22.66    34%
+  18h  2537   0.0511   0.0030     no     193      0.52    31%
+  20h  2549   0.0516   0.0002     no     144     -3.95     7%
+  22h  2555   0.0532   0.0001     no     146     -4.26     7%
+```
+**Read:** market Brier < model Brier at **every** hour. By 8–10pm the book is near-perfect
+(mktB ≈ 0.0001 — run_max ≈ settlement, market already knows) and gated P&L is negative. At
+4pm the model has the most trades (799) and a small +$22 P&L, but it's still worse-calibrated
+than the market → treat as variance, not edge. **No obs edge as currently modeled.**
+
+### Result 2 — per-(station, offset) residuals (refinement, `min_edge=0.04`, min_station_samples=8)
+```
+offset     n   modelB     mktB  edge?  trades      P&L$   win%
+  16h  2531   0.0722   0.0349     no     772     25.65    38%
+  18h  2537   0.0514   0.0030     no     346     -3.63    23%
+  20h  2549   0.0523   0.0002     no     247     -8.41     4%
+  22h  2555   0.0532   0.0001     no     146     -4.26     7%
+```
+**Verdict UNCHANGED.** Fitting residuals per station (not pooled) did NOT create edge — mktB
+still < modelB at every hour, and 18/20h actually got worse (more trades gated in → more
+negative P&L). This answers the open question: the negative is **market efficiency**, not a
+too-crude residual model. **Step 2 is closed: no obs edge; the retail book prices the
+observable running max as well as or better than we can.**
+
+### Commands (ASOS / intraday)
+```bash
+PYTHONPATH=. python research/intraday_afternoon.py   # rebuild intraday_afternoon.parquet (slow: Kalshi candlestick pulls, hard rate-limited)
+PYTHONPATH=. python research/intraday_edge.py        # run the obs-conditioned edge test (table above)
+```
 
 ## Data inventory (what survived the pivot, all gitignored under `data/`)
 - `era5/` — **1.7 GB** ERA5 reanalysis, 2021–2026 (ground-truth + forecast proxy for
@@ -56,8 +141,11 @@ work is to run that gate across **many leads and intraday snapshots**, not just 
   with `d1_mid`, `settlement`, `yes_bid/ask`, `volume`, `strike_type`, strikes. The
   real-price truth for the D+1 eval.
 - `historical/intraday_prices.parquet` — **2,327 markets × price snapshots at
-  p-12/p-6/p+0/p+6/p+12/p+14h** around each market, + `settlement`. THE dataset for the
-  intraday/short-lead edge test.
+  p-12/p-6/p+0/p+6/p+12/p+14h** around each market, + `settlement`. Superseded for the
+  edge test: only reaches ~9am (pre-high), so useless for obs-conditioning.
+- `historical/intraday_afternoon.parquet` — **NEW**, the real intraday dataset: 5,277
+  markets × afternoon local hours {16,18,20,22}, settlement-aligned run_max, ~92% obs. See
+  the ASOS section above. This is what step 2 actually ran on.
 - **Missing / gone:** `ecmwf/` (0 B — the ECMWF anchor backfill; not needed for the
   historical ERA5 feature build, but was a live-model input) and the old
   `features.parquet` (now rebuilt).
@@ -74,12 +162,13 @@ Brier **and gated P&L per lead**. Deliverable: a lead × segment table showing w
 any lead has positive gated P&L. (This is the cheap, first test — reuses trained models
 + `features.parquet`, no new data.)
 
-### 2. Intraday / short-lead edge (the main event)
-Use `intraday_prices.parquet`. At each snapshot (esp. `p+0`, `p+6`) the real signal is
-the **running observed max** from live ASOS obs — the model must ingest obs-to-date and
-predict P(final daily max > threshold) given "max so far". Compare that to the snapshot
-market price; gate + settle. The empirical question: is our obs-conditioned fair value
-sharper/faster than the retail book at that same moment? If not here, nowhere.
+### 2. Intraday / short-lead edge (the main event) — ✅ RAN, ❌ NEGATIVE, ✅ CLOSED
+Built the full obs pipeline (1-min ASOS → 5-min-avg settlement-aligned run_max →
+afternoon Kalshi price) and ran the edge test on `intraday_afternoon.parquet`. Model does
+NOT beat the market at any afternoon hour; by 8–10pm the book is near-perfect. The pooled
+residual model was then refined to **per-(station, offset) residuals** (pooled fallback
+<8 samples) and re-run — **verdict unchanged, negative held.** Step 2 closed: no obs edge;
+market efficient intraday. Next task is **step 1 (multi-lead edge map)**.
 
 ### 3. Model refinement (only where it changes the verdict)
 Work `plans/model-gaps.md` selectively — prioritize the gaps that matter for the above:

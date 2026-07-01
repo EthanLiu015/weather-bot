@@ -55,33 +55,61 @@ def residuals_by_offset(day_df: pd.DataFrame) -> dict[int, np.ndarray]:
     return {int(h): g["R"].dropna().to_numpy() for h, g in r.groupby("offset_h")}
 
 
+def residuals_by_station_offset(day_df: pd.DataFrame) -> dict[tuple[str, int], np.ndarray]:
+    """Empirical residual-rise samples R keyed by (station, offset).
+
+    Same residual as `residuals_by_offset` but not pooled across stations — a
+    coastal station's afternoon rise differs from a desert station's. Thin per-key
+    samples are backstopped by the pooled model in `evaluate`.
+    """
+    finals = day_df.groupby(["station", "date"])["run_max"].transform("max")
+    r = day_df.assign(R=finals - day_df["run_max"])
+    return {(str(s), int(h)): g["R"].dropna().to_numpy()
+            for (s, h), g in r.groupby(["station", "offset_h"])}
+
+
 def _station_day_frame(df: pd.DataFrame) -> pd.DataFrame:
     """Unique (station, date, offset) run_max rows — residuals are per station-day,
     not per market (all markets of a station-day share the same obs)."""
     return df.dropna(subset=["run_max"]).drop_duplicates(["station", "date", "offset_h"])
 
 
-def evaluate(df: pd.DataFrame, min_edge: float = 0.04, train_frac: float = 0.5) -> dict:
-    """Per-offset obs-conditioned edge vs the afternoon price, temporal split."""
+def evaluate(
+    df: pd.DataFrame,
+    min_edge: float = 0.04,
+    train_frac: float = 0.5,
+    min_station_samples: int = 8,
+) -> dict:
+    """Per-offset obs-conditioned edge vs the afternoon price, temporal split.
+
+    Residuals are fit per (station, offset); a key with fewer than
+    `min_station_samples` train rows falls back to the pooled per-offset sample so
+    thin stations aren't priced off noise.
+    """
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"])
     dates = np.sort(df["date"].unique())
     split = dates[int(len(dates) * train_frac)]
     train, test = df[df["date"] < split], df[df["date"] >= split]
 
-    R_by_off = residuals_by_offset(_station_day_frame(train))
+    train_sd = _station_day_frame(train)
+    R_by_off = residuals_by_offset(train_sd)
+    R_by_so = residuals_by_station_offset(train_sd)
 
     results: dict[int, dict] = {}
     for h, grp in test.groupby("offset_h"):
-        R = R_by_off.get(int(h))
-        if R is None or R.size == 0:
+        pooled = R_by_off.get(int(h))
+        if pooled is None or pooled.size == 0:
             continue
         fair, mids, outs = [], [], []
         for row in grp.itertuples(index=False):
             if not np.isfinite(row.run_max):
                 continue
+            R = R_by_so.get((str(row.station), int(h)))
+            if R is None or R.size < min_station_samples:
+                R = pooled
             yes = bracket_yes_prob(
-                lambda x: prob_final_above(R, row.run_max, x),
+                lambda x, _R=R, _rm=row.run_max: prob_final_above(_R, _rm, x),
                 row.strike_type, row.floor_strike, row.cap_strike,
             )
             if yes is None:
