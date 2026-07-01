@@ -66,10 +66,13 @@ work is to run that gate across **many leads and intraday snapshots**, not just 
   Trains ONCE (~35 min), scores every market at every lead, dumps
   `data/historical/multilead_scored.parquet`; then `--from-cache` re-scores any
   (fee, floor) in <1s. Results + reading below.
-- ⏭️ **Next (honesty gate, NOT scaling):** the scan surfaced a candidate microstructure
-  signal (fade the modal 2°F "between" bracket via NO). It must survive `leakage_audit.py`
-  + a **station-day-clustered / block-bootstrap variance** check + a maker-fill-realism
-  check before ANY belief. The apparent Sharpe is inflated by correlated sampling.
+- ✅ **Between-NO signal AUDITED — verdict ARTIFACT, killed** (`research/audit_between.py`).
+  Four attacks, all fatal (table below). The candidate is dead; do not build on it.
+- ⏭️ **Next:** the model has NO tradeable edge on KXHIGH — forecast (any lead, intraday)
+  OR microstructure — under realistic execution. Re-scoring the SAME model is exhausted.
+  Only genuinely NEW information can move the forecast side: roadmap 3 (multi-model NWP
+  disagreement via Open-Meteo — new data) and roadmap 4 (fat-tail per-station calibration).
+  Sober prior from v1/v2: market Brier ~0.095 is very hard to beat. Not pivoting markets.
 
 ### Roadmap 1 result — fee/floor turns blanket-negative into ~flat-to-small-positive
 Same markets/model as multi-lead step 1; only the fee & price-floor vary (per-lead P&L $):
@@ -98,6 +101,24 @@ market ~0.095. Positive P&L is NOT forecast edge (see roadmap 2).
   (KPHX -19, KLAS -18, KLGA -12) — plausibly a regime/fat-tail miscalibration.
 
 Reproduce: `PYTHONPATH=. python -m research.fee_segment_scan --from-cache`
+
+### Audit of the between-NO signal — ARTIFACT (all four attacks fatal)
+`PYTHONPATH=. python -m research.audit_between --lead 24`
+1. **De-correlation kills the size.** The $97.9 counted each station-day up to 6× (one row
+   per lead). At a SINGLE decision lead (24h) the real figure is **+$12.26** over 39 dates.
+   Block-bootstrap over dates: 90% CI **[−$5.1, +$30.7]**, P(profit) **0.87** — not
+   significant. **Top-3 dates = 102% of P&L** (all profit from 3 days; rest net negative).
+2. **The model adds nothing.** A NULL structural fade (sell EVERY between bracket above the
+   floor, ignore the forecast) earns **+$32.55 > $12.26** — the model *subtracts* value. The
+   "signal" is 100% structural base-rate/anchoring fade, zero weather skill.
+3. **Fill/fee realism destroys it.** maker perfect-fill +$12.26 → **taker −$3.24**, **maker
+   +1¢ adverse −$2.36**, **maker +2¢ adverse −$16.98**. Survives only on flawless maker
+   fills at mid with no adverse selection — which is exactly what NO-fills on soon-worthless
+   brackets won't give you.
+4. Integrity clean (mids in (0,1), binary outcomes, 40 dates/18 stations; 766 "dups" are a
+   coarse (lead,station,date,mid) key colliding across the day's between brackets — benign).
+
+**Conclusion: no tradeable edge in KXHIGH from this model, forecast or microstructure.**
 
 ---
 
