@@ -18,17 +18,19 @@ import time
 import pandas as pd
 
 from config.stations import STATION_REGISTRY
-from ingestion.openmeteo import fetch_station
+from ingestion.openmeteo import fetch_station, fetch_station_fresh
 
 logger = logging.getLogger(__name__)
 
 OUT_PATH = "data/historical/openmeteo_multimodel.parquet"
+FRESH_PATH = "data/historical/openmeteo_fresh.parquet"
 
 
-def backfill(start: str, end: str, pause: float = 1.0) -> pd.DataFrame:
+def backfill(start: str, end: str, pause: float = 1.0, fresh: bool = False) -> pd.DataFrame:
+    fetch = fetch_station_fresh if fresh else fetch_station
     frames: list[pd.DataFrame] = []
     for i, (icao, st) in enumerate(STATION_REGISTRY.items(), 1):
-        df = fetch_station(icao, st.lat, st.lon, st.timezone, start, end)
+        df = fetch(icao, st.lat, st.lon, st.timezone, start, end)
         logger.info("[%d/%d] %s: %d rows (%s models)", i, len(STATION_REGISTRY),
                     icao, len(df), df["model"].nunique() if not df.empty else 0)
         if not df.empty:
@@ -44,12 +46,16 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--start", default="2026-04-01")
     ap.add_argument("--end", default="2026-06-01")
+    ap.add_argument("--fresh", action="store_true",
+                    help="pull freshest same-day run (Historical Forecast API) instead of 24/48/72h")
     args = ap.parse_args()
 
-    df = backfill(args.start, args.end)
-    df.to_parquet(OUT_PATH, index=False)
-    logger.info("Saved %d rows to %s", len(df), OUT_PATH)
+    df = backfill(args.start, args.end, fresh=args.fresh)
+    out = FRESH_PATH if args.fresh else OUT_PATH
+    df.to_parquet(out, index=False)
+    logger.info("Saved %d rows to %s", len(df), out)
     print(df.groupby(["model", "lead_hour"]).size().unstack(fill_value=0))
+    return
 
 
 if __name__ == "__main__":

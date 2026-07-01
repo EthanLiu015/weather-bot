@@ -25,6 +25,10 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
+# Freshest archived run (~same-day, 0-24h lead) — approximates the market's ~9am
+# settlement-day decision-time information, for an apples-to-apples edge test.
+HIST_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+FRESH_LEAD_HOUR = 6  # nominal label; the run is same-day, ~0-14h before the high
 
 # short name -> Open-Meteo model slug. AIFS + GraphCast are the new (AI) signal;
 # gfs/icon/ecmwf give physics baselines to disagree against.
@@ -77,6 +81,57 @@ def parse_previous_runs(
                 "tmax_c": tmax,
             })
     return pd.DataFrame(rows, columns=["station", "date", "lead_hour", "model", "tmax_c"])
+
+
+def parse_daily_forecast(resp: dict, station: str, models, lead_hour: int = FRESH_LEAD_HOUR) -> pd.DataFrame:
+    """Long-form rows from a Historical Forecast API `daily=temperature_2m_max`
+    response, where each model's column is suffixed with its slug."""
+    daily = resp.get("daily", {})
+    dates = daily.get("time", [])
+    rows: list[dict] = []
+    for model in models:
+        col = f"temperature_2m_max_{MODEL_SLUGS[model]}"
+        vals = daily.get(col)
+        if not vals:
+            continue
+        for date, v in zip(dates, vals):
+            if v is None:
+                continue
+            rows.append({"station": station, "date": date, "lead_hour": lead_hour,
+                         "model": model, "tmax_c": float(v)})
+    return pd.DataFrame(rows, columns=["station", "date", "lead_hour", "model", "tmax_c"])
+
+
+def fetch_station_fresh(
+    station: str, lat: float, lon: float, tz: str,
+    start_date: str, end_date: str, models=tuple(MODEL_SLUGS),
+    timeout: float = 60.0, max_retries: int = 4,
+) -> pd.DataFrame:
+    """Freshest same-day daily-max forecast per model from the Historical Forecast
+    API — the ~9am-decision-time information, for the fair-lead edge test."""
+    import httpx
+
+    params = {
+        "latitude": lat, "longitude": lon, "timezone": tz,
+        "start_date": start_date, "end_date": end_date,
+        "daily": "temperature_2m_max",
+        "models": ",".join(MODEL_SLUGS[m] for m in models),
+        "temperature_unit": "celsius",
+    }
+    for attempt in range(max_retries):
+        try:
+            r = httpx.get(HIST_FORECAST_URL, params=params, timeout=timeout)
+            if r.status_code == 429 or r.status_code >= 500:
+                raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
+            r.raise_for_status()
+            return parse_daily_forecast(r.json(), station, models)
+        except httpx.HTTPError as e:
+            wait = 2 ** attempt
+            logger.warning("%s fresh attempt %d failed (%s); retry in %ds",
+                           station, attempt + 1, e, wait)
+            time.sleep(wait)
+    logger.error("%s fresh: giving up after %d attempts", station, max_retries)
+    return pd.DataFrame(columns=["station", "date", "lead_hour", "model", "tmax_c"])
 
 
 def fetch_station(

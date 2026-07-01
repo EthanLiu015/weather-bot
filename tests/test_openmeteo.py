@@ -8,7 +8,22 @@ network call itself is a thin wrapper and not unit-tested.
 import numpy as np
 import pandas as pd
 
-from ingestion.openmeteo import daily_max_by_date, parse_previous_runs, MODEL_SLUGS
+from ingestion.openmeteo import (
+    daily_max_by_date, parse_previous_runs, parse_daily_forecast, MODEL_SLUGS,
+)
+
+
+def test_parse_daily_forecast_reads_suffixed_model_columns():
+    resp = {"daily": {
+        "time": ["2026-05-01", "2026-05-02"],
+        "temperature_2m_max_ecmwf_aifs025_single": [23.0, None],
+        "temperature_2m_max_gfs_seamless": [21.0, 22.0],
+    }}
+    df = parse_daily_forecast(resp, "KLAX", ["aifs", "gfs"])
+    assert df[(df.model == "aifs") & (df.date == "2026-05-01")].iloc[0].tmax_c == 23.0
+    # None value skipped
+    assert df[(df.model == "aifs") & (df.date == "2026-05-02")].empty
+    assert df[(df.model == "gfs")].tmax_c.tolist() == [21.0, 22.0]
 
 
 def test_daily_max_groups_by_local_date_and_ignores_none():

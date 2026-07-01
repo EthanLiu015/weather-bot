@@ -66,9 +66,10 @@ def _price(mean: float, sigma: float, row) -> float | None:
     )
 
 
-def evaluate(train_frac: float = 0.5, min_edge: float = 0.04) -> None:
-    mm = pd.read_parquet(MM_PATH)
-    ens = ensemble_stats(mm)
+def evaluate(train_frac: float = 0.5, min_edge: float = 0.04,
+             mm_path: str = MM_PATH, lead_hour: int = DECISION_LEAD) -> None:
+    mm = pd.read_parquet(mm_path)
+    ens = ensemble_stats(mm, lead_hour=lead_hour)
     ens["date"] = pd.to_datetime(ens["date"])
 
     markets = _load_eval_markets(f"data/historical/kalshi_prices.parquet", EVAL_START, EVAL_END)
@@ -93,27 +94,53 @@ def evaluate(train_frac: float = 0.5, min_edge: float = 0.04) -> None:
     mae = float(err.abs().mean())
     logger.info("Ensemble train: bias=%.2f°F  MAE=%.2f°F  σ=%.2f°F (n=%d)", bias, mae, sigma, len(err))
 
-    fair, mids, outs, spreads, aifs_gap = [], [], [], [], []
-    for row in test.itertuples(index=False):
-        yes = _price(row.ens_mean + bias, sigma, row)
-        if yes is None:
-            continue
-        fair.append(float(yes)); mids.append(float(row.d1_mid)); outs.append(float(row.settlement))
-        spreads.append(float(row.ens_std)); aifs_gap.append(float(row.aifs_minus_phys) if np.isfinite(row.aifs_minus_phys) else np.nan)
+    # Per-station bias/σ (fall back to global when a station is thin), for a
+    # calibration pass that closes what a single global σ leaves on the table.
+    st_stats = {}
+    for st, g in train.groupby("station"):
+        e = (g["actual_tmax"] - g["ens_mean"]).dropna()
+        if len(e) >= 15:
+            st_stats[st] = (float(e.mean()), float(e.std()))
 
-    fair, mids, outs = np.array(fair), np.array(mids), np.array(outs)
-    spreads = np.array(spreads)
-    pnl, traded = per_trade_pnl(fair, mids, outs, min_edge=min_edge, fee_coef=MAKER_FEE_COEF, min_price=0.15)
+    def price_rows(rows) -> tuple[np.ndarray, ...]:
+        fair, fair_st, mids, outs, spreads = [], [], [], [], []
+        for row in rows.itertuples(index=False):
+            b, s = st_stats.get(row.station, (bias, sigma))
+            yes = _price(row.ens_mean + bias, sigma, row)          # global σ
+            yes_st = _price(row.ens_mean + b, s, row)               # per-station σ
+            if yes is None or yes_st is None:
+                continue
+            fair.append(float(yes)); fair_st.append(float(yes_st))
+            mids.append(float(row.d1_mid)); outs.append(float(row.settlement))
+            spreads.append(float(row.ens_std))
+        return (np.array(fair), np.array(fair_st), np.array(mids),
+                np.array(outs), np.array(spreads))
+
+    tr_fair, tr_fair_st, tr_mid, tr_out, _ = price_rows(train)
+    fair, fair_st, mids, outs, spreads = price_rows(test)
+
+    # Isotonic calibration fit on TRAIN (per-station fair → outcome), applied to test.
+    from sklearn.isotonic import IsotonicRegression
+    iso = IsotonicRegression(out_of_bounds="clip").fit(tr_fair_st, tr_out)
+    fair_cal = iso.predict(fair_st)
+
+    pnl, traded = per_trade_pnl(fair_cal, mids, outs, min_edge=min_edge, fee_coef=MAKER_FEE_COEF, min_price=0.15)
+    mkt_b = brier_score(mids, outs)
 
     print("\n" + "=" * 72)
-    print("MULTI-MODEL ENSEMBLE EDGE @24h  (bias-corrected mean ± fitted σ, maker+floor)")
+    print("MULTI-MODEL ENSEMBLE EDGE @24h  (roadmap 3+4; maker+floor)")
     print("=" * 72)
-    print(f"  test markets: {len(fair)}   ensemble MAE(train): {mae:.2f}°F   σ: {sigma:.2f}°F")
-    print(f"  A. SKILL:  model Brier {brier_score(fair, outs):.4f}   "
-          f"market Brier {brier_score(mids, outs):.4f}   "
-          f"{'BEATS BOOK' if brier_score(fair,outs) < brier_score(mids,outs) else 'no edge'}")
+    print(f"  test markets: {len(fair)}   ensemble MAE(train): {mae:.2f}°F   global σ: {sigma:.2f}°F")
+    print(f"  market Brier (d1_mid @14:00 UTC settlement-day, ~9am local): {mkt_b:.4f}")
+    print(f"  A. global σ         model Brier {brier_score(fair, outs):.4f}")
+    print(f"  B. per-station σ    model Brier {brier_score(fair_st, outs):.4f}")
+    print(f"  C. + isotonic cal   model Brier {brier_score(fair_cal, outs):.4f}   "
+          f"{'BEATS BOOK' if brier_score(fair_cal,outs) < mkt_b else 'still no edge'}")
     print(f"     gated P&L ${pnl[traded].sum():.2f} on {int(traded.sum())} trades "
           f"(win {100*(pnl[traded]>0).mean():.0f}%)")
+    print(f"  NOTE: our forecast is 24h-lead; d1_mid is ~15h FRESHER (same-day morning).")
+    print(f"        A calibration gain here cannot close an information-lead gap.")
+    fair = fair_cal  # tercile table uses the calibrated probs
 
     print("\n  B. DISAGREEMENT FILTER — by cross-model spread tercile:")
     print(f"  {'spread':>10} {'n':>5} {'modelB':>8} {'mktB':>8} {'edge?':>6} {'trades':>7} {'P&L$':>8}")
@@ -130,8 +157,17 @@ def evaluate(train_frac: float = 0.5, min_edge: float = 0.04) -> None:
 
 
 def main() -> None:
+    import argparse
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    evaluate()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--fresh", action="store_true",
+                    help="score the freshest same-day run vs d1_mid (fair-lead test)")
+    args = ap.parse_args()
+    if args.fresh:
+        from ingestion.openmeteo import FRESH_LEAD_HOUR
+        evaluate(mm_path="data/historical/openmeteo_fresh.parquet", lead_hour=FRESH_LEAD_HOUR)
+    else:
+        evaluate()
 
 
 if __name__ == "__main__":

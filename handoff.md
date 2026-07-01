@@ -80,11 +80,46 @@ work is to run that gate across **many leads and intraday snapshots**, not just 
     degrade, market stays sharp. Gated P&L ~flat (+$8.84/725 trades, win 54%).
   - The residual gap (0.130 vs 0.095) is **calibration**, not point accuracy (σ is a crude
     global 2.4°F). → roadmap 4.
-- ⏭️ **Next: roadmap 4 (calibration), sober.** Per-station-month σ + isotonic/conformal on
-  the multi-model ensemble mean is the one remaining lever that could approach (not likely
-  beat) the book. If a per-(station,month) σ + calibrated bracket probs don't cross 0.095,
-  the forecast side is definitively exhausted and the market is efficient at the 24h decision.
-  Everything points that way; keep expectations at "match, maybe," not "beat." Not pivoting.
+- ✅ **Roadmap 4 (calibration) RAN — no edge.** Per-station σ + isotonic on the ensemble
+  barely moves Brier (0.1298→0.1286→0.1298 @24h): calibration cannot inject information a
+  stale forecast lacks.
+- ✅ **KEY DISCOVERY — the comparison was lead-unfair, and the market STILL wins.** `d1_mid`
+  is the last trade at/before **14:00 UTC on the settlement day** (`DECISION_CUTOFF_HOUR_UTC=14`
+  in `scripts/fetch_kalshi_history.py`), i.e. ~9am local the morning of the high — ~15h
+  FRESHER than our 24h forecast. So the "efficiency" was partly a lead handicap. Fixed it:
+  pulled the **freshest same-day** multi-model run (Open-Meteo Historical Forecast API,
+  `--fresh` → `openmeteo_fresh.parquet`, 5,955 rows) and re-ran. Fresh ensemble MAE **2.0°F**,
+  Brier **0.121** — better, but **market 0.095 still wins**.
+- ✅ **Efficiency is NOT a trivial-bracket artifact** (the doubt worth checking). Split by
+  contestedness of `d1_mid`: the book beats our fresh ensemble at EVERY tier — near-certain
+  (mkt .021 vs .043), mid (.146 vs .187), contested (.197 vs .210), and **tossup ~50/50
+  (.243 vs .292)**. The market out-calibrates a fresh SOTA multi-model ensemble even on the
+  hardest coin-flips. 56% of markets sit within 0.1 of 0/1 (easy) but the win holds on the
+  contested 44% too.
+- 🧭 **DEFINITIVE CONCLUSION: no forecast edge on KXHIGH, at any lead or difficulty.** The
+  book prices ~SOTA same-day guidance (public NBM/MOS + overnight obs + latest AI/physics
+  runs) and out-calibrates our best forecast everywhere. Why it CAN be this efficient:
+  objective/verifiable NWS settlement → sharp bots; public station-calibrated NBM; ~9am
+  same-day pricing; 24h high genuinely predictable so the residual is small. The only
+  positive-P&L we ever saw is structural microstructure fade (between-NO, mid-spread
+  tercile) — worse-Brier-yet-+P&L, which dies under de-correlation + realistic fills (see
+  audit). Not pivoting markets, but the forecast thesis is exhausted; any further work is
+  microstructure/execution, honestly audited, or accept KXHIGH is efficient.
+
+### Roadmap 4 + fair-lead result — fresh same-day ensemble still loses to the book
+```
+                     ensemble MAE   model Brier   market Brier   verdict
+ 24h lead (roadmap3)     2.30°F        0.129          0.095       market wins
+ fresh same-day (fair)   2.02°F        0.121          0.095       market wins
+market Brier by contestedness of d1_mid (fresh ensemble):
+ bucket             n     modelB   mktB    winner
+ near-certain    1236     0.043   0.021    market
+ mid              331     0.187   0.146    market
+ contested        292     0.210   0.197    market
+ tossup(~50/50)   301     0.292   0.243    market
+```
+Reproduce: `PYTHONPATH=. python scripts/backfill_openmeteo.py --fresh` then
+`PYTHONPATH=. python -m research.multimodel_edge --fresh`
 
 ### Roadmap 3 result — multi-model ensemble @24h (bias-corrected mean ± fitted σ)
 ```
