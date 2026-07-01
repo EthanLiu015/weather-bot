@@ -7,7 +7,18 @@ running (cumulative) max that the intraday model conditions on.
 """
 import pandas as pd
 
-from ingestion.asos_1min import parse_1min_csv, running_max, icao_to_1min_code
+from ingestion.asos_1min import (
+    parse_1min_csv,
+    running_max,
+    icao_to_1min_code,
+    settlement_running_max,
+    settlement_max_at,
+)
+
+
+def _obs(temps, start="2026-06-01 18:00"):
+    times = pd.date_range(start, periods=len(temps), freq="1min")
+    return pd.DataFrame({"valid_utc": times, "tmpf": [float(t) for t in temps]})
 
 
 SAMPLE = """station,station_name,valid(UTC),tmpf
@@ -48,6 +59,35 @@ def test_running_max_sorts_out_of_order_input():
     # After sorting by time: 76 then 77 -> cummax 76, 77
     assert list(rm["valid_utc"]) == [pd.Timestamp("2026-06-01 18:00"), pd.Timestamp("2026-06-01 18:03")]
     assert list(rm["run_max"]) == [76.0, 77.0]
+
+
+def test_settlement_max_uses_5min_average_not_the_peak():
+    # Rising 1-min temps 70..78. The trailing 5-min average lags the instantaneous
+    # peak, so the settlement-aligned max (74) is BELOW the raw max (78) — exactly
+    # the +1F-style gap that makes raw obs unsafe for 2F brackets.
+    obs = _obs([70, 72, 74, 76, 78])
+    sm = settlement_running_max(obs)
+    assert list(sm["settle_max"]) == [70.0, 71.0, 72.0, 73.0, 74.0]
+    assert obs["tmpf"].max() == 78.0  # raw peak is higher
+
+
+def test_settlement_max_is_monotone_non_decreasing():
+    # A spike then cooling must not lower the running max.
+    obs = _obs([80, 80, 80, 70, 70])
+    sm = settlement_running_max(obs)
+    assert list(sm["settle_max"]) == sorted(sm["settle_max"])
+
+
+def test_settlement_max_at_ignores_obs_after_cutoff():
+    obs = _obs([70, 72, 74, 90, 90])  # last two (18:03, 18:04) are after cutoff
+    at = settlement_max_at(obs, pd.Timestamp("2026-06-01 18:02"))
+    # Only 70,72,74 count -> 5-min avg cummax = 72, nowhere near the later 90 spike.
+    assert at == 72.0
+
+
+def test_settlement_max_at_returns_none_before_any_obs():
+    obs = _obs([70, 72])
+    assert settlement_max_at(obs, pd.Timestamp("2026-06-01 17:00")) is None
 
 
 def test_icao_to_1min_code_strips_leading_k():

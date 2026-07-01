@@ -135,6 +135,27 @@ class KalshiClient:
                                    params={"period_interval": period_interval})
         return data.get("candlesticks", [])
 
+    async def get_candlesticks_range(
+        self, series: str, ticker: str, start_ts: int, end_ts: int, period_interval: int = 60
+    ) -> list[dict]:
+        """Hourly (default) candlesticks between two unix timestamps.
+
+        Kalshi requires the series in the path and honours start_ts/end_ts only on
+        this form; the bare /markets/{ticker}/candlesticks 404s. Used to recover the
+        AFTERNOON traded price (during the daily high), which the morning-capped
+        intraday_prices dataset lacks. Returns [] on failure rather than raising so a
+        batch backfill skips dead markets.
+        """
+        try:
+            data = await self._request(
+                "GET",
+                f"/series/{series}/markets/{ticker}/candlesticks",
+                params={"start_ts": start_ts, "end_ts": end_ts, "period_interval": period_interval},
+            )
+        except Exception:
+            return []
+        return data.get("candlesticks", [])
+
     async def get_historical_markets(self, **kwargs) -> list[dict]:
         data = await self._request("GET", "/markets", params={**kwargs, "status": "settled"})
         return data.get("markets", [])

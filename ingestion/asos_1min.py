@@ -24,6 +24,7 @@ import logging
 from datetime import datetime
 
 import httpx
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,35 @@ def running_max(obs: pd.DataFrame) -> pd.DataFrame:
     ordered = obs.sort_values("valid_utc").reset_index(drop=True)
     ordered["run_max"] = ordered["tmpf"].cummax()
     return ordered
+
+
+def settlement_running_max(obs: pd.DataFrame, window: str = "5min") -> pd.DataFrame:
+    """Running max aligned to how the daily high SETTLES.
+
+    Settlement uses the ASOS 5-minute *average* temperature, not the 1-minute
+    instantaneous peak — so the raw running max overshoots settlement by ~1°F
+    (validated: MSP 81 vs official 80). Here we take a trailing 5-minute mean of the
+    1-min obs, round to whole °F, and cumulate the max. `settle_max` is therefore the
+    best real-time estimate, at each minute, of what the day's high will settle at.
+
+    Returns the obs sorted by time with an added `settle_max` column.
+    """
+    if obs.empty:
+        return obs.assign(settle_max=pd.Series([], dtype=float))
+    ordered = obs.sort_values("valid_utc").reset_index(drop=True)
+    roll = ordered.set_index("valid_utc")["tmpf"].rolling(window).mean()
+    ordered["settle_max"] = np.floor(roll.to_numpy() + 0.5)
+    ordered["settle_max"] = ordered["settle_max"].cummax()
+    return ordered
+
+
+def settlement_max_at(obs: pd.DataFrame, cutoff_utc: pd.Timestamp) -> float | None:
+    """The settlement-aligned running max known AT `cutoff_utc` (obs strictly after
+    the cutoff are ignored — no look-ahead). None if no obs by then."""
+    up_to = obs[pd.to_datetime(obs["valid_utc"]) <= cutoff_utc]
+    if up_to.empty:
+        return None
+    return float(settlement_running_max(up_to)["settle_max"].iloc[-1])
 
 
 def fetch_1min(station: str, start: datetime, end: datetime, timeout: float = 90.0) -> pd.DataFrame:
