@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(*)"
+      "Bash(*)",
+      "WebSearch",
+      "WebFetch(domain:www.northlakelabs.com)",
+      "WebFetch(domain:kalshi.com)",
+      "WebFetch",
+      "Bash(PYTHONPATH=. python -m pytest tests/test_track_b.py -q)"
     ]
   }
 }
