@@ -49,5 +49,10 @@ htmlcov/
 data/backtest_results.csv
 data/backtest_report.html
 
-# Live market-data logger output (grows large; collect locally)
+# Market-making orderbook collector output (not needed on the forecasting branch)
 data/marketdata/
+.DS_Store
+
+# Forward-capture programs' output (grows unbounded, some files exceed
+# GitHub's 100MB limit e.g. tennis_ticks daily parquets)
+data/capture/
