@@ -5,19 +5,23 @@ history; its durable conclusions are carried in "Frozen Decisions" below)._
 
 ---
 
-## 1. Project Objective — CONCLUDED: PLATEAU
+## 1. Project Objective — CONCLUDED: PLATEAU / BLOCKED (two loops)
 
 Goal was: beat the Kalshi KXHIGH market on calibration — **model Brier < market
 Brier (0.0951)** on the real-market eval window (Apr 11 → May 27 2026 test split),
-using only pre-14:00-UTC information. The autoresearch loop
-(`autoresearch/orchestrator-260701-1933/orchestrator-state.json`, status
-**PLATEAU**) ran 6 cycles and exhausted every planned lever.
+using only pre-14:00-UTC information. Two autoresearch loops ran:
+`orchestrator-260701-1933` (cycles 0–7, pure models + blend, **PLATEAU**) and
+`orchestrator-260701-2330` (cycles 8–9, market-input models, **BLOCKED**).
 
-**Final verdict: KXHIGH `d1_mid` at 14:00 UTC is efficient with respect to every
-legal public information source we could obtain.** The killer result (cycle 6):
-the walk-forward closed-form optimal shrinkage weight for our best fair model is
-**w = 0.000** — even handed the market price for free, the model contributes zero
-orthogonal information. No model in this information set can hit the predicate.
+**Final verdict — the predicate is unreachable, with a four-part proof chain:**
+1. Pure fair models exhausted at 0.1193 (NBM/ensembles/members/obs/truth).
+2. Shrinkage blend w = 0.000 — the model has zero orthogonal information.
+3. `d1_mid` itself is well-calibrated: renorm/isotonic/logistic/stacking all
+   lose on test (in-sample recalibration gain ≈ 0.0001 — nothing to extract).
+4. The book's one real flaw (tick floor: 0.01-brackets settle 0.44 %) is worth
+   ≤ 0.00005 Brier — an order of magnitude below significance. Intraday
+   denoising data no longer exists (Kalshi rolling purge).
+0.0951 is the book's irreducible level on this window.
 
 ## 2. Cycle Results (all honest: train-only fitting, test scored once, block bootstrap)
 
@@ -30,7 +34,11 @@ orthogonal information. No model in this information set can hit the predicate.
 | 4 | Settlement-truth audit (`research/settlement_truth.py`) | — | — | alarm was artifact; truth confirmed clean (below) |
 | 5a | Ensemble member PDFs (`research/ensemble_pdf.py`) | — | — | BLOCKED: no fair member data on Open-Meteo |
 | 5b | Morning-obs conditioning (`research/obs_conditioning.py`) | 0.1202–0.1219 | 0.0951 | loses, P=0.00; runmax truncation worth only 0.0017 |
-| 6 | Market-shrinkage blend (`research/blend_fallback.py`) | 0.0951 (=mkt) | 0.0951 | w*=0.000 — zero orthogonal info. **Loop stopped** |
+| 6 | Market-shrinkage blend (`research/blend_fallback.py`) | 0.0951 (=mkt) | 0.0951 | w*=0.000 — zero orthogonal info |
+| 7 | TRUE member PDFs, fair (GEFS 31 via dynamical.org Zarr + ECMWF IFS ENS 51 via Icechunk, 00Z inits) | 0.1193 | 0.0951 | loses, P=0.00; = cycle-3 NBM-only; shape worthless |
+| 8 | Market self-recalibration C0–C4 (`research/market_recalibration.py`): simplex renorm, isotonic, logistic, stacking | 0.0952–0.0960 | 0.0951 | all lose; d1_mid is well-calibrated; renorm of the 1.04 vig-oversum HURTS |
+| 9a | Microstructure denoising (VWAP / quote-mid of pre-14:00 trades) | — | — | BLOCKED: Kalshi purged Apr–May trades + candles; captured bid/ask 100 % degenerate |
+| 9b | Tick-floor tail sharpening (0.01 settles 0.44 % — real 2.3× overpricing) | — | — | analytic kill: perfect tail pricing ≤ 0.00005 Brier, below any significance. **Loop closed: BLOCKED** |
 
 ## 3. Durable Findings (this session)
 
@@ -45,14 +53,20 @@ orthogonal information. No model in this information set can hit the predicate.
   bracket 100 % vs 50/59 % for KLGA/KORD). Yet re-pointing NBM at the true
   stations does NOT help (KNYC MAE 1.96 vs KLGA 1.77; KMDW 2.04 vs KORD 2.13) —
   NBM's station calibration already absorbs the mismatch.
-- **No fair ensemble-member data exists on Open-Meteo**: `temperature_2m_previous_dayN`
-  returns all-null for ensemble models (gfs025, ecmwf_ifs025) on both the
-  ensemble API and previous-runs API, historical and forecast mode. Plain
-  historical ensemble data is assembled from latest runs = post-cutoff look-ahead
-  (banned). Only path is AWS GRIB byte-range backfill (noaa-gefs-pds).
-  `scripts/backfill_ensemble_members.py` + `research/ensemble_pdf.py` are written
-  and ready if that data is ever obtained — but cycle 6's w=0 makes the prior
-  very low.
+- **No usable ensemble-member data exists on Open-Meteo at all** for our window:
+  `previous_dayN` vars return all-null for every ensemble slug, and the plain
+  assembled archive is a rolling ~2-week window — April/May 2026 is gone, fair
+  or unfair. **The working member source is dynamical.org**: NOAA GEFS 35-day
+  Zarr (`https://data.dynamical.org/noaa/gefs/forecast-35-day/latest.zarr`,
+  31 members, inits 2020-10→present, `maximum_temperature_2m`) and ECMWF IFS ENS
+  Icechunk (`dynamical_catalog.open("ecmwf-ifs-ens-forecast-15-day-0-25-degree")`,
+  51 members, 00Z-only inits since 2024-04). Both fair (00Z posts pre-cutoff);
+  point reads are KB-scale.
+- **Member PDFs don't help (cycle 7).** 82 pooled fair members: raw member-mean
+  MAE ~3.3 °F (grid representativeness; KLAS/KSFO/KPHX worst), member spread adds
+  nothing over NBM's own `xnd` (P3 0.1193 ≈ cycle-3 0.1195), and the empirical
+  member CDF is WORSE than a calibrated Gaussian. Distribution shape was the last
+  pure lever.
 - **Morning obs don't close the gap.** Hourly METARs from the true settlement
   stations (obs ≤ 14:00 UTC; runmax coverage 1.00): physical truncation at the
   morning running max improves Brier by only 0.0017; trajectory/warming-rate
@@ -104,13 +118,160 @@ PYTHONPATH=. python -m research.blend_fallback        # cycle 6 (w=0 result)
 
 ---
 
+## Session 2026-07-06 — edge autopsy + cross-market scan (orchestrator-260706-goalAB)
+
+**Why others "win" KXHIGH (Goal A):** public bots are paper-trading or n=16 (one
+is methodologically our cycle 7, archived April 2026). The credible postmortem
+(northlakelabs) says winners are **latency arbs executing within seconds of each
+NWS model cycle**; fees kill sub-15¢ contracts. This reconciles every negative we
+have: cycle-2's post-cutoff "win" (0.0914) is exactly the information those bots
+harvest intra-day; every static snapshot we can backtest is post-race (hence
+blend w=0). A "similar strategy" = live model-cycle sniper — unbacktestable
+(ticks purged), forward-paper-trade only; we own pricing/calibration/fees,
+missing websocket book + release trigger + execution loop.
+
+**Cross-category scan (Goal B):** `scripts/kalshi_market_scan.py` →
+`autoresearch/orchestrator-260706-goalAB/{report.md, market-scan-results.tsv}`.
+Highlights: BTC-bracket longshot "anomaly" was pseudo-replication (one event
+settles a whole strike ladder — killed, but crypto-book staleness vs 24/7 spot is
+the forward-testable cousin of weather sniping); WTA shows favorite-longshot-bias
+direction (n=60 events, needs sharp-book cross-check); new HOURLY temp markets
+(TWC-settled, KNYC) are calibrated but have ZERO liquidity; CPI/Fed books
+untradable. **Structural: Kalshi's ~10-week purge caps every backtest — any
+future program must forward-capture daily (settled + candles + books).**
+
+## Forward-capture programs (BUILT + CRON-INSTALLED 2026-07-06)
+
+User crontab now runs four jobs (was empty before; `crontab -l` to inspect,
+`crontab -r` to remove; macOS cron skips runs while the machine sleeps):
+- `scripts/capture_books.py` hourly :05 — top-of-book snapshots (BTC/ETH/WTA/
+  NYC+CHI highs/TSA) → `data/capture/books.parquet`. Feeds crypto-staleness study.
+- `scripts/capture_daily.py` daily 10:00 — newly settled markets + probe candle
+  (close−24h/mid-life) for 24 series → `data/capture/settled_probe.parquet`.
+  Beats the ~10-week API purge; calibration sample grows forever.
+- `scripts/sniper_paper.py` every 30 min — PAPER model-cycle sniper: latest NBM
+  NBS bulletin per station (IEM) → bracket fairs (per-station bias + EMOS from
+  local history, per-target-date txn/xnd, integer-vs-x.99 strike semantics) vs
+  live books, net-of-fee edges logged → `data/capture/sniper_signals.parquet`.
+  NO orders. Mid-afternoon "edges" are stale-model illusions BY DESIGN — the
+  analysis buckets by signal age; only fresh-after-release buckets test the
+  latency hypothesis.
+- `scripts/tennis_odds_compare.py` daily 09:00 — Kalshi ATP+WTA+challenger books vs de-vigged
+  sharp lines (The Odds API; set `ODDS_API_KEY` env in crontab to activate
+  matching, else logs Kalshi-only) → `data/capture/tennis_compare.parquet`.
+
+### Live tennis tick infrastructure (added 2026-07-06, rewritten to v2 on 2026-07-16)
+- `live/tennis_recorder.py` — **v2 (2026-07-16): WS push, not REST polling.**
+  Single WebSocket (`orderbook_delta` + `ticker` channels) across all open
+  tennis markets (ATP/WTA/challengers, ~74–244 concurrent) — full
+  price-level depth (snapshot + signed deltas), not just top-of-book; real
+  push latency, not a 1s poll floor. Replaced the v1 REST-poll recorder
+  described in the original 2026-07-06 note below (kept for the CloudFront
+  cache-bust discovery, which no longer applies — WS has no such caching
+  layer). Rows: `type` ∈ {snapshot, delta, ticker} →
+  `data/capture/tennis_ticks/date=YYYY-MM-DD/part-*.parquet`; "who is
+  playing" metadata → `data/capture/tennis_events.parquet`. Pauses itself if
+  free disk < 2 GB. Stop: `kill $(cat data/capture/tennis_recorder.pid)`.
+- **2026-07-28 fixes** (see `plans/tennis-mm-next-steps.md` "Recorder fix"
+  for full detail): (1) the `*/5 * * * *` watchdog cron line was silently
+  `EPERM`-failing every run for 10 days straight (macOS blocks cron from
+  directly exec'ing a script under `~/Documents`; errors went to local
+  mail, not a log) — fixed by wrapping the cron line through `/bin/bash`
+  explicitly. (2) Added `seq`/`sid` columns (populated from every WS
+  message) and a 15-min `periodic_resync_loop` (forces a full
+  reconnect+resubscribe via the existing seq-gap `needs_resync` path) —
+  offline replay of the 07-16/17/18 data (before this fix) was found to
+  drift 79% of the time by 14.6¢ average vs the recorder's own
+  authoritative top-of-book, because there was no way to detect a
+  dropped/misordered delta after the fact. Data captured before 2026-07-28
+  should not be trusted for anything beyond top-of-book (which the
+  recorder's own cached `yes_bid`/`yes_ask` fields on each row are fine
+  for) — full ladder-depth analysis on that window is unreliable.
+- `scripts/tennis_watchdog.sh` (cron */5, fixed 2026-07-28) restarts the
+  daemon; macOS sleep still gaps the data. `scripts/tennis_compact.py`
+  (cron 03:30) merges finished days into one file per day — also had a
+  dtype bug (recorder's price format changed string→float mid-day on
+  07-16) fixed 2026-07-27, `NUMERIC_COLUMNS` now coerced via
+  `pd.to_numeric` before merge.
+
+**Scoring: after ≥2 weeks run `PYTHONPATH=. python scripts/analyze_capture.py`**
+— sniper paper P&L by signal-age bucket, tennis Brier kalshi-vs-sharp, accumulated
+per-series calibration (event-clustered). Everything under `data/capture/`
+(gitignored data; logs in `data/capture/logs/`).
+
+## Session 2026-07-27/28 — tennis MM dead, order-flow taker edge found + built (paper-only)
+
+Full detail and exact numbers: `plans/tennis-mm-next-steps.md` (research log)
+and `plans/tennis-momentum-edge-explained.md` (plain-language writeup of the
+edge, its asymmetry, and every way it could still be wrong). Summary:
+
+- **Passive market-making (spread capture) — DEAD.** Built
+  `scripts/mm_feasibility.py`: queue-aware fill simulator (join FIFO at best
+  price, walk the trade tape to detect fills) + markout. 19,654 fills,
+  245 market-days: mean markout **negative at every horizon** (5s/30s/120s),
+  net of the 0.0175 maker fee, win rate 28–32%. Fills cluster exactly when
+  the book is about to reprice against the resting side — classic adverse
+  selection. Don't reopen this path.
+- **Order-flow momentum taker — REAL, but one-sided.** Mirror question:
+  since resting orders reliably lose to the flow, is that flow *takeable*?
+  `scripts/tennis_momentum_signal.py` (screening) →
+  `scripts/tennis_taker_pnl.py` (fee-netted P&L, cluster-robust). 108,346
+  signals, 204 market-days. Buying "no" when a trade prints at the bid
+  (bearish pressure): cluster t-stat (one mean per market, not per-trade —
+  naive per-trade stats were inflated ~10× by autocorrelation) **7.2–8.0**,
+  67% of markets individually profitable. The mirror "yes"-side (following
+  bullish prints) is weak/inconsistent (t≈2.3, 53% of markets) — **not
+  traded**. Payoff is trend-following-shaped: median trade loses, mean
+  trade wins.
+- **Latency-robust up to 5s tested** (`tennis_taker_pnl.py --latency_ms`) —
+  entry priced at signal_ts+latency instead of instantly; cluster t-stat
+  at 1000ms (7.97) was *stronger* than instant (7.20), not weaker. This
+  isn't a "who reacts fastest" race — real execution latency doesn't
+  appear to erode it, at least out to 5s.
+- **Size/depth cost — BLOCKED then partially unblocked.** Walking the full
+  order-book ladder (not just top-of-book) for realistic order sizes
+  needed our own book reconstruction, which was found to drift badly (see
+  recorder-fix note above) — that test's numbers were discarded, not
+  reported. Recorder fixed 2026-07-28 (seq/sid + periodic resync); the
+  size question needs new data under the fixed schema before it's
+  retestable — not answered yet.
+- **Phase 5 built (paper-trading only):** `trading/tennis_order_manager.py`
+  (fixed 1-contract size, fixed 30s hold — matches what's actually
+  validated, not Kelly-sized) + `live/tennis_signal_bot.py` (separate WS
+  process from the capture daemon, on purpose — reuses `Book` +
+  sign-detection but no parquet writes) + `config/settings.py`
+  (`TENNIS_ENABLED=False` by default, separate kill switch from
+  `BOT_ACTIVE`) + `tests/test_tennis_order_manager.py` (9 tests, TDD).
+  32/32 full suite passes. **Not cronned.** Full design rationale:
+  `/Users/ethan/.claude/plans/reactive-greeting-globe.md`.
+
+**Next step:** manual paper-trading review run — `TENNIS_ENABLED=true` in
+`.env`, run `PYTHONPATH=. python live/tennis_signal_bot.py` for a few
+minutes against live markets, confirm `[PAPER]` fills land in the DB
+(`orders`/`positions`/`daily_pnl`) on real detected signals. Then decide on
+cronning it for a real paper-trading sample before ever flipping
+`PAPER_TRADING=false`.
+
 ## Where a future session could go (only remaining ideas)
 
-1. **AWS GRIB ensemble members** (GEFS `noaa-gefs-pds` byte-range via .idx; maybe
-   ECMWF open-data) → feed `research/ensemble_pdf.py`. Low prior: w=0 says the
-   book already impounds mean+σ; only distribution SHAPE could matter.
-2. **Different market/series** — the machinery (eval spine, walk-forward, honesty
-   protocol) transfers to KXLOW or non-weather series where the book may be
-   softer. KXLOW data is already in `kalshi_prices.parquet`.
-3. **Maker-side microstructure** rather than forecasting — but see dead ends
-   before reopening anything.
+1. ~~Ensemble members~~ — DONE (cycle 7, via dynamical.org; no edge). Every pure
+   forecasting lever is now exhausted.
+2. ~~Different market/series~~ — DONE, pivoted to tennis (above). Weather's
+   KXHIGH machinery is dormant, not deleted from history (working tree has
+   large uncommitted deletions from the pivot — see
+   `plans/tennis-mm-next-steps.md` "What's reusable vs. what's new").
+3. ~~Maker-side microstructure~~ — DONE, dead (above). Order-flow **taker**
+   is the live thread now; see the 07-27/28 session above for where it
+   stands and the next step.
+
+### Session addenda (cycle 7 infrastructure)
+- New scripts: `scripts/backfill_gefs_members_zarr.py`,
+  `scripts/backfill_ecmwf_members_icechunk.py` (fair member backfills;
+  per-thread dataset handles — xarray lazy indexes are not thread-safe shared),
+  `scripts/backfill_ecmwf_members_openmeteo.py` (dead — archive window).
+- `data/historical/ensemble_members.parquet`: 125,460 rows = 82 members × 1530
+  station-days (gitignored).
+- Env gotcha: `pip install zarr`/`icechunk` drags numpy→2.x and breaks the conda
+  stack (scipy/numexpr/bottleneck compiled vs 1.x). Pin `numpy<2`; working set:
+  numpy 1.26.4 + zarr 3.1.5 + icechunk 1.1.21→2.1.0 (via dynamical-catalog 0.5.0,
+  numpy stays 1.26.4).

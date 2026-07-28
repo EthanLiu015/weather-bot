@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 from cryptography.hazmat.primitives import serialization, hashes
@@ -46,6 +47,7 @@ class KalshiClient:
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
+        self._base_path = urlparse(self._base_url).path.rstrip("/")
         self._bucket = _TokenBucket()
         self._paper_trading = paper_trading
         pem = Path(private_key_path).read_bytes()
@@ -57,11 +59,16 @@ class KalshiClient:
             )
 
     def _sign_request(self, method: str, path: str, body: str = "") -> dict[str, str]:
+        """Kalshi signs timestamp + method + full-path-from-API-root (no query
+        string, no body) with RSA-PSS/SHA256 — not PKCS1v15, and not the bare
+        path relative to base_url. Verified against the live API: PKCS1v15 or
+        an incomplete path both 401 with INCORRECT_API_KEY_SIGNATURE."""
         ts_ms = str(int(time.time() * 1000))
-        msg = ts_ms + method.upper() + path + body
+        full_path = self._base_path + path.split("?", 1)[0]
+        msg = ts_ms + method.upper() + full_path
         signature = self._private_key.sign(
             msg.encode(),
-            padding.PKCS1v15(),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
             hashes.SHA256(),
         )
         sig_b64 = base64.b64encode(signature).decode()

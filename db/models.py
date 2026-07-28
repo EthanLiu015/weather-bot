@@ -7,23 +7,6 @@ class Base(DeclarativeBase):
     pass
 
 
-class ForecastRun(Base):
-    __tablename__ = "forecast_runs"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    station = Column(String(10), nullable=False, index=True)
-    model_source = Column(String(20), nullable=False)
-    run_time = Column(DateTime, nullable=False)
-    lead_time_hours = Column(Integer, nullable=False)
-    mu = Column(Float, nullable=False)
-    sigma = Column(Float, nullable=False)
-    calibrated_prob = Column(Float)
-    ci_lower = Column(Float)
-    ci_upper = Column(Float)
-    threshold = Column(Float)
-    created_at = Column(DateTime, default=datetime.utcnow)
-
-
 class MarketSnapshot(Base):
     __tablename__ = "market_snapshots"
 
@@ -80,36 +63,3 @@ class DailyPnL(Base):
     num_fills = Column(Integer, nullable=False, default=0)
 
 
-class CalibrationSnapshot(Base):
-    __tablename__ = "calibration_snapshots"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    station = Column(String(10), nullable=False, index=True)
-    lead_bucket = Column(String(10), nullable=False)
-    brier_score = Column(Float)
-    reliability_slope = Column(Float)
-    sharpness = Column(Float)
-    recorded_at = Column(DateTime, default=datetime.utcnow)
-
-
-class DailyForecastLog(Base):
-    __tablename__ = "daily_forecast_log"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    station = Column(String(10), nullable=False, index=True)
-    target_date = Column(Date, nullable=False, index=True)
-    forecast_tmax_f = Column(Float, nullable=False)
-    recorded_at = Column(DateTime, default=datetime.utcnow)
-
-
-class ModelArtifact(Base):
-    __tablename__ = "model_artifacts"
-
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    model_type = Column(String(30), nullable=False)
-    station = Column(String(10), nullable=False)
-    version = Column(String(20), nullable=False)
-    path = Column(Text, nullable=False)
-    trained_at = Column(DateTime, default=datetime.utcnow)
-    crps_val = Column(Float)
-    mae_val = Column(Float)
